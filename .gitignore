@@ -1,0 +1,6 @@
+.env
+data/parsed_articles/*.json
+conspect/*.md
+__pycache__/
+*.pyc
+venv/
