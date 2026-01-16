@@ -1,221 +1,317 @@
 """
-Единый пайплайн: URL → Парсинг → Конспект
-Аналог в 1С: Общий модуль, вызывающий подчинённые обработки
+Единый пайплайн: URL → Парсинг → Конспект.
 
-Использование:
-    python pipeline.py https://habr.com/ru/articles/123456/
-    python pipeline.py  # Интерактивный режим
+Поддерживаемые источники:
+    - habr.com (статьи)
+    - github.com (README репозиториев)
+
+Example:
+    Командная строка:
+        python pipeline.py https://habr.com/ru/articles/123456/
+        python pipeline.py https://github.com/anthropics/anthropic-cookbook
+
+    Интерактивный режим:
+        python pipeline.py
 """
 
+import json
 import os
 import sys
-import json
 from datetime import datetime
 
-# Импортируем наши модули (как вызов процедур из других модулей в 1С)
-from scraper import get_structured_habr_article
-from summarizer import generate_summary, save_summary_to_file, read_json_file
+# Импортируем наши модули
+from scraper import get_article
+from summarizer import generate_summary, save_summary_to_file
+
+# Публичный API модуля
+__all__ = ['process_article', 'ensure_directories']
 
 # Конфигурация путей
-# Аналог в 1С: Константы.ПутьКХранилищуДанных
-DATA_DIR = "data"
-PARSED_DIR = os.path.join(DATA_DIR, "parsed_articles")
-CONSPECT_DIR = "conspect"
+DATA_DIR: str = 'data'
+PARSED_DIR: str = os.path.join(DATA_DIR, 'parsed_articles')
+CONSPECT_DIR: str = 'conspect'
+
+# Поддерживаемые источники
+SUPPORTED_SOURCES: dict[str, str] = {
+    'habr.com': 'habr',
+    'github.com': 'github',
+}
 
 
-def ensure_directories():
+def ensure_directories() -> None:
     """
-    Создаёт необходимые папки, если их нет
-    Аналог в 1С: ПроверитьСоздатьКаталоги()
+    Создаёт необходимые папки, если их нет.
+
+    Создаваемые директории:
+        - data/
+        - data/parsed_articles/
+        - conspect/
     """
     for directory in [DATA_DIR, PARSED_DIR, CONSPECT_DIR]:
         if not os.path.exists(directory):
             os.makedirs(directory)
-            print(f"📁 Создана папка: {directory}")
+            print(f'📁 Создана папка: {directory}')
 
 
-def generate_filename_from_url(url):
+def is_supported_url(url: str) -> bool:
     """
-    Генерирует имя файла из URL статьи
-    Аналог в 1С: СформироватьИмяФайлаИзURL()
-    
-    Пример: https://habr.com/ru/articles/984968/ → habr_984968
+    Проверяет, поддерживается ли URL.
+
+    Args:
+        url: URL для проверки.
+
+    Returns:
+        True если источник поддерживается, иначе False.
     """
-    # Извлекаем ID статьи из URL
-    parts = url.rstrip('/').split('/')
-    article_id = parts[-1] if parts[-1].isdigit() else "unknown"
-    
-    # Определяем источник
-    if "habr.com" in url:
-        source = "habr"
-    else:
-        source = "other"
-    
-    return f"{source}_{article_id}"
+    return any(source in url for source in SUPPORTED_SOURCES)
 
 
-def save_parsed_data(article_data, filename):
+def get_source_name(url: str) -> str:
     """
-    Сохраняет распарсенные данные в JSON (для истории и отладки)
-    Аналог в 1С: СохранитьДанныеВФайл()
+    Определяет название источника по URL.
+
+    Args:
+        url: URL статьи или репозитория.
+
+    Returns:
+        Название источника ('habr', 'github') или 'unknown'.
+    """
+    for domain, name in SUPPORTED_SOURCES.items():
+        if domain in url:
+            return name
+    return 'unknown'
+
+
+def generate_filename_from_url(url: str) -> str:
+    """
+    Генерирует имя файла из URL.
+
+    Args:
+        url: URL статьи или репозитория.
+
+    Returns:
+        Имя файла без расширения.
+
+    Examples:
+        >>> generate_filename_from_url('https://habr.com/ru/articles/984968/')
+        'habr_984968'
+        >>> generate_filename_from_url('https://github.com/anthropics/cookbook')
+        'github_anthropics_cookbook'
+    """
+    source = get_source_name(url)
     
-    :param article_data: словарь с данными статьи
-    :param filename: имя файла без расширения
-    :return: путь к сохранённому файлу
+    if source == 'habr':
+        # Извлекаем ID статьи из URL Хабра
+        parts = url.rstrip('/').split('/')
+        article_id = parts[-1] if parts[-1].isdigit() else 'unknown'
+        return f'{source}_{article_id}'
+    
+    elif source == 'github':
+        # Извлекаем owner/repo из URL GitHub
+        parts = url.rstrip('/').split('/')
+        if len(parts) >= 2:
+            owner = parts[-2]
+            repo = parts[-1]
+            return f'{source}_{owner}_{repo}'
+        return f'{source}_unknown'
+    
+    return f'{source}_unknown'
+
+
+def save_parsed_data(article_data: dict, filename: str) -> str:
+    """
+    Сохраняет распарсенные данные в JSON.
+
+    Args:
+        article_data: Словарь с данными статьи.
+        filename: Имя файла без расширения.
+
+    Returns:
+        Путь к сохранённому файлу.
     """
     # Добавляем метаданные
     article_data['parsed_at'] = datetime.now().isoformat()
-    
+
     # Формируем путь
-    file_path = os.path.join(PARSED_DIR, f"{filename}.json")
-    
+    file_path = os.path.join(PARSED_DIR, f'{filename}.json')
+
     # Сохраняем
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(article_data, f, ensure_ascii=False, indent=2)
-    
-    print(f"💾 Данные сохранены: {file_path}")
+
+    print(f'💾 Данные сохранены: {file_path}')
     return file_path
 
 
-def process_article(url, model="gpt-3.5-turbo", save_json=True):
+def format_article_info(article_data: dict) -> None:
     """
-    Основная функция пайплайна: URL → Конспект
-    Аналог в 1С: ОбработатьСтатью(URL, Параметры)
-    
-    :param url: URL статьи для обработки
-    :param model: модель OpenAI для генерации
-    :param save_json: сохранять ли промежуточный JSON
-    :return: путь к файлу конспекта или None при ошибке
+    Выводит информацию о распарсенной статье.
+
+    Args:
+        article_data: Словарь с данными статьи.
     """
-    print("\n" + "=" * 60)
-    print("🚀 ЗАПУСК ПАЙПЛАЙНА")
-    print("=" * 60)
+    source = article_data.get('source', 'unknown')
     
-    # ШАГ 1: Парсинг статьи
-    # Аналог в 1С: РезультатПарсинга = ВызватьОбработкуПарсера(URL)
-    print("\n📥 ШАГ 1: Парсинг статьи...")
-    print("-" * 40)
+    print(f'✅ Контент распарсен: {article_data.get("title", "Без названия")}')
+    print(f'   Источник: {source}')
+    print(f'   Автор: {article_data.get("author", "Не указан")}')
     
-    article_data = get_structured_habr_article(url)
+    # Дополнительные поля в зависимости от источника
+    if source == 'habr':
+        print(f'   Дата: {article_data.get("date", "Не указана")}')
+    elif source == 'github':
+        print(f'   Звёзды: {article_data.get("stars", "0")}')
+        print(f'   Язык: {article_data.get("language", "Не определён")}')
+        if article_data.get('description'):
+            print(f'   Описание: {article_data.get("description")[:50]}...')
     
+    print(f'   Длина текста: {article_data.get("content_length", 0)} символов')
+
+
+def process_article(
+    url: str,
+    model: str = 'gpt-3.5-turbo',
+    save_json: bool = True,
+) -> str | None:
+    """
+    Основная функция пайплайна: URL → Конспект.
+
+    Args:
+        url: URL статьи или репозитория для обработки.
+        model: Модель OpenAI для генерации ('gpt-3.5-turbo' или 'gpt-4').
+        save_json: Сохранять ли промежуточный JSON с данными.
+
+    Returns:
+        Путь к файлу конспекта или None при ошибке.
+    """
+    print('\n' + '=' * 60)
+    print('🚀 ЗАПУСК ПАЙПЛАЙНА')
+    print('=' * 60)
+
+    # Проверка поддержки URL
+    if not is_supported_url(url):
+        print(f'❌ Источник не поддерживается: {url}')
+        print(f'   Поддерживаемые: {", ".join(SUPPORTED_SOURCES.keys())}')
+        return None
+
+    # ШАГ 1: Парсинг
+    print('\n📥 ШАГ 1: Парсинг контента...')
+    print('-' * 40)
+
+    article_data = get_article(url)
+
     # Проверяем на ошибки парсинга
     if 'error' in article_data:
-        print(f"❌ Ошибка парсинга: {article_data['error']}")
+        print(f'❌ Ошибка парсинга: {article_data["error"]}')
         return None
-    
-    print(f"✅ Статья распарсена: {article_data['title']}")
-    print(f"   Автор: {article_data['author']}")
-    print(f"   Длина текста: {article_data['content_length']} символов")
-    
+
+    format_article_info(article_data)
+
     # ШАГ 2: Сохранение промежуточных данных (опционально)
-    # Аналог в 1С: Если СохранятьПромежуточныеДанные Тогда...
     if save_json:
         filename = generate_filename_from_url(url)
         save_parsed_data(article_data, filename)
-    
+
     # ШАГ 3: Генерация конспекта
-    # Аналог в 1С: Конспект = ВызватьОбработкуГенерации(ДанныеСтатьи)
-    print(f"\n🧠 ШАГ 2: Генерация конспекта (модель: {model})...")
-    print("-" * 40)
-    
+    print(f'\n🧠 ШАГ 2: Генерация конспекта (модель: {model})...')
+    print('-' * 40)
+
     summary = generate_summary(article_data, model)
-    
+
     # Проверяем на ошибки генерации
-    if summary.startswith("❌"):
-        print(f"Ошибка генерации: {summary}")
+    if summary.startswith('❌'):
+        print(f'Ошибка генерации: {summary}')
         return None
-    
-    print("✅ Конспект сгенерирован!")
-    
+
+    print('✅ Конспект сгенерирован!')
+
     # ШАГ 4: Сохранение конспекта
-    # Аналог в 1С: СохранитьКонспект(Конспект, Заголовок)
-    print(f"\n💾 ШАГ 3: Сохранение конспекта...")
-    print("-" * 40)
-    
+    print('\n💾 ШАГ 3: Сохранение конспекта...')
+    print('-' * 40)
+
     article_title = article_data.get('title', 'Без_названия')
     saved_path = save_summary_to_file(summary, article_title, CONSPECT_DIR)
-    
+
     # Итог
-    print("\n" + "=" * 60)
-    print("✨ ПАЙПЛАЙН ЗАВЕРШЁН УСПЕШНО")
-    print("=" * 60)
-    print(f"📄 Исходная статья: {url}")
-    print(f"📚 Конспект сохранён: {saved_path}")
-    
+    print('\n' + '=' * 60)
+    print('✨ ПАЙПЛАЙН ЗАВЕРШЁН УСПЕШНО')
+    print('=' * 60)
+    print(f'📄 Исходный URL: {url}')
+    print(f'📚 Конспект сохранён: {saved_path}')
+
     return saved_path
 
 
-def interactive_mode():
-    """
-    Интерактивный режим работы
-    Аналог в 1С: ИнтерактивныйРежим()
-    """
-    print("\n" + "=" * 60)
-    print("🤖 АГЕНТ ДЛЯ ИЗУЧЕНИЯ ИИ — ГЕНЕРАТОР КОНСПЕКТОВ")
-    print("=" * 60)
-    
+def interactive_mode() -> None:
+    """Интерактивный режим работы с вводом URL и выбором модели."""
+    print('\n' + '=' * 60)
+    print('🤖 АГЕНТ ДЛЯ ИЗУЧЕНИЯ ИИ — ГЕНЕРАТОР КОНСПЕКТОВ')
+    print('=' * 60)
+
+    # Показываем поддерживаемые источники
+    print('\n📌 Поддерживаемые источники:')
+    for domain in SUPPORTED_SOURCES:
+        print(f'   ✅ {domain}')
+
     # Запрашиваем URL
-    url = input("\n🔗 Введите URL статьи с Хабра: ").strip()
-    
+    url = input('\n🔗 Введите URL: ').strip()
+
     if not url:
-        print("❌ URL не указан. Завершение.")
+        print('❌ URL не указан. Завершение.')
         return
-    
-    # Валидация URL (базовая)
-    if "habr.com" not in url:
-        print("⚠️  Внимание: Парсер оптимизирован для Хабра.")
-        proceed = input("   Продолжить? (y/n): ").strip().lower()
-        if proceed not in ['y', 'yes', 'да']:
-            print("Отменено.")
-            return
-    
+
+    # Валидация URL
+    if not is_supported_url(url):
+        print(f'⚠️ Источник не поддерживается.')
+        print(f'   Поддерживаемые: {", ".join(SUPPORTED_SOURCES.keys())}')
+        return
+
     # Выбор модели
-    print("\n📊 Выбор модели:")
-    print("   1 — gpt-3.5-turbo (быстрее, дешевле)")
-    print("   2 — gpt-4 (качественнее, дороже)")
-    
-    model_choice = input("   Ваш выбор (Enter = 1): ").strip()
-    model = "gpt-4" if model_choice == "2" else "gpt-3.5-turbo"
-    
+    print('\n📊 Выбор модели:')
+    print('   1 — gpt-3.5-turbo (быстрее, дешевле)')
+    print('   2 — gpt-4 (качественнее, дороже)')
+
+    model_choice = input('   Ваш выбор (Enter = 1): ').strip()
+    model = 'gpt-4' if model_choice == '2' else 'gpt-3.5-turbo'
+
     # Запуск пайплайна
     result = process_article(url, model=model)
-    
+
     if result:
         # Предлагаем просмотреть результат
-        view_choice = input("\n👀 Показать конспект? (y/n, Enter = да): ").strip().lower()
+        view_choice = input('\n👀 Показать конспект? (y/n, Enter = да): ').strip().lower()
         if view_choice in ['', 'y', 'yes', 'да']:
-            print("\n" + "=" * 60)
-            print("📚 СОДЕРЖИМОЕ КОНСПЕКТА:")
-            print("=" * 60)
+            print('\n' + '=' * 60)
+            print('📚 СОДЕРЖИМОЕ КОНСПЕКТА:')
+            print('=' * 60)
             with open(result, 'r', encoding='utf-8') as f:
                 print(f.read())
 
 
-def main():
+def main() -> None:
     """
-    Точка входа — поддерживает два режима:
-    1. Командная строка: python pipeline.py <URL>
-    2. Интерактивный: python pipeline.py
-    
-    Аналог в 1С: ПриЗапуске()
+    Точка входа — поддерживает два режима.
+
+    Режимы запуска:
+        1. Командная строка: python pipeline.py <URL> [model]
+        2. Интерактивный: python pipeline.py
     """
     # Создаём необходимые папки
     ensure_directories()
-    
+
     # Проверяем аргументы командной строки
-    # Аналог в 1С: ПараметрыЗапуска
     if len(sys.argv) > 1:
         # Режим командной строки
         url = sys.argv[1]
-        
+
         # Опциональный параметр модели
-        model = sys.argv[2] if len(sys.argv) > 2 else "gpt-3.5-turbo"
-        
+        model = sys.argv[2] if len(sys.argv) > 2 else 'gpt-3.5-turbo'
+
         process_article(url, model=model)
     else:
         # Интерактивный режим
         interactive_mode()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
