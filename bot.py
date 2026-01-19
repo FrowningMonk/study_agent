@@ -4,6 +4,7 @@ Telegram-бот для агента изучения ИИ.
 Поддерживаемые источники:
     - habr.com (статьи)
     - github.com (README репозиториев)
+    - infostart.ru (статьи и публикации по 1С)
 
 Поддерживаемые модели:
     - gemma3:12b (локальная, Ollama) — по умолчанию
@@ -27,7 +28,7 @@ from telebot import types
 from dotenv import load_dotenv
 
 from pipeline import ensure_directories, process_article
-from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL
+from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -46,6 +47,7 @@ TELEGRAM_TOKEN: str | None = os.getenv('TELEGRAM_BOT_TOKEN')
 SUPPORTED_SOURCES: dict[str, str] = {
     'habr.com': 'habr',
     'github.com': 'github',
+    'infostart.ru': 'infostart',
 }
 
 # Хранилище выбранных моделей пользователей: {user_id: model_name}
@@ -146,6 +148,16 @@ MSG_ERROR_WITH_DETAILS: str = """❌ Произошла ошибка: {error}
 
 Попробуй ещё раз через минуту."""
 
+MSG_MODEL_UNAVAILABLE: str = """❌ Модель недоступна
+
+🤖 Модель: {model}
+⚠️ {error}
+
+Что делать:
+• Выбрать другую модель: /model
+• Проверить, что Ollama запущена (для локальных моделей)
+• Проверить API ключ в .env (для OpenAI моделей)"""
+
 MSG_UNKNOWN_COMMAND: str = """🤔 Не понял команду.
 
 Отправь ссылку на статью или репозиторий, например:
@@ -195,20 +207,42 @@ bot = _init_bot()
 # =============================================================================
 
 
-def is_url(text: str | None) -> bool:
+def extract_url(text: str | None) -> str | None:
     """
-    Проверяет, является ли текст URL-адресом.
+    Извлекает URL из текста сообщения.
 
     Args:
         text: Текст для проверки.
 
     Returns:
-        True если текст — URL, иначе False.
+        Найденный URL или None.
     """
     if not text:
-        return False
-    text = text.strip()
-    return text.startswith('http://') or text.startswith('https://')
+        return None
+
+    # Разбиваем текст на слова
+    words = text.split()
+
+    # Ищем первое слово, начинающееся с http:// или https://
+    for word in words:
+        word = word.strip()
+        if word.startswith('http://') or word.startswith('https://'):
+            return word
+
+    return None
+
+
+def is_url(text: str | None) -> bool:
+    """
+    Проверяет, содержит ли текст URL-адрес.
+
+    Args:
+        text: Текст для проверки.
+
+    Returns:
+        True если текст содержит URL, иначе False.
+    """
+    return extract_url(text) is not None
 
 
 def is_supported_url(url: str) -> bool:
@@ -432,7 +466,12 @@ if bot:
         Args:
             message: Входящее сообщение со ссылкой.
         """
-        url = message.text.strip()
+        # Извлекаем URL из сообщения
+        url = extract_url(message.text)
+        if not url:
+            bot.reply_to(message, MSG_UNKNOWN_COMMAND)
+            return
+
         user_id = message.from_user.id
 
         # Получаем модель пользователя
@@ -444,6 +483,18 @@ if bot:
         # Проверяем поддержку источника
         if not is_supported_url(url):
             bot.reply_to(message, MSG_UNSUPPORTED_SOURCE)
+            return
+
+        # Проверяем доступность модели
+        is_available, error_message = check_model_availability(model)
+        if not is_available:
+            model_name = get_model_display_name(model)
+            error_text = MSG_MODEL_UNAVAILABLE.format(
+                model=model_name,
+                error=error_message,
+            )
+            bot.reply_to(message, error_text)
+            print(f'❌ Модель {model} недоступна для {user_id}: {error_message}')
             return
 
         # Отправляем статус "печатает..."

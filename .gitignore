@@ -4,3 +4,4 @@ conspect/*.md
 __pycache__/
 *.pyc
 venv/
+.claude/
