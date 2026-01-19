@@ -1,19 +1,24 @@
 """
-Модуль генерации конспектов через OpenAI API.
+Модуль генерации конспектов через OpenAI API и Ollama.
 
 Поддерживает разные промпты для разных источников:
     - habr.com — статьи (технические, аналитические)
     - github.com — README репозиториев
 
+Поддерживаемые провайдеры:
+    - ollama — локальные модели (gemma3:12b и др.)
+    - openai — облачные модели (gpt-3.5-turbo, gpt-4)
+
 Example:
     >>> from summarizer import generate_summary
-    >>> summary = generate_summary(article_data, model='gpt-3.5-turbo')
+    >>> summary = generate_summary(article_data, model='gemma3:12b')
 """
 
 import json
 import os
 import re
 
+import ollama
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -24,7 +29,36 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Публичный API модуля
-__all__ = ['generate_summary', 'save_summary_to_file', 'read_json_file']
+__all__ = ['generate_summary', 'save_summary_to_file', 'read_json_file', 'AVAILABLE_MODELS']
+
+
+# =============================================================================
+# КОНФИГУРАЦИЯ МОДЕЛЕЙ
+# =============================================================================
+
+# Доступные модели: название → провайдер
+AVAILABLE_MODELS: dict[str, str] = {
+    'gemma3:12b': 'ollama',
+    'gpt-3.5-turbo': 'openai',
+    'gpt-4': 'openai',
+}
+
+# Модель по умолчанию (локальная)
+DEFAULT_MODEL: str = 'gemma3:12b'
+
+
+def _get_provider(model: str) -> str:
+    """
+    Определяет провайдера по названию модели.
+
+    Args:
+        model: Название модели.
+
+    Returns:
+        Провайдер ('ollama' или 'openai').
+        Если модель неизвестна, возвращает 'ollama'.
+    """
+    return AVAILABLE_MODELS.get(model, 'ollama')
 
 
 # =============================================================================
@@ -153,41 +187,113 @@ def create_prompt(article_data: dict) -> tuple[str, str]:
 
 
 # =============================================================================
+# ГЕНЕРАЦИЯ ЧЕРЕЗ OLLAMA
+# =============================================================================
+
+
+def _generate_with_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+) -> str:
+    """
+    Генерирует текст через локальную модель Ollama.
+
+    Args:
+        system_prompt: Системный промпт.
+        user_prompt: Пользовательский промпт.
+        model: Название модели в Ollama.
+
+    Returns:
+        Сгенерированный текст.
+
+    Raises:
+        Exception: При ошибке соединения или генерации.
+    """
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        options={
+            'temperature': 0.3,
+            'num_predict': 1000,  # аналог max_tokens
+        },
+    )
+
+    return response['message']['content']
+
+
+# =============================================================================
+# ГЕНЕРАЦИЯ ЧЕРЕЗ OPENAI
+# =============================================================================
+
+
+def _generate_with_openai(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+) -> str:
+    """
+    Генерирует текст через OpenAI API.
+
+    Args:
+        system_prompt: Системный промпт.
+        user_prompt: Пользовательский промпт.
+        model: Название модели OpenAI.
+
+    Returns:
+        Сгенерированный текст.
+
+    Raises:
+        Exception: При ошибке API.
+    """
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=1000,
+        timeout=30,
+    )
+
+    return response.choices[0].message.content
+
+
+# =============================================================================
 # ОСНОВНЫЕ ФУНКЦИИ
 # =============================================================================
 
 
-def generate_summary(article_data: dict, model: str = 'gpt-3.5-turbo') -> str:
+def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
     """
-    Генерирует конспект через OpenAI API.
+    Генерирует конспект через выбранную модель.
 
     Args:
         article_data: Словарь с данными статьи/репозитория.
-        model: Модель OpenAI ('gpt-3.5-turbo' или 'gpt-4').
+        model: Название модели (по умолчанию — локальная Ollama).
 
     Returns:
         Текст конспекта или сообщение об ошибке (начинается с '❌').
     """
     try:
         source = article_data.get('source', 'unknown')
-        print(f'🧠 Генерация конспекта для {source} (модель: {model})...')
+        provider = _get_provider(model)
+
+        print(f'🧠 Генерация конспекта для {source}')
+        print(f'   Модель: {model} ({provider})')
 
         # Получаем промпты для нужного источника
         system_prompt, user_prompt = create_prompt(article_data)
 
-        # Отправляем запрос к API
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1000,
-            timeout=30,
-        )
-
-        summary = response.choices[0].message.content
+        # Выбираем провайдера и генерируем
+        if provider == 'ollama':
+            summary = _generate_with_ollama(system_prompt, user_prompt, model)
+        else:
+            summary = _generate_with_openai(system_prompt, user_prompt, model)
 
         print('✅ Конспект успешно сгенерирован!')
         return summary
@@ -338,8 +444,19 @@ def main() -> None:
     print(f'   Длина: {article_data.get("content_length", 0)} символов')
 
     # Выбор модели
-    model_choice = input('\nМодель (1=gpt-3.5-turbo, 2=gpt-4, Enter=1): ').strip()
-    model = 'gpt-4' if model_choice == '2' else 'gpt-3.5-turbo'
+    print('\n📊 Выбор модели:')
+    print('   1 — gemma3:12b (локальная, Ollama)')
+    print('   2 — gpt-3.5-turbo (OpenAI)')
+    print('   3 — gpt-4 (OpenAI)')
+
+    model_choice = input('   Ваш выбор (Enter = 1): ').strip()
+
+    if model_choice == '2':
+        model = 'gpt-3.5-turbo'
+    elif model_choice == '3':
+        model = 'gpt-4'
+    else:
+        model = DEFAULT_MODEL
 
     # Генерация
     print('\n' + '=' * 60)

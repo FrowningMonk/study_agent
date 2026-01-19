@@ -5,10 +5,16 @@
     - habr.com (статьи)
     - github.com (README репозиториев)
 
+Поддерживаемые модели:
+    - gemma3:12b (локальная, Ollama) — по умолчанию
+    - gpt-3.5-turbo (OpenAI)
+    - gpt-4 (OpenAI)
+
 Example:
     Командная строка:
         python pipeline.py https://habr.com/ru/articles/123456/
-        python pipeline.py https://github.com/anthropics/anthropic-cookbook
+        python pipeline.py https://habr.com/ru/articles/123456/ gpt-4
+        python pipeline.py https://github.com/anthropics/anthropic-cookbook gemma3:12b
 
     Интерактивный режим:
         python pipeline.py
@@ -21,7 +27,7 @@ from datetime import datetime
 
 # Импортируем наши модули
 from scraper import get_article
-from summarizer import generate_summary, save_summary_to_file
+from summarizer import generate_summary, save_summary_to_file, AVAILABLE_MODELS, DEFAULT_MODEL
 
 # Публичный API модуля
 __all__ = ['process_article', 'ensure_directories']
@@ -168,9 +174,25 @@ def format_article_info(article_data: dict) -> None:
     print(f'   Длина текста: {article_data.get("content_length", 0)} символов')
 
 
+def get_provider_name(model: str) -> str:
+    """
+    Возвращает читаемое название провайдера.
+
+    Args:
+        model: Название модели.
+
+    Returns:
+        Название провайдера для отображения.
+    """
+    provider = AVAILABLE_MODELS.get(model, 'ollama')
+    if provider == 'ollama':
+        return 'Ollama (локальная)'
+    return 'OpenAI'
+
+
 def process_article(
     url: str,
-    model: str = 'gpt-3.5-turbo',
+    model: str = DEFAULT_MODEL,
     save_json: bool = True,
 ) -> str | None:
     """
@@ -178,7 +200,7 @@ def process_article(
 
     Args:
         url: URL статьи или репозитория для обработки.
-        model: Модель OpenAI для генерации ('gpt-3.5-turbo' или 'gpt-4').
+        model: Модель для генерации (по умолчанию — локальная Ollama).
         save_json: Сохранять ли промежуточный JSON с данными.
 
     Returns:
@@ -213,7 +235,9 @@ def process_article(
         save_parsed_data(article_data, filename)
 
     # ШАГ 3: Генерация конспекта
-    print(f'\n🧠 ШАГ 2: Генерация конспекта (модель: {model})...')
+    provider_name = get_provider_name(model)
+    print(f'\n🧠 ШАГ 2: Генерация конспекта...')
+    print(f'   Модель: {model} ({provider_name})')
     print('-' * 40)
 
     summary = generate_summary(article_data, model)
@@ -237,6 +261,7 @@ def process_article(
     print('✨ ПАЙПЛАЙН ЗАВЕРШЁН УСПЕШНО')
     print('=' * 60)
     print(f'📄 Исходный URL: {url}')
+    print(f'🤖 Использована модель: {model}')
     print(f'📚 Конспект сохранён: {saved_path}')
 
     return saved_path
@@ -268,11 +293,18 @@ def interactive_mode() -> None:
 
     # Выбор модели
     print('\n📊 Выбор модели:')
-    print('   1 — gpt-3.5-turbo (быстрее, дешевле)')
-    print('   2 — gpt-4 (качественнее, дороже)')
+    print('   1 — gemma3:12b (локальная, Ollama)')
+    print('   2 — gpt-3.5-turbo (OpenAI)')
+    print('   3 — gpt-4 (OpenAI)')
 
-    model_choice = input('   Ваш выбор (Enter = 1): ').strip()
-    model = 'gpt-4' if model_choice == '2' else 'gpt-3.5-turbo'
+    model_choice = input('   Ваш выбор (Enter = 1, локальная): ').strip()
+
+    if model_choice == '2':
+        model = 'gpt-3.5-turbo'
+    elif model_choice == '3':
+        model = 'gpt-4'
+    else:
+        model = DEFAULT_MODEL
 
     # Запуск пайплайна
     result = process_article(url, model=model)
@@ -304,8 +336,8 @@ def main() -> None:
         # Режим командной строки
         url = sys.argv[1]
 
-        # Опциональный параметр модели
-        model = sys.argv[2] if len(sys.argv) > 2 else 'gpt-3.5-turbo'
+        # Опциональный параметр модели (теперь по умолчанию локальная)
+        model = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_MODEL
 
         process_article(url, model=model)
     else:

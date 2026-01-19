@@ -5,9 +5,15 @@ Telegram-бот для агента изучения ИИ.
     - habr.com (статьи)
     - github.com (README репозиториев)
 
+Поддерживаемые модели:
+    - gemma3:12b (локальная, Ollama) — по умолчанию
+    - gpt-3.5-turbo (OpenAI)
+    - gpt-4 (OpenAI)
+
 Команды бота:
     /start — Приветствие и инструкция
     /help  — Справка по использованию
+    /model — Выбор модели для генерации
     <URL>  — Отправить ссылку → получить конспект
 
 Example:
@@ -17,9 +23,11 @@ Example:
 import os
 
 import telebot
+from telebot import types
 from dotenv import load_dotenv
 
 from pipeline import ensure_directories, process_article
+from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -40,6 +48,16 @@ SUPPORTED_SOURCES: dict[str, str] = {
     'github.com': 'github',
 }
 
+# Хранилище выбранных моделей пользователей: {user_id: model_name}
+user_models: dict[int, str] = {}
+
+# Читаемые названия моделей для отображения
+MODEL_DISPLAY_NAMES: dict[str, str] = {
+    'gemma3:12b': '🏠 Gemma 3 12B (локальная)',
+    'gpt-3.5-turbo': '⚡ GPT-3.5 Turbo',
+    'gpt-4': '🧠 GPT-4',
+}
+
 # =============================================================================
 # ТЕКСТЫ СООБЩЕНИЙ
 # =============================================================================
@@ -57,6 +75,9 @@ MSG_WELCOME: str = """👋 Привет, {name}!
 • habr.com — технические статьи
 • github.com — README репозиториев
 
+🤖 Текущая модель: {model}
+Сменить модель: /model
+
 💡 Попробуй отправить ссылку прямо сейчас!
 
 /help — справка по командам"""
@@ -66,6 +87,7 @@ MSG_HELP: str = """📖 Справка по боту
 Команды:
 /start — Приветствие
 /help — Эта справка
+/model — Выбор модели
 
 Использование:
 Отправь ссылку, например:
@@ -76,13 +98,19 @@ MSG_HELP: str = """📖 Справка по боту
 ✅ Хабр (habr.com) — статьи
 ✅ GitHub (github.com) — README репозиториев
 
+Доступные модели:
+🏠 gemma3:12b — локальная (Ollama), по умолчанию
+⚡ gpt-3.5-turbo — OpenAI, быстрая
+🧠 gpt-4 — OpenAI, качественная
+
 Время обработки:
-~30-60 секунд (зависит от размера контента)
+~30-60 секунд (зависит от размера контента и модели)
 
 Возможные ошибки:
 • Контент не найден — проверь ссылку
 • Таймаут — попробуй ещё раз
-• Ошибка API — подожди минуту и повтори"""
+• Ошибка API — подожди минуту и повтори
+• Ollama не запущена — запусти ollama serve"""
 
 MSG_UNSUPPORTED_SOURCE: str = """⚠️ Источник не поддерживается.
 
@@ -94,10 +122,12 @@ MSG_UNSUPPORTED_SOURCE: str = """⚠️ Источник не поддержив
 
 MSG_PROCESSING_HABR: str = """⏳ Обрабатываю статью...
 
+🤖 Модель: {model}
 Это займёт 30-60 секунд."""
 
 MSG_PROCESSING_GITHUB: str = """⏳ Анализирую репозиторий...
 
+🤖 Модель: {model}
 Это займёт 30-60 секунд."""
 
 MSG_SUCCESS: str = '✅ Конспект готов!'
@@ -108,6 +138,7 @@ MSG_ERROR_GENERIC: str = """❌ Не удалось обработать кон�
 • Контент не найден
 • Ошибка парсинга
 • Проблема с API
+• Ollama не запущена (если используется локальная модель)
 
 Проверь ссылку и попробуй ещё раз."""
 
@@ -122,6 +153,18 @@ MSG_UNKNOWN_COMMAND: str = """🤔 Не понял команду.
 • https://github.com/anthropics/anthropic-cookbook
 
 /help — справка по командам"""
+
+MSG_MODEL_SELECT: str = """🤖 Выбор модели
+
+Текущая модель: {current_model}
+
+Выбери модель для генерации конспектов:"""
+
+MSG_MODEL_CHANGED: str = """✅ Модель изменена!
+
+Новая модель: {model}
+
+Теперь конспекты будут генерироваться с помощью этой модели."""
 
 
 # =============================================================================
@@ -197,20 +240,77 @@ def get_source_type(url: str) -> str:
     return 'unknown'
 
 
-def get_processing_message(url: str) -> str:
+def get_user_model(user_id: int) -> str:
+    """
+    Возвращает выбранную модель пользователя.
+
+    Args:
+        user_id: ID пользователя Telegram.
+
+    Returns:
+        Название модели (или дефолтная, если не выбрана).
+    """
+    return user_models.get(user_id, DEFAULT_MODEL)
+
+
+def get_model_display_name(model: str) -> str:
+    """
+    Возвращает читаемое название модели.
+
+    Args:
+        model: Техническое название модели.
+
+    Returns:
+        Читаемое название для отображения.
+    """
+    return MODEL_DISPLAY_NAMES.get(model, model)
+
+
+def get_processing_message(url: str, model: str) -> str:
     """
     Возвращает сообщение о начале обработки в зависимости от источника.
 
     Args:
         url: URL для обработки.
+        model: Используемая модель.
 
     Returns:
         Текст сообщения.
     """
+    model_name = get_model_display_name(model)
     source_type = get_source_type(url)
+
     if source_type == 'github':
-        return MSG_PROCESSING_GITHUB
-    return MSG_PROCESSING_HABR
+        return MSG_PROCESSING_GITHUB.format(model=model_name)
+    return MSG_PROCESSING_HABR.format(model=model_name)
+
+
+def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
+    """
+    Создаёт inline-клавиатуру для выбора модели.
+
+    Args:
+        current_model: Текущая выбранная модель.
+
+    Returns:
+        Объект InlineKeyboardMarkup.
+    """
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for model_name in AVAILABLE_MODELS.keys():
+        display_name = get_model_display_name(model_name)
+
+        # Добавляем галочку к текущей модели
+        if model_name == current_model:
+            display_name = f'✓ {display_name}'
+
+        button = types.InlineKeyboardButton(
+            text=display_name,
+            callback_data=f'model:{model_name}',
+        )
+        keyboard.add(button)
+
+    return keyboard
 
 
 def send_long_message(chat_id: int, text: str, chunk_size: int = 4000) -> None:
@@ -256,7 +356,12 @@ if bot:
             message: Входящее сообщение от пользователя.
         """
         user_name = message.from_user.first_name or 'друг'
-        welcome_text = MSG_WELCOME.format(name=user_name)
+        user_id = message.from_user.id
+
+        current_model = get_user_model(user_id)
+        model_name = get_model_display_name(current_model)
+
+        welcome_text = MSG_WELCOME.format(name=user_name, model=model_name)
         bot.reply_to(message, welcome_text)
 
     @bot.message_handler(commands=['help'])
@@ -269,6 +374,56 @@ if bot:
         """
         bot.reply_to(message, MSG_HELP)
 
+    @bot.message_handler(commands=['model'])
+    def handle_model(message: telebot.types.Message) -> None:
+        """
+        Обработчик команды /model — показывает меню выбора модели.
+
+        Args:
+            message: Входящее сообщение от пользователя.
+        """
+        user_id = message.from_user.id
+        current_model = get_user_model(user_id)
+        current_model_name = get_model_display_name(current_model)
+
+        keyboard = create_model_keyboard(current_model)
+
+        bot.send_message(
+            message.chat.id,
+            MSG_MODEL_SELECT.format(current_model=current_model_name),
+            reply_markup=keyboard,
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('model:'))
+    def handle_model_callback(call: telebot.types.CallbackQuery) -> None:
+        """
+        Обработчик нажатия на кнопку выбора модели.
+
+        Args:
+            call: Callback-запрос от inline-кнопки.
+        """
+        user_id = call.from_user.id
+
+        # Извлекаем название модели из callback_data
+        model = call.data.split(':', 1)[1]
+
+        # Сохраняем выбор пользователя
+        user_models[user_id] = model
+
+        model_name = get_model_display_name(model)
+
+        # Обновляем сообщение
+        bot.edit_message_text(
+            MSG_MODEL_CHANGED.format(model=model_name),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+
+        # Отвечаем на callback (убирает часики на кнопке)
+        bot.answer_callback_query(call.id, f'Выбрана модель: {model}')
+
+        print(f'🔄 Пользователь {user_id} выбрал модель: {model}')
+
     @bot.message_handler(func=lambda message: is_url(message.text))
     def handle_url(message: telebot.types.Message) -> None:
         """
@@ -280,7 +435,11 @@ if bot:
         url = message.text.strip()
         user_id = message.from_user.id
 
+        # Получаем модель пользователя
+        model = get_user_model(user_id)
+
         print(f'📨 Получена ссылка от {user_id}: {url}')
+        print(f'   Модель: {model}')
 
         # Проверяем поддержку источника
         if not is_supported_url(url):
@@ -291,12 +450,12 @@ if bot:
         bot.send_chat_action(message.chat.id, 'typing')
 
         # Уведомляем о начале обработки
-        processing_msg = get_processing_message(url)
+        processing_msg = get_processing_message(url, model)
         status_msg = bot.reply_to(message, processing_msg)
 
         try:
-            # Запускаем пайплайн
-            result_path = process_article(url, model='gpt-3.5-turbo', save_json=True)
+            # Запускаем пайплайн с выбранной моделью
+            result_path = process_article(url, model=model, save_json=True)
 
             if result_path is None:
                 bot.edit_message_text(
@@ -314,7 +473,7 @@ if bot:
             _safe_delete_message(message.chat.id, status_msg.message_id)
 
             # Отправляем конспект
-            _send_summary(message.chat.id, summary, url)
+            _send_summary(message.chat.id, summary, url, model)
 
             print(f'✅ Конспект отправлен пользователю {user_id}')
 
@@ -351,7 +510,7 @@ def _safe_delete_message(chat_id: int, message_id: int) -> None:
         pass
 
 
-def _send_summary(chat_id: int, summary: str, url: str) -> None:
+def _send_summary(chat_id: int, summary: str, url: str, model: str) -> None:
     """
     Отправляет конспект пользователю.
 
@@ -359,13 +518,15 @@ def _send_summary(chat_id: int, summary: str, url: str) -> None:
         chat_id: ID чата.
         summary: Текст конспекта.
         url: Ссылка на исходную статью.
+        model: Использованная модель.
     """
-    header = MSG_SUCCESS + f'\nИсточник: {url}\n\n'
+    model_name = get_model_display_name(model)
+    header = MSG_SUCCESS + f'\n🤖 Модель: {model_name}\n📎 Источник: {url}\n\n'
 
     if len(header) + len(summary) <= 4096:
         bot.send_message(chat_id, header + summary)
     else:
-        bot.send_message(chat_id, MSG_SUCCESS)
+        bot.send_message(chat_id, MSG_SUCCESS + f'\n🤖 Модель: {model_name}')
         send_long_message(chat_id, summary)
 
 
@@ -413,6 +574,10 @@ def main() -> None:
     print('📌 Поддерживаемые источники:')
     for domain in SUPPORTED_SOURCES:
         print(f'   • {domain}')
+    print('🤖 Доступные модели:')
+    for model, display_name in MODEL_DISPLAY_NAMES.items():
+        default_mark = ' (по умолчанию)' if model == DEFAULT_MODEL else ''
+        print(f'   • {display_name}{default_mark}')
     print('📱 Найди бота в Telegram и отправь /start')
     print('🛑 Для остановки нажми Ctrl+C')
     print('=' * 60)
