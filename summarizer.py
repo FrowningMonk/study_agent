@@ -4,6 +4,7 @@
 Поддерживает разные промпты для разных источников:
     - habr.com — статьи (технические, аналитические)
     - github.com — README репозиториев
+    - infostart.ru — статьи и публикации по 1С
 
 Поддерживаемые провайдеры:
     - ollama — локальные модели (gemma3:12b и др.)
@@ -29,7 +30,14 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Публичный API модуля
-__all__ = ['generate_summary', 'save_summary_to_file', 'read_json_file', 'AVAILABLE_MODELS']
+__all__ = [
+    'generate_summary',
+    'save_summary_to_file',
+    'read_json_file',
+    'check_model_availability',
+    'AVAILABLE_MODELS',
+    'DEFAULT_MODEL',
+]
 
 
 # =============================================================================
@@ -89,17 +97,44 @@ HABR_USER_PROMPT_TEMPLATE: str = """Перескажи суть статьи в 
 
 
 # =============================================================================
+# ПРОМПТЫ ДЛЯ INFOSTART
+# =============================================================================
+
+INFOSTART_SYSTEM_PROMPT: str = """Ты — помощник разработчика 1С.
+
+Твоя задача: помочь быстро понять, стоит ли читать статью по 1С.
+
+Правила:
+- Пиши простым текстом без форматирования
+- Никаких списков, заголовков, эмодзи
+- Максимум 5-7 предложений
+- Передай суть: какую проблему решает автор, какой подход использует
+- В конце — главный практический вывод или рекомендацию
+"""
+
+INFOSTART_USER_PROMPT_TEMPLATE: str = """Перескажи суть статьи по 1С в 2-3 предложениях: какая задача решается, какой подход использован, какой результат. Потом одно предложение — главный практический вывод.
+
+ЗАГОЛОВОК: {title}
+АВТОР: {author}
+
+ТЕКСТ СТАТЬИ:
+{content}
+"""
+
+
+# =============================================================================
 # ПРОМПТЫ ДЛЯ GITHUB
 # =============================================================================
 
 GITHUB_SYSTEM_PROMPT: str = """Ты — аналитик open-source проектов.
 
-Твоя задача: дать краткую справку о репозитории.
+Твоя задача: дать краткую справку о репозитории на основе всех доступных файлов документации.
 
 Правила:
 - Пиши кратко, без эмодзи
 - Три пункта: Назначение, Технологии, Зрелость
-- Зрелость оценивай по звёздам и полноте README
+- Зрелость оценивай по звёздам и полноте документации
+- Учитывай информацию из всех предоставленных файлов (README, ARCHITECTURE, CONTRIBUTING и др.)
 """
 
 GITHUB_USER_PROMPT_TEMPLATE: str = """Дай справку о репозитории по трём пунктам:
@@ -112,8 +147,9 @@ GITHUB_USER_PROMPT_TEMPLATE: str = """Дай справку о репозито�
 ОПИСАНИЕ: {description}
 ЗВЁЗДЫ: {stars}
 ЯЗЫК: {language}
+ФАЙЛЫ ДОКУМЕНТАЦИИ: {files}
 
-README:
+СОДЕРЖИМОЕ:
 {content}
 """
 
@@ -142,9 +178,27 @@ def _create_habr_prompt(article_data: dict) -> tuple[str, str]:
     return HABR_SYSTEM_PROMPT, user_prompt
 
 
+def _create_infostart_prompt(article_data: dict) -> tuple[str, str]:
+    """
+    Создаёт промпт для статьи с InfoStart.
+
+    Args:
+        article_data: Словарь с данными статьи.
+
+    Returns:
+        Кортеж (system_prompt, user_prompt).
+    """
+    user_prompt = INFOSTART_USER_PROMPT_TEMPLATE.format(
+        title=article_data.get('title', 'Не указан'),
+        author=article_data.get('author', 'Не указан'),
+        content=article_data.get('content', 'Текст отсутствует'),
+    )
+    return INFOSTART_SYSTEM_PROMPT, user_prompt
+
+
 def _create_github_prompt(article_data: dict) -> tuple[str, str]:
     """
-    Создаёт промпт для README с GitHub.
+    Создаёт промпт для документации с GitHub.
 
     Args:
         article_data: Словарь с данными репозитория.
@@ -152,13 +206,18 @@ def _create_github_prompt(article_data: dict) -> tuple[str, str]:
     Returns:
         Кортеж (system_prompt, user_prompt).
     """
+    # Формируем список файлов
+    files = article_data.get('files', ['README.md'])
+    files_str = ', '.join(files) if isinstance(files, list) else 'README.md'
+
     user_prompt = GITHUB_USER_PROMPT_TEMPLATE.format(
         title=article_data.get('title', 'Не указан'),
         author=article_data.get('author', 'Не указан'),
         description=article_data.get('description', 'Нет описания'),
         stars=article_data.get('stars', '0'),
         language=article_data.get('language', 'Не определён'),
-        content=article_data.get('content', 'README отсутствует'),
+        files=files_str,
+        content=article_data.get('content', 'Документация отсутствует'),
     )
     return GITHUB_SYSTEM_PROMPT, user_prompt
 
@@ -182,6 +241,8 @@ def create_prompt(article_data: dict) -> tuple[str, str]:
         return _create_habr_prompt(article_data)
     elif source == 'github':
         return _create_github_prompt(article_data)
+    elif source == 'infostart':
+        return _create_infostart_prompt(article_data)
     else:
         raise ValueError(f'Неподдерживаемый источник: {source}')
 
@@ -261,6 +322,55 @@ def _generate_with_openai(
     )
 
     return response.choices[0].message.content
+
+
+# =============================================================================
+# ПРОВЕРКА ДОСТУПНОСТИ МОДЕЛЕЙ
+# =============================================================================
+
+
+def check_model_availability(model: str) -> tuple[bool, str | None]:
+    """
+    Проверяет доступность модели.
+
+    Args:
+        model: Название модели.
+
+    Returns:
+        Кортеж (доступна ли модель, сообщение об ошибке или None).
+    """
+    provider = _get_provider(model)
+
+    try:
+        if provider == 'ollama':
+            # Проверяем доступность Ollama
+            try:
+                # Пытаемся получить список моделей
+                models = ollama.list()
+                # Проверяем, есть ли нужная модель
+                available_models = [m.model for m in models.get('models', [])]
+                if model not in available_models:
+                    return False, f'Модель {model} не найдена в Ollama. Доступные модели: {", ".join(available_models) if available_models else "нет"}'
+                return True, None
+            except Exception as e:
+                error_msg = str(e).lower()
+                if 'connection' in error_msg or 'connect' in error_msg:
+                    return False, 'Ollama не запущена. Запустите команду: ollama serve'
+                elif 'keyerror' in error_msg or "'name'" in error_msg:
+                    return False, f'Ошибка версии библиотеки ollama. Обновите: pip install --upgrade ollama'
+                return False, f'Не удалось подключиться к Ollama. Проверьте, что сервис запущен (ollama serve)'
+
+        elif provider == 'openai':
+            # Проверяем наличие API ключа
+            if not os.getenv('OPENAI_API_KEY'):
+                return False, 'API ключ OpenAI не найден. Добавьте OPENAI_API_KEY в .env файл'
+            # Для OpenAI дополнительная проверка не требуется
+            return True, None
+
+        return True, None
+
+    except Exception as e:
+        return False, f'Непредвиденная ошибка при проверке модели: {str(e)}'
 
 
 # =============================================================================

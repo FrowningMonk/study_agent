@@ -4,6 +4,7 @@
 Поддерживаемые источники:
     - habr.com (статьи)
     - github.com (README репозиториев)
+    - infostart.ru (статьи и публикации по 1С)
 
 Поддерживаемые модели:
     - gemma3:12b (локальная, Ollama) — по умолчанию
@@ -15,6 +16,7 @@ Example:
         python pipeline.py https://habr.com/ru/articles/123456/
         python pipeline.py https://habr.com/ru/articles/123456/ gpt-4
         python pipeline.py https://github.com/anthropics/anthropic-cookbook gemma3:12b
+        python pipeline.py https://infostart.ru/public/886103/
 
     Интерактивный режим:
         python pipeline.py
@@ -41,6 +43,7 @@ CONSPECT_DIR: str = 'conspect'
 SUPPORTED_SOURCES: dict[str, str] = {
     'habr.com': 'habr',
     'github.com': 'github',
+    'infostart.ru': 'infostart',
 }
 
 
@@ -103,15 +106,17 @@ def generate_filename_from_url(url: str) -> str:
         'habr_984968'
         >>> generate_filename_from_url('https://github.com/anthropics/cookbook')
         'github_anthropics_cookbook'
+        >>> generate_filename_from_url('https://infostart.ru/public/886103/')
+        'infostart_886103'
     """
     source = get_source_name(url)
-    
+
     if source == 'habr':
         # Извлекаем ID статьи из URL Хабра
         parts = url.rstrip('/').split('/')
         article_id = parts[-1] if parts[-1].isdigit() else 'unknown'
         return f'{source}_{article_id}'
-    
+
     elif source == 'github':
         # Извлекаем owner/repo из URL GitHub
         parts = url.rstrip('/').split('/')
@@ -120,7 +125,14 @@ def generate_filename_from_url(url: str) -> str:
             repo = parts[-1]
             return f'{source}_{owner}_{repo}'
         return f'{source}_unknown'
-    
+
+    elif source == 'infostart':
+        # Извлекаем ID статьи из URL InfoStart
+        # Примеры: /public/123456/ или /1c/articles/123456/
+        parts = url.rstrip('/').split('/')
+        article_id = parts[-1] if parts[-1].isdigit() else 'unknown'
+        return f'{source}_{article_id}'
+
     return f'{source}_unknown'
 
 
@@ -157,11 +169,11 @@ def format_article_info(article_data: dict) -> None:
         article_data: Словарь с данными статьи.
     """
     source = article_data.get('source', 'unknown')
-    
+
     print(f'✅ Контент распарсен: {article_data.get("title", "Без названия")}')
     print(f'   Источник: {source}')
     print(f'   Автор: {article_data.get("author", "Не указан")}')
-    
+
     # Дополнительные поля в зависимости от источника
     if source == 'habr':
         print(f'   Дата: {article_data.get("date", "Не указана")}')
@@ -170,7 +182,10 @@ def format_article_info(article_data: dict) -> None:
         print(f'   Язык: {article_data.get("language", "Не определён")}')
         if article_data.get('description'):
             print(f'   Описание: {article_data.get("description")[:50]}...')
-    
+    elif source == 'infostart':
+        # Для InfoStart особых полей не выводим, только основные
+        pass
+
     print(f'   Длина текста: {article_data.get("content_length", 0)} символов')
 
 
