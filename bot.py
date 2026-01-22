@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from pipeline import ensure_directories, process_article
 from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
+from database import init_db, article_exists, get_cached_summary
 
 load_dotenv()
 
@@ -79,6 +80,7 @@ MSG_MODEL_UNAVAILABLE = "Модель {model} недоступна: {error}\n\n�
 MSG_UNKNOWN = "Без ссылки работать бессмысленно. /help для справки."
 MSG_MODEL_SELECT = "Текущая модель: {current_model}\n\nВыбери модель:"
 MSG_MODEL_CHANGED = "Модель изменена: {model}"
+MSG_DUPLICATE_FOUND = "📦 Эта статья уже обработана.\n\nЧто сделать?"
 
 
 # Проверяем наличие токена перед запуском
@@ -136,6 +138,38 @@ def get_user_model(user_id: int) -> str:
         Название модели для генерации конспектов
     """
     return user_models.get(user_id, DEFAULT_MODEL)
+
+
+def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
+    """
+    Создает inline-клавиатуру для выбора действия при дубликате.
+
+    Args:
+        url: URL статьи для передачи в callback_data
+
+    Returns:
+        InlineKeyboardMarkup с кнопками выбора действия
+    """
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    # Кодируем URL для callback_data (ограничение 64 байта)
+    # Используем хеш URL для идентификации
+    url_hash = str(hash(url))[-10:]
+
+    show_btn = types.InlineKeyboardButton(
+        text='📦 Показать сохранённый',
+        callback_data=f'cache:show:{url_hash}',
+    )
+    regen_btn = types.InlineKeyboardButton(
+        text='🔄 Сгенерировать заново',
+        callback_data=f'cache:regen:{url_hash}',
+    )
+    keyboard.add(show_btn, regen_btn)
+    return keyboard
+
+
+# Временное хранилище URL по хешу (для callback)
+pending_cache_urls: dict[str, str] = {}
 
 
 def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
@@ -257,13 +291,105 @@ def handle_model_callback(call: telebot.types.CallbackQuery) -> None:
     print(f'Пользователь {user_id} выбрал модель: {model}')
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cache:'))
+def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает выбор действия при дубликате.
+
+    Callback data имеет формат: "cache:show:url_hash" или "cache:regen:url_hash"
+    """
+    user_id = call.from_user.id
+    parts = call.data.split(':')
+    action = parts[1]
+    url_hash = parts[2]
+
+    # Получаем URL из временного хранилища
+    url = pending_cache_urls.get(url_hash)
+    if not url:
+        bot.answer_callback_query(call.id, 'Ссылка устарела, отправьте заново')
+        return
+
+    model = get_user_model(user_id)
+
+    if action == 'show':
+        # Показать сохранённый конспект
+        summary = get_cached_summary(url)
+        if summary:
+            bot.edit_message_text(
+                '📦 Сохранённый конспект:',
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+            send_long_message(call.message.chat.id, summary)
+            bot.answer_callback_query(call.id, 'Показан сохранённый конспект')
+            print(f'Показан кеш для {user_id}: {url}')
+        else:
+            bot.answer_callback_query(call.id, 'Конспект не найден')
+        # Очищаем временное хранилище
+        pending_cache_urls.pop(url_hash, None)
+
+    elif action == 'regen':
+        # Сгенерировать заново
+        bot.edit_message_text(
+            '🔄 Генерирую заново...',
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        bot.answer_callback_query(call.id, 'Начинаю генерацию')
+
+        # Проверяем доступность модели
+        is_available, error_message = check_model_availability(model)
+        if not is_available:
+            error_text = MSG_MODEL_UNAVAILABLE.format(model=model, error=error_message)
+            bot.send_message(call.message.chat.id, error_text)
+            print(f'Модель {model} недоступна для {user_id}: {error_message}')
+            return
+
+        try:
+            # skip_cache=True для принудительной перегенерации
+            result_path = process_article(
+                url,
+                model=model,
+                save_json=True,
+                user_id=user_id,
+                skip_cache=True,
+            )
+
+            if result_path is None:
+                bot.send_message(
+                    call.message.chat.id,
+                    MSG_ERROR.format(error='Не удалось обработать статью'),
+                )
+                return
+
+            with open(result_path, 'r', encoding='utf-8') as f:
+                summary = f.read()
+
+            header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
+            if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+                bot.send_message(call.message.chat.id, header + summary)
+            else:
+                bot.send_message(call.message.chat.id, f'🔄 Перегенерировано! Модель: {model}')
+                send_long_message(call.message.chat.id, summary)
+
+            print(f'Перегенерирован конспект для {user_id}: {url}')
+
+        except Exception as e:
+            bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+            print(f'Ошибка перегенерации для {user_id}: {e}')
+
+        # Очищаем временное хранилище
+        pending_cache_urls.pop(url_hash, None)
+
+
 @bot.message_handler(func=lambda message: extract_url(message.text) is not None)
 def handle_url(message: telebot.types.Message) -> None:
     """
     Обрабатывает сообщения с URL - создает конспект статьи.
 
     Извлекает URL из сообщения, проверяет поддержку источника,
-    обрабатывает статью с помощью выбранной модели и отправляет конспект.
+    проверяет наличие в кеше, обрабатывает статью с помощью
+    выбранной модели и отправляет конспект.
     """
     url = extract_url(message.text)
     if not url:
@@ -280,6 +406,19 @@ def handle_url(message: telebot.types.Message) -> None:
         bot.reply_to(message, MSG_UNSUPPORTED)
         return
 
+    # Проверяем наличие в кеше
+    if article_exists(url):
+        url_hash = str(hash(url))[-10:]
+        pending_cache_urls[url_hash] = url
+        keyboard = create_cache_keyboard(url)
+        bot.send_message(
+            message.chat.id,
+            MSG_DUPLICATE_FOUND,
+            reply_markup=keyboard,
+        )
+        print(f'Найден дубликат для {user_id}: {url}')
+        return
+
     # Проверяем доступность модели
     is_available, error_message = check_model_availability(model)
     if not is_available:
@@ -292,7 +431,7 @@ def handle_url(message: telebot.types.Message) -> None:
     status_msg = bot.reply_to(message, MSG_PROCESSING)
 
     try:
-        result_path = process_article(url, model=model, save_json=True)
+        result_path = process_article(url, model=model, save_json=True, user_id=user_id)
 
         if result_path is None:
             bot.edit_message_text(
@@ -343,6 +482,7 @@ def handle_unknown(message: telebot.types.Message) -> None:
 def main() -> None:
     """Запуск бота."""
     ensure_directories()
+    init_db()
 
     print('=' * 60)
     print('TELEGRAM-БОТ АГЕНТА ДЛЯ ИЗУЧЕНИЯ ИИ')

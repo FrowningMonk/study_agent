@@ -30,6 +30,7 @@ from datetime import datetime
 # Импортируем наши модули
 from scraper import get_article
 from summarizer import generate_summary, save_summary_to_file, AVAILABLE_MODELS, DEFAULT_MODEL
+from database import init_db, article_exists, save_article, update_article
 
 # Публичный API модуля
 __all__ = ['process_article', 'ensure_directories']
@@ -209,6 +210,8 @@ def process_article(
     url: str,
     model: str = DEFAULT_MODEL,
     save_json: bool = True,
+    user_id: int | None = None,
+    skip_cache: bool = False,
 ) -> str | None:
     """
     Основная функция пайплайна: URL → Конспект.
@@ -217,10 +220,14 @@ def process_article(
         url: URL статьи или репозитория для обработки.
         model: Модель для генерации (по умолчанию — локальная Ollama).
         save_json: Сохранять ли промежуточный JSON с данными.
+        user_id: Telegram user_id для привязки статьи.
+        skip_cache: Пропустить проверку кеша (для принудительной перегенерации).
 
     Returns:
         Путь к файлу конспекта или None при ошибке.
     """
+    # Инициализация БД (идемпотентная операция)
+    init_db()
     print('\n' + '=' * 60)
     print('🚀 ЗАПУСК ПАЙПЛАЙНА')
     print('=' * 60)
@@ -270,6 +277,25 @@ def process_article(
 
     article_title = article_data.get('title', 'Без_названия')
     saved_path = save_summary_to_file(summary, article_title, CONSPECT_DIR)
+
+    # ШАГ 5: Сохранение в БД
+    print('\n🗄️ ШАГ 4: Сохранение в базу данных...')
+    print('-' * 40)
+
+    # Проверяем, есть ли уже запись (при skip_cache=True)
+    if article_exists(url):
+        # Обновляем существующую запись
+        update_article(url=url, summary=summary, model=model)
+        print('✅ Обновлено в БД')
+    else:
+        # Создаём новую запись
+        article_id = save_article(
+            article_data=article_data,
+            summary=summary,
+            model=model,
+            user_id=user_id,
+        )
+        print(f'✅ Сохранено в БД: article_id={article_id}')
 
     # Итог
     print('\n' + '=' * 60)
@@ -343,8 +369,9 @@ def main() -> None:
         1. Командная строка: python pipeline.py <URL> [model]
         2. Интерактивный: python pipeline.py
     """
-    # Создаём необходимые папки
+    # Создаём необходимые папки и инициализируем БД
     ensure_directories()
+    init_db()
 
     # Проверяем аргументы командной строки
     if len(sys.argv) > 1:
