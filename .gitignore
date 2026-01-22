@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 venv/
 .claude/
+data/study_agent.db

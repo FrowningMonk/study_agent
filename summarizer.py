@@ -17,7 +17,6 @@ Example:
 
 import json
 import os
-import re
 
 import ollama
 from dotenv import load_dotenv
@@ -32,7 +31,6 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 # Публичный API модуля
 __all__ = [
     'generate_summary',
-    'save_summary_to_file',
     'read_json_file',
     'check_model_availability',
     'AVAILABLE_MODELS',
@@ -421,67 +419,6 @@ def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
         return error_message
 
 
-def save_summary_to_file(
-    summary: str,
-    article_title: str,
-    output_dir: str = 'conspect',
-) -> str | None:
-    """
-    Сохраняет конспект в файл.
-
-    Args:
-        summary: Текст конспекта.
-        article_title: Заголовок статьи (для имени файла).
-        output_dir: Папка для сохранения.
-
-    Returns:
-        Путь к сохранённому файлу или None при ошибке.
-    """
-    try:
-        # Создаём папку, если её нет
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            print(f'📁 Создана папка: {output_dir}')
-
-        # Создаём безопасное имя файла
-        safe_title = _sanitize_filename(article_title)
-
-        # Формируем путь к файлу
-        file_path = os.path.join(output_dir, f'конспект_{safe_title}.md')
-
-        # Сохраняем
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(summary)
-
-        print(f'💾 Конспект сохранён: {file_path}')
-        return file_path
-
-    except Exception as e:
-        print(f'❌ Ошибка при сохранении файла: {str(e)}')
-        return None
-
-
-def _sanitize_filename(title: str, max_length: int = 50) -> str:
-    """
-    Создаёт безопасное имя файла из заголовка.
-
-    Args:
-        title: Исходный заголовок.
-        max_length: Максимальная длина имени.
-
-    Returns:
-        Безопасное имя файла.
-    """
-    # Заменяем недопустимые символы на подчёркивание
-    safe = re.sub(r'[^\w\s\-]', '_', title)
-    # Заменяем пробелы на подчёркивание
-    safe = re.sub(r'\s+', '_', safe)
-    # Убираем множественные подчёркивания
-    safe = re.sub(r'_+', '_', safe)
-    # Обрезаем
-    return safe[:max_length].strip('_')
-
-
 def read_json_file(file_path: str) -> dict | None:
     """
     Читает JSON файл и возвращает словарь.
@@ -576,11 +513,6 @@ def main() -> None:
     print('📚 КОНСПЕКТ:')
     print('=' * 60)
     print(summary)
-
-    # Сохранение
-    save_choice = input('\nСохранить? (y/n, Enter=да): ').strip().lower()
-    if save_choice in ['', 'y', 'yes', 'да']:
-        save_summary_to_file(summary, article_data.get('title', 'Без_названия'))
 
     print('\n✨ Готово!')
 
