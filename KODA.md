@@ -20,7 +20,7 @@
 | LLM (локальные) | Ollama (gemma3:12b) |
 | LLM (облачные) | OpenAI API (gpt-3.5-turbo, gpt-4) |
 | Парсинг HTML | BeautifulSoup4, requests |
-| HTTP-клиент | httpx |
+| HTTP-клиент | requests |
 | База данных | SQLite |
 | Конфигурация | python-dotenv |
 
@@ -36,13 +36,11 @@ study_agent/
 ├── summarizer.py       # Модуль генерации конспектов
 ├── database.py         # Модуль работы с SQLite
 ├── requirements.txt    # Зависимости Python
+├── README.md           # Основная документация
 ├── .env                # Конфигурация (токены, API-ключи)
-├── data/               # База данных и распарсенные статьи
-│   ├── study_agent.db  # SQLite база данных
-│   └── parsed_articles/# JSON с данными статей
-├── conspect/           # Сохранённые конспекты в формате Markdown
-├── docs/               # Документация
-└── venv/               # Виртуальное окружение Python
+├── data/               # База данных SQLite
+│   └── study_agent.db  # SQLite база данных
+└── docs/               # Документация
     ├── add-new-source.md
     ├── add-ollama-model.md
     ├── git-workflow.md
@@ -238,8 +236,10 @@ data = get_article('https://habr.com/ru/articles/123456/')
 - `_combine_markdown_content(files_data)` — объединение нескольких Markdown файлов
 
 **Константы:**
-- `MAX_CONTENT_LENGTH = 30000` — максимальная длина контента для обработки
-- `GITHUB_API_HEADERS` — заголовки для GitHub API (без авторизации: 60 запросов/час)
+- `MAX_CONTENT_LENGTH = 8000` — максимальная длина контента для обработки
+- `TIMEOUT_SECONDS = 10` — таймаут HTTP-запросов
+- `USER_AGENT` — User-Agent для HTTP-запросов
+- `IMPORTANT_MD_FILES` — список важных markdown файлов для GitHub
 
 ### Модуль `summarizer.py`
 
