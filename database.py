@@ -5,6 +5,8 @@
     - init_db() - инициализация БД и таблиц
     - article_exists(url) - проверка наличия статьи в БД
     - get_cached_summary(url) - получение сохранённого конспекта
+    - get_article_by_url(url) - получение статьи по URL
+    - get_article_by_id(id) - получение статьи по ID
     - save_article(...) - сохранение статьи с конспектом
     - update_article(...) - обновление конспекта существующей статьи
 
@@ -25,6 +27,7 @@ __all__ = [
     'article_exists',
     'get_cached_summary',
     'get_article_by_url',
+    'get_article_by_id',
     'save_article',
     'update_article',
 ]
@@ -154,6 +157,26 @@ def get_article_by_url(url: str) -> dict | None:
     try:
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM articles WHERE url = ?', (url,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_article_by_id(article_id: int) -> dict | None:
+    """
+    Получает полную информацию о статье по ID.
+
+    Args:
+        article_id: ID статьи в таблице articles (поле id)
+
+    Returns:
+        dict с полями статьи или None если не найдена
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM articles WHERE id = ?', (article_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
     finally:

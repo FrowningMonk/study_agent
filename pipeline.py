@@ -22,23 +22,19 @@ Example:
         python pipeline.py
 """
 
-import json
 import os
 import sys
-from datetime import datetime
 
 # Импортируем наши модули
 from scraper import get_article
-from summarizer import generate_summary, save_summary_to_file, AVAILABLE_MODELS, DEFAULT_MODEL
-from database import init_db, article_exists, save_article, update_article
+from summarizer import generate_summary, AVAILABLE_MODELS, DEFAULT_MODEL
+from database import init_db, article_exists, save_article, update_article, get_article_by_url
 
 # Публичный API модуля
 __all__ = ['process_article', 'ensure_directories']
 
 # Конфигурация путей
 DATA_DIR: str = 'data'
-PARSED_DIR: str = os.path.join(DATA_DIR, 'parsed_articles')
-CONSPECT_DIR: str = 'conspect'
 
 # Поддерживаемые источники
 SUPPORTED_SOURCES: dict[str, str] = {
@@ -54,10 +50,8 @@ def ensure_directories() -> None:
 
     Создаваемые директории:
         - data/
-        - data/parsed_articles/
-        - conspect/
     """
-    for directory in [DATA_DIR, PARSED_DIR, CONSPECT_DIR]:
+    for directory in [DATA_DIR]:
         if not os.path.exists(directory):
             os.makedirs(directory)
             print(f'📁 Создана папка: {directory}')
@@ -90,76 +84,6 @@ def get_source_name(url: str) -> str:
         if domain in url:
             return name
     return 'unknown'
-
-
-def generate_filename_from_url(url: str) -> str:
-    """
-    Генерирует имя файла из URL.
-
-    Args:
-        url: URL статьи или репозитория.
-
-    Returns:
-        Имя файла без расширения.
-
-    Examples:
-        >>> generate_filename_from_url('https://habr.com/ru/articles/984968/')
-        'habr_984968'
-        >>> generate_filename_from_url('https://github.com/anthropics/cookbook')
-        'github_anthropics_cookbook'
-        >>> generate_filename_from_url('https://infostart.ru/public/886103/')
-        'infostart_886103'
-    """
-    source = get_source_name(url)
-
-    if source == 'habr':
-        # Извлекаем ID статьи из URL Хабра
-        parts = url.rstrip('/').split('/')
-        article_id = parts[-1] if parts[-1].isdigit() else 'unknown'
-        return f'{source}_{article_id}'
-
-    elif source == 'github':
-        # Извлекаем owner/repo из URL GitHub
-        parts = url.rstrip('/').split('/')
-        if len(parts) >= 2:
-            owner = parts[-2]
-            repo = parts[-1]
-            return f'{source}_{owner}_{repo}'
-        return f'{source}_unknown'
-
-    elif source == 'infostart':
-        # Извлекаем ID статьи из URL InfoStart
-        # Примеры: /public/123456/ или /1c/articles/123456/
-        parts = url.rstrip('/').split('/')
-        article_id = parts[-1] if parts[-1].isdigit() else 'unknown'
-        return f'{source}_{article_id}'
-
-    return f'{source}_unknown'
-
-
-def save_parsed_data(article_data: dict, filename: str) -> str:
-    """
-    Сохраняет распарсенные данные в JSON.
-
-    Args:
-        article_data: Словарь с данными статьи.
-        filename: Имя файла без расширения.
-
-    Returns:
-        Путь к сохранённому файлу.
-    """
-    # Добавляем метаданные
-    article_data['parsed_at'] = datetime.now().isoformat()
-
-    # Формируем путь
-    file_path = os.path.join(PARSED_DIR, f'{filename}.json')
-
-    # Сохраняем
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(article_data, f, ensure_ascii=False, indent=2)
-
-    print(f'💾 Данные сохранены: {file_path}')
-    return file_path
 
 
 def format_article_info(article_data: dict) -> None:
@@ -209,22 +133,20 @@ def get_provider_name(model: str) -> str:
 def process_article(
     url: str,
     model: str = DEFAULT_MODEL,
-    save_json: bool = True,
     user_id: int | None = None,
     skip_cache: bool = False,
-) -> str | None:
+) -> tuple[str, int] | None:
     """
     Основная функция пайплайна: URL → Конспект.
 
     Args:
         url: URL статьи или репозитория для обработки.
         model: Модель для генерации (по умолчанию — локальная Ollama).
-        save_json: Сохранять ли промежуточный JSON с данными.
         user_id: Telegram user_id для привязки статьи.
         skip_cache: Пропустить проверку кеша (для принудительной перегенерации).
 
     Returns:
-        Путь к файлу конспекта или None при ошибке.
+        Кортеж (summary: str, article_id: int) или None при ошибке.
     """
     # Инициализация БД (идемпотентная операция)
     init_db()
@@ -251,12 +173,7 @@ def process_article(
 
     format_article_info(article_data)
 
-    # ШАГ 2: Сохранение промежуточных данных (опционально)
-    if save_json:
-        filename = generate_filename_from_url(url)
-        save_parsed_data(article_data, filename)
-
-    # ШАГ 3: Генерация конспекта
+    # ШАГ 2: Генерация конспекта
     provider_name = get_provider_name(model)
     print(f'\n🧠 ШАГ 2: Генерация конспекта...')
     print(f'   Модель: {model} ({provider_name})')
@@ -271,15 +188,8 @@ def process_article(
 
     print('✅ Конспект сгенерирован!')
 
-    # ШАГ 4: Сохранение конспекта
-    print('\n💾 ШАГ 3: Сохранение конспекта...')
-    print('-' * 40)
-
-    article_title = article_data.get('title', 'Без_названия')
-    saved_path = save_summary_to_file(summary, article_title, CONSPECT_DIR)
-
-    # ШАГ 5: Сохранение в БД
-    print('\n🗄️ ШАГ 4: Сохранение в базу данных...')
+    # ШАГ 3: Сохранение в БД
+    print('\n🗄️ ШАГ 3: Сохранение в базу данных...')
     print('-' * 40)
 
     # Проверяем, есть ли уже запись (при skip_cache=True)
@@ -287,6 +197,11 @@ def process_article(
         # Обновляем существующую запись
         update_article(url=url, summary=summary, model=model)
         print('✅ Обновлено в БД')
+        # Получаем ID существующей записи
+        article_id = None
+        existing_article = get_article_by_url(url)
+        if existing_article:
+            article_id = existing_article['id']
     else:
         # Создаём новую запись
         article_id = save_article(
@@ -303,9 +218,8 @@ def process_article(
     print('=' * 60)
     print(f'📄 Исходный URL: {url}')
     print(f'🤖 Использована модель: {model}')
-    print(f'📚 Конспект сохранён: {saved_path}')
 
-    return saved_path
+    return summary, article_id
 
 
 def interactive_mode() -> None:
@@ -351,14 +265,14 @@ def interactive_mode() -> None:
     result = process_article(url, model=model)
 
     if result:
+        summary, article_id = result
         # Предлагаем просмотреть результат
         view_choice = input('\n👀 Показать конспект? (y/n, Enter = да): ').strip().lower()
         if view_choice in ['', 'y', 'yes', 'да']:
             print('\n' + '=' * 60)
             print('📚 СОДЕРЖИМОЕ КОНСПЕКТА:')
             print('=' * 60)
-            with open(result, 'r', encoding='utf-8') as f:
-                print(f.read())
+            print(summary)
 
 
 def main() -> None:

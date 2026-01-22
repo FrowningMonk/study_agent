@@ -347,23 +347,21 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
 
         try:
             # skip_cache=True для принудительной перегенерации
-            result_path = process_article(
+            result = process_article(
                 url,
                 model=model,
-                save_json=True,
                 user_id=user_id,
                 skip_cache=True,
             )
 
-            if result_path is None:
+            if result is None:
                 bot.send_message(
                     call.message.chat.id,
                     MSG_ERROR.format(error='Не удалось обработать статью'),
                 )
                 return
 
-            with open(result_path, 'r', encoding='utf-8') as f:
-                summary = f.read()
+            summary, article_id = result
 
             header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
             if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -372,7 +370,7 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 bot.send_message(call.message.chat.id, f'🔄 Перегенерировано! Модель: {model}')
                 send_long_message(call.message.chat.id, summary)
 
-            print(f'Перегенерирован конспект для {user_id}: {url}')
+            print(f'Перегенерирован конспект для {user_id}: {url}, article_id={article_id}')
 
         except Exception as e:
             bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
@@ -431,9 +429,9 @@ def handle_url(message: telebot.types.Message) -> None:
     status_msg = bot.reply_to(message, MSG_PROCESSING)
 
     try:
-        result_path = process_article(url, model=model, save_json=True, user_id=user_id)
+        result = process_article(url, model=model, user_id=user_id)
 
-        if result_path is None:
+        if result is None:
             bot.edit_message_text(
                 MSG_ERROR.format(error='Не удалось обработать статью'),
                 chat_id=message.chat.id,
@@ -441,8 +439,7 @@ def handle_url(message: telebot.types.Message) -> None:
             )
             return
 
-        with open(result_path, 'r', encoding='utf-8') as f:
-            summary = f.read()
+        summary, article_id = result
 
         # Удаляем статусное сообщение
         try:
@@ -458,7 +455,7 @@ def handle_url(message: telebot.types.Message) -> None:
             bot.send_message(message.chat.id, f'Готово! Модель: {model}')
             send_long_message(message.chat.id, summary)
 
-        print(f'Конспект отправлен пользователю {user_id}')
+        print(f'Конспект отправлен пользователю {user_id}, article_id={article_id}')
 
     except Exception as e:
         error_text = MSG_ERROR.format(error=str(e))
