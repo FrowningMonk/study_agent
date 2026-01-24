@@ -27,9 +27,22 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 
-from pipeline import ensure_directories, process_article
+from pipeline import ensure_directories, process_article, save_article_to_db
 from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
-from database import init_db, article_exists, get_cached_summary
+from database import (
+    init_db,
+    article_exists,
+    get_cached_summary,
+    get_article_by_id,
+    create_idea,
+    get_user_ideas,
+    get_idea_by_id,
+    update_idea,
+    delete_idea,
+    link_article_to_idea,
+    unlink_article_from_idea,
+    get_articles_by_idea,
+)
 
 load_dotenv()
 
@@ -62,6 +75,10 @@ MSG_START: str = """👋 Привет!
 2. Подожди 30-60 секунд
 3. Я расскажу о чем ссылка.
 
+💡 Идеи:
+• /new_idea — создать новую идею
+• /ideas — посмотреть свои идеи
+
 📌 Поддерживаемые источники:
 • habr.com — технические статьи
 • github.com — README репозиториев
@@ -72,7 +89,13 @@ MSG_START: str = """👋 Привет!
 💡 Попробуй отправить ссылку прямо сейчас!
 
 /help — справка по командам"""
-MSG_HELP = "Команды:\n/start - начало\n/model - выбор модели\n\nПоддерживаемые источники: habr.com, github.com, infostart.ru"
+MSG_HELP = """Команды:
+/start - начало
+/model - выбор модели
+/new_idea - создать идею
+/ideas - посмотреть идеи
+
+Поддерживаемые источники: habr.com, github.com, infostart.ru"""
 MSG_PROCESSING = "Обрабатываю..."
 MSG_ERROR = "Ошибка: {error}"
 MSG_UNSUPPORTED = "Я такие ссылки пока не понимаю. Поддерживаемые источники: habr.com, github.com, infostart.ru"
@@ -81,6 +104,25 @@ MSG_UNKNOWN = "Без ссылки работать бессмысленно. /h
 MSG_MODEL_SELECT = "Текущая модель: {current_model}\n\nВыбери модель:"
 MSG_MODEL_CHANGED = "Модель изменена: {model}"
 MSG_DUPLICATE_FOUND = "📦 Эта статья уже обработана.\n\nЧто сделать?"
+
+# Сообщения для идей
+MSG_IDEA_ASK_NAME = "Пришли название своей идеи."
+MSG_IDEA_ASK_DESCRIPTION = "Теперь пришли описание для этой идеи (можно использовать Markdown)."
+MSG_IDEA_CREATED = "Идея '{name}' успешно создана!"
+MSG_IDEAS_EMPTY = "У тебя пока нет идей."
+MSG_IDEAS_TITLE = "Твои идеи:"
+MSG_IDEA_NOT_FOUND = "Идея не найдена или доступ к ней запрещён."
+MSG_IDEA_CONFIRM_DELETE = "Ты уверен, что хочешь удалить эту идею? Нажми 'Да' для подтверждения."
+MSG_IDEA_DELETED = "Идея удалена."
+MSG_IDEA_UPDATED = "Идея '{name}' успешно обновлена!"
+
+# Сообщения для привязки статей к идеям
+MSG_LINK_SELECT_IDEAS = "Выбери идеи для привязки статьи (можно несколько):"
+MSG_LINK_DONE = "Статья привязана к идеям: {ideas}"
+MSG_LINK_SKIPPED = "Статья не привязана ни к одной идее."
+MSG_IDEA_ARTICLES_TITLE = "Статьи, привязанные к идее «{name}»:"
+MSG_IDEA_NO_ARTICLES = "К этой идее пока не привязано ни одной статьи."
+MSG_ARTICLE_UNLINKED = "Статья отвязана от идеи."
 
 
 # Проверяем наличие токена перед запуском
@@ -171,6 +213,10 @@ def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
 # Временное хранилище URL по хешу (для callback)
 pending_cache_urls: dict[str, str] = {}
 
+# Хранилище состояния multiselect для привязки статей к идеям
+# Формат: {user_id: {'article_data': dict, 'summary': str, 'model': str, 'selected_ideas': set[int]}}
+pending_article_links: dict[int, dict] = {}
+
 
 def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
     """
@@ -196,6 +242,68 @@ def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
         )
         keyboard.add(button)
     return keyboard
+
+
+def create_link_ideas_keyboard(
+    ideas: list[dict],
+    selected_ids: set[int],
+) -> types.InlineKeyboardMarkup:
+    """
+    Создаёт inline-клавиатуру для multiselect привязки к идеям.
+
+    Args:
+        ideas: список идей пользователя
+        selected_ids: множество ID уже выбранных идей
+
+    Returns:
+        InlineKeyboardMarkup с toggle-кнопками идей
+    """
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for idea in ideas:
+        idea_id = idea['id']
+        is_selected = idea_id in selected_ids
+        prefix = "✅ " if is_selected else "⬜ "
+        button = types.InlineKeyboardButton(
+            text=f"{prefix}{idea['name'][:40]}",
+            callback_data=f"toggle_link:{idea_id}",
+        )
+        keyboard.add(button)
+
+    # Кнопки "Готово" и "Не привязывать"
+    done_btn = types.InlineKeyboardButton(
+        text="✔️ Готово",
+        callback_data="link_done",
+    )
+    skip_btn = types.InlineKeyboardButton(
+        text="❌ Не привязывать",
+        callback_data="link_skip",
+    )
+    keyboard.row(done_btn, skip_btn)
+
+    return keyboard
+
+
+def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int) -> None:
+    """
+    Предлагает пользователю привязать статью к идеям.
+
+    Показывает multiselect клавиатуру если у пользователя есть идеи.
+    """
+    ideas = get_user_ideas(user_id)
+
+    if not ideas:
+        # У пользователя нет идей — не показываем выбор
+        return
+
+    # Инициализируем состояние multiselect
+    pending_article_links[user_id] = {
+        'article_id': article_id,
+        'selected_ideas': set(),
+    }
+
+    keyboard = create_link_ideas_keyboard(ideas, set())
+    bot.send_message(chat_id, MSG_LINK_SELECT_IDEAS, reply_markup=keyboard)
 
 
 def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_SIZE) -> None:
@@ -242,11 +350,25 @@ def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_S
         bot.send_message(chat_id, current_chunk)
 
 
+def create_main_keyboard() -> types.ReplyKeyboardMarkup:
+    """
+    Создаёт постоянную клавиатуру с основными командами.
+
+    Returns:
+        ReplyKeyboardMarkup с кнопками команд
+    """
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.row('/ideas', '/new_idea')
+    keyboard.row('/model', '/help')
+    return keyboard
+
+
 # Обработчики команд и сообщений
 @bot.message_handler(commands=['start'])
 def handle_start(message: telebot.types.Message) -> None:
     """Обрабатывает команду /start - приветствие и инструкции."""
-    bot.reply_to(message, MSG_START)
+    keyboard = create_main_keyboard()
+    bot.send_message(message.chat.id, MSG_START, reply_markup=keyboard)
 
 
 @bot.message_handler(commands=['help'])
@@ -361,7 +483,9 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 )
                 return
 
-            summary, article_id = result
+            summary, article_data = result
+            # Сохраняем статью в БД и получаем ID
+            article_id = save_article_to_db(article_data, summary, model, user_id, url)
 
             header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
             if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -378,6 +502,131 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
 
         # Очищаем временное хранилище
         pending_cache_urls.pop(url_hash, None)
+
+
+# ========================
+# Обработчики для привязки статей к идеям (multiselect)
+# ========================
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_link:'))
+def handle_toggle_link(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает toggle выбора идеи в multiselect.
+
+    Callback data формат: toggle_link:{idea_id}
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    # Проверяем наличие активной сессии
+    if user_id not in pending_article_links:
+        bot.answer_callback_query(call.id, "Сессия истекла, отправь статью заново")
+        return
+
+    # Сразу отвечаем на callback, чтобы убрать "часики"
+    bot.answer_callback_query(call.id)
+
+    session = pending_article_links[user_id]
+    selected = session['selected_ideas']
+
+    # Toggle состояния
+    if idea_id in selected:
+        selected.discard(idea_id)
+    else:
+        selected.add(idea_id)
+
+    # Обновляем клавиатуру
+    try:
+        ideas = get_user_ideas(user_id)
+        keyboard = create_link_ideas_keyboard(ideas, selected)
+
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        print(f'Ошибка toggle_link для {user_id}: {e}')
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'link_done')
+def handle_link_done(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает завершение выбора идей — сохраняет привязки.
+    """
+    user_id = call.from_user.id
+
+    if user_id not in pending_article_links:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+
+    # Сразу отвечаем на callback, чтобы убрать "часики" в Telegram
+    bot.answer_callback_query(call.id)
+
+    session = pending_article_links[user_id]
+    article_id = session['article_id']
+    selected_ideas = session['selected_ideas']
+
+    try:
+        if not selected_ideas:
+            # Ничего не выбрано
+            bot.edit_message_text(
+                MSG_LINK_SKIPPED,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+        else:
+            # Сохраняем привязки
+            linked_names = []
+            for idea_id in selected_ideas:
+                success = link_article_to_idea(article_id, idea_id, user_id)
+                if success:
+                    idea = get_idea_by_id(idea_id, user_id)
+                    if idea:
+                        linked_names.append(idea['name'])
+
+            if linked_names:
+                bot.edit_message_text(
+                    MSG_LINK_DONE.format(ideas=", ".join(linked_names)),
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+            else:
+                bot.edit_message_text(
+                    MSG_LINK_SKIPPED,
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+    except Exception as e:
+        print(f'Ошибка привязки статьи к идеям для {user_id}: {e}')
+        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+    finally:
+        # Очищаем сессию в любом случае
+        pending_article_links.pop(user_id, None)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'link_skip')
+def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает отказ от привязки статьи к идеям.
+    """
+    user_id = call.from_user.id
+
+    # Сразу отвечаем на callback, чтобы убрать "часики"
+    bot.answer_callback_query(call.id)
+
+    try:
+        bot.edit_message_text(
+            MSG_LINK_SKIPPED,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+    except Exception as e:
+        print(f'Ошибка link_skip для {user_id}: {e}')
+    finally:
+        # Очищаем сессию в любом случае
+        pending_article_links.pop(user_id, None)
 
 
 @bot.message_handler(func=lambda message: extract_url(message.text) is not None)
@@ -439,7 +688,9 @@ def handle_url(message: telebot.types.Message) -> None:
             )
             return
 
-        summary, article_id = result
+        summary, article_data = result
+        # Сохраняем статью в БД и получаем ID
+        article_id = save_article_to_db(article_data, summary, model, user_id, url)
 
         # Удаляем статусное сообщение
         try:
@@ -457,6 +708,10 @@ def handle_url(message: telebot.types.Message) -> None:
 
         print(f'Конспект отправлен пользователю {user_id}, article_id={article_id}')
 
+        # Предлагаем привязать статью к идеям
+        if article_id:
+            _offer_link_to_ideas(message.chat.id, user_id, article_id)
+
     except Exception as e:
         error_text = MSG_ERROR.format(error=str(e))
         try:
@@ -470,10 +725,459 @@ def handle_url(message: telebot.types.Message) -> None:
         print(f'Ошибка для {user_id}: {e}')
 
 
+@bot.message_handler(commands=['new_idea'])
+def handle_new_idea(message: telebot.types.Message) -> None:
+    """
+    Обрабатывает команду /new_idea - начало создания новой идеи.
+
+    Запрашивает у пользователя название идеи, затем описание.
+    Использует register_next_step_handler для цепочки сообщений.
+    """
+    user_id = message.from_user.id
+    bot.reply_to(message, MSG_IDEA_ASK_NAME)
+    # Регистрируем следующий шаг - получение названия
+    bot.register_next_step_handler(message, process_idea_name, user_id)
+
+
+def process_idea_name(message: telebot.types.Message, user_id: int) -> None:
+    """
+    Обрабатывает название идеи, запрашивает описание.
+
+    Args:
+        message: сообщение с названием идеи
+        user_id: ID пользователя
+    """
+    idea_name = message.text.strip()
+    if not idea_name:
+        bot.send_message(message.chat.id, "Название не может быть пустым. Пришли название идеи:")
+        bot.register_next_step_handler(message, process_idea_name, user_id)
+        return
+
+    bot.send_message(message.chat.id, MSG_IDEA_ASK_DESCRIPTION)
+    # Регистрируем следующий шаг - получение описания
+    bot.register_next_step_handler(message, process_idea_description, user_id, idea_name)
+
+
+def process_idea_description(message: telebot.types.Message, user_id: int, idea_name: str) -> None:
+    """
+    Обрабатывает описание идеи, создаёт идею в базе.
+
+    Args:
+        message: сообщение с описанием идеи
+        user_id: ID пользователя
+        idea_name: название идеи, полученное на предыдущем шаге
+    """
+    idea_description = message.text.strip() if message.text else ""
+
+    try:
+        idea_id = create_idea(idea_name, idea_description if idea_description else None, user_id)
+        bot.send_message(message.chat.id, MSG_IDEA_CREATED.format(name=idea_name))
+        print(f'Пользователь {user_id} создал идею {idea_id}: {idea_name}')
+    except Exception as e:
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        print(f'Ошибка создания идеи для {user_id}: {e}')
+
+
+@bot.message_handler(commands=['ideas'])
+def handle_ideas(message: telebot.types.Message) -> None:
+    """
+    Обрабатывает команду /ideas - показывает список идей пользователя.
+
+    Получает все идеи пользователя и отображает их в виде inline-клавиатуры.
+    """
+    user_id = message.from_user.id
+    ideas = get_user_ideas(user_id)
+
+    if not ideas:
+        bot.send_message(message.chat.id, MSG_IDEAS_EMPTY)
+        return
+
+    # Создаём inline-клавиатуру со списком идей
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for idx, idea in enumerate(ideas, 1):
+        button = types.InlineKeyboardButton(
+            text=f"{idx}. {idea['name'][:50]}",  # Ограничиваем длину названия
+            callback_data=f"view_idea:{idea['id']}",
+        )
+        keyboard.add(button)
+
+    bot.send_message(message.chat.id, MSG_IDEAS_TITLE, reply_markup=keyboard)
+    
+
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message: telebot.types.Message) -> None:
     """Обрабатывает все остальные сообщения - отправляет подсказку."""
     bot.reply_to(message, MSG_UNKNOWN)
+
+
+# ========================
+# Обработчики команд для работы с идеями
+# ========================
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('view_idea:'))
+def handle_view_idea(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает нажатие кнопки просмотра идеи.
+
+    Показывает детали идеи с возможностью редактирования и удаления.
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    idea = get_idea_by_id(idea_id, user_id)
+
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+
+    # Формируем сообщение с деталями идеи
+    idea_text = f"**{idea['name']}**\n\n{idea['description'] or '(нет описания)'}"
+
+    # Создаём клавиатуру с кнопками
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    articles_btn = types.InlineKeyboardButton(
+        text="📚 Статьи",
+        callback_data=f"idea_articles:{idea_id}",
+    )
+    edit_btn = types.InlineKeyboardButton(
+        text="✏️ Редактировать",
+        callback_data=f"edit_idea:{idea_id}",
+    )
+    delete_btn = types.InlineKeyboardButton(
+        text="🗑️ Удалить",
+        callback_data=f"delete_idea:{idea_id}",
+    )
+    keyboard.row(articles_btn)
+    keyboard.row(edit_btn, delete_btn)
+
+    bot.edit_message_text(
+        idea_text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=keyboard,
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('idea_articles:'))
+def handle_idea_articles(call: telebot.types.CallbackQuery) -> None:
+    """
+    Показывает список статей, привязанных к идее.
+
+    Callback data формат: idea_articles:{idea_id}
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+
+    articles = get_articles_by_idea(idea_id, user_id)
+
+    if not articles:
+        # Нет статей — показываем сообщение с кнопкой "Назад"
+        keyboard = types.InlineKeyboardMarkup()
+        back_btn = types.InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"view_idea:{idea_id}",
+        )
+        keyboard.add(back_btn)
+
+        bot.edit_message_text(
+            MSG_IDEA_NO_ARTICLES,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=keyboard,
+        )
+        bot.answer_callback_query(call.id)
+        return
+
+    # Формируем список статей с кнопками
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+
+    for idx, article in enumerate(articles, 1):
+        article_id = article['id']
+        title = article['title'][:25] + "..." if len(article['title']) > 25 else article['title']
+
+        # Кнопка "Конспект" и "Отвязать" для каждой статьи
+        summary_btn = types.InlineKeyboardButton(
+            text=f"📄 {idx}. {title}",
+            callback_data=f"show_summary:{article_id}:{idea_id}",
+        )
+        unlink_btn = types.InlineKeyboardButton(
+            text="🔗❌",
+            callback_data=f"unlink:{article_id}:{idea_id}",
+        )
+        keyboard.row(summary_btn, unlink_btn)
+
+    # Кнопка "Назад"
+    back_btn = types.InlineKeyboardButton(
+        text="⬅️ Назад к идее",
+        callback_data=f"view_idea:{idea_id}",
+    )
+    keyboard.add(back_btn)
+
+    bot.edit_message_text(
+        MSG_IDEA_ARTICLES_TITLE.format(name=idea['name']),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=keyboard,
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('show_summary:'))
+def handle_show_summary(call: telebot.types.CallbackQuery) -> None:
+    """
+    Показывает конспект статьи.
+
+    Callback data формат: show_summary:{article_id}:{idea_id}
+    """
+    parts = call.data.split(':')
+    article_id = int(parts[1])
+
+    article = get_article_by_id(article_id)
+    if not article:
+        bot.answer_callback_query(call.id, "Статья не найдена")
+        return
+
+    summary = article.get('summary', '(конспект отсутствует)')
+    title = article.get('title', 'Без названия')
+    url = article.get('url', '')
+
+    # Отправляем конспект отдельным сообщением
+    header = f"📄 **{title}**\n🔗 {url}\n\n"
+    bot.answer_callback_query(call.id)
+
+    if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        bot.send_message(call.message.chat.id, header + summary)
+    else:
+        bot.send_message(call.message.chat.id, header)
+        send_long_message(call.message.chat.id, summary)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('unlink:'))
+def handle_unlink_article(call: telebot.types.CallbackQuery) -> None:
+    """
+    Отвязывает статью от идеи.
+
+    Callback data формат: unlink:{article_id}:{idea_id}
+    """
+    user_id = call.from_user.id
+    parts = call.data.split(':')
+    article_id = int(parts[1])
+    idea_id = int(parts[2])
+
+    success = unlink_article_from_idea(article_id, idea_id, user_id)
+
+    if success:
+        bot.answer_callback_query(call.id, MSG_ARTICLE_UNLINKED)
+        # Обновляем список статей — симулируем нажатие на "Статьи"
+        call.data = f"idea_articles:{idea_id}"
+        handle_idea_articles(call)
+    else:
+        bot.answer_callback_query(call.id, "Не удалось отвязать статью")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_idea:'))
+def handle_edit_idea(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает нажатие кнопки редактирования идеи.
+
+    Запрашивает новое название, затем новое описание.
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    # Получаем текущую идею для отображения
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+
+    # Показываем текущее название и запрашиваем новое
+    current_text = (
+        f"Текущее название: *{idea['name']}*\n\n"
+        "Пришли новое название идеи:"
+    )
+    bot.send_message(call.message.chat.id, current_text, parse_mode='Markdown')
+    bot.register_next_step_handler(call.message, process_edit_name, user_id, idea_id)
+
+
+def process_edit_name(message: telebot.types.Message, user_id: int, idea_id: int) -> None:
+    """
+    Обрабатывает новое название при редактировании.
+
+    Args:
+        message: сообщение с новым названием
+        user_id: ID пользователя
+        idea_id: ID идеи
+    """
+    new_name = message.text.strip()
+    if not new_name:
+        bot.send_message(message.chat.id, "Название не может быть пустым. Пришли новое название:")
+        bot.register_next_step_handler(message, process_edit_name, user_id, idea_id)
+        return
+
+    # Получаем текущее описание для отображения
+    idea = get_idea_by_id(idea_id, user_id)
+    if idea:
+        current_desc = idea['description'] or '(нет описания)'
+        current_text = (
+            f"Новое название: *{new_name}*\n\n"
+            f"Текущее описание:\n{current_desc}\n\n"
+            "Пришли новое описание (или /skip чтобы оставить текущее):"
+        )
+        bot.send_message(message.chat.id, current_text, parse_mode='Markdown')
+
+    # Регистрируем следующий шаг - получение нового описания
+    bot.register_next_step_handler(message, process_edit_description, user_id, idea_id, new_name)
+
+
+def process_edit_description(message: telebot.types.Message, user_id: int, idea_id: int, new_name: str) -> None:
+    """
+    Обрабатывает новое описание при редактировании.
+
+    Args:
+        message: сообщение с новым описанием
+        user_id: ID пользователя
+        idea_id: ID идеи
+        new_name: новое название (уже введённое)
+    """
+    new_description = None
+    if message.text and message.text.strip() != '/skip':
+        new_description = message.text.strip()
+
+    try:
+        success = update_idea(idea_id, user_id, name=new_name, description=new_description)
+        if success:
+            bot.send_message(message.chat.id, MSG_IDEA_UPDATED.format(name=new_name))
+            print(f'Пользователь {user_id} обновил идею {idea_id}: {new_name}')
+        else:
+            bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
+    except Exception as e:
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        print(f'Ошибка обновления идеи для {user_id}: {e}')
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_idea:'))
+def handle_delete_idea(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает нажатие кнопки удаления идеи.
+
+    Запрашивает подтверждение перед удалением.
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    # Проверяем существование идеи
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+
+    # Создаём клавиатуру подтверждения
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    confirm_btn = types.InlineKeyboardButton(
+        text="Да",
+        callback_data=f"confirm_delete:{idea_id}",
+    )
+    cancel_btn = types.InlineKeyboardButton(
+        text="Отмена",
+        callback_data=f"cancel_delete:{idea_id}",
+    )
+    keyboard.add(confirm_btn, cancel_btn)
+
+    bot.edit_message_text(
+        MSG_IDEA_CONFIRM_DELETE,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=keyboard,
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_delete:'))
+def handle_confirm_delete(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает подтверждение удаления идеи.
+    """
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+
+    try:
+        success = delete_idea(idea_id, user_id)
+        if success:
+            bot.edit_message_text(
+                MSG_IDEA_DELETED,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+            print(f'Пользователь {user_id} удалил идею {idea_id}')
+        else:
+            bot.edit_message_text(
+                MSG_IDEA_NOT_FOUND,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+            )
+    except Exception as e:
+        bot.edit_message_text(
+            MSG_ERROR.format(error=str(e)),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        print(f'Ошибка удаления идеи для {user_id}: {e}')
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_delete:'))
+def handle_cancel_delete(call: telebot.types.CallbackQuery) -> None:
+    """
+    Обрабатывает отмену удаления идеи.
+    """
+    idea_id = int(call.data.split(':')[1])
+
+    # Получаем обновлённую информацию об идее
+    user_id = call.from_user.id
+    idea = get_idea_by_id(idea_id, user_id)
+
+    if idea:
+        # Возвращаемся к просмотру деталей идеи
+        idea_text = f"**{idea['name']}**\n\n{idea['description'] or '(нет описания)'}"
+
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        articles_btn = types.InlineKeyboardButton(
+            text="📚 Статьи",
+            callback_data=f"idea_articles:{idea_id}",
+        )
+        edit_btn = types.InlineKeyboardButton(
+            text="✏️ Редактировать",
+            callback_data=f"edit_idea:{idea_id}",
+        )
+        delete_btn = types.InlineKeyboardButton(
+            text="🗑️ Удалить",
+            callback_data=f"delete_idea:{idea_id}",
+        )
+        keyboard.row(articles_btn)
+        keyboard.row(edit_btn, delete_btn)
+
+        bot.edit_message_text(
+            idea_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=keyboard,
+        )
+    else:
+        bot.edit_message_text(
+            MSG_IDEA_NOT_FOUND,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+
+    bot.answer_callback_query(call.id)
 
 
 def main() -> None:
