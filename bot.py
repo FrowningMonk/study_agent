@@ -27,7 +27,7 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 
-from pipeline import ensure_directories, process_article
+from pipeline import ensure_directories, process_article, save_article_to_db
 from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
 from database import (
     init_db,
@@ -214,7 +214,7 @@ def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
 pending_cache_urls: dict[str, str] = {}
 
 # Хранилище состояния multiselect для привязки статей к идеям
-# Формат: {user_id: {'article_id': int, 'selected_ideas': set[int]}}
+# Формат: {user_id: {'article_data': dict, 'summary': str, 'model': str, 'selected_ideas': set[int]}}
 pending_article_links: dict[int, dict] = {}
 
 
@@ -483,7 +483,9 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 )
                 return
 
-            summary, article_id = result
+            summary, article_data = result
+            # Сохраняем статью в БД и получаем ID
+            article_id = save_article_to_db(article_data, summary, model, user_id, url)
 
             header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
             if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -522,6 +524,9 @@ def handle_toggle_link(call: telebot.types.CallbackQuery) -> None:
         bot.answer_callback_query(call.id, "Сессия истекла, отправь статью заново")
         return
 
+    # Сразу отвечаем на callback, чтобы убрать "часики"
+    bot.answer_callback_query(call.id)
+
     session = pending_article_links[user_id]
     selected = session['selected_ideas']
 
@@ -532,15 +537,17 @@ def handle_toggle_link(call: telebot.types.CallbackQuery) -> None:
         selected.add(idea_id)
 
     # Обновляем клавиатуру
-    ideas = get_user_ideas(user_id)
-    keyboard = create_link_ideas_keyboard(ideas, selected)
+    try:
+        ideas = get_user_ideas(user_id)
+        keyboard = create_link_ideas_keyboard(ideas, selected)
 
-    bot.edit_message_reply_markup(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=keyboard,
-    )
-    bot.answer_callback_query(call.id)
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        print(f'Ошибка toggle_link для {user_id}: {e}')
 
 
 @bot.callback_query_handler(func=lambda call: call.data == 'link_done')
@@ -554,43 +561,49 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
         bot.answer_callback_query(call.id, "Сессия истекла")
         return
 
+    # Сразу отвечаем на callback, чтобы убрать "часики" в Telegram
+    bot.answer_callback_query(call.id)
+
     session = pending_article_links[user_id]
     article_id = session['article_id']
     selected_ideas = session['selected_ideas']
 
-    if not selected_ideas:
-        # Ничего не выбрано
-        bot.edit_message_text(
-            MSG_LINK_SKIPPED,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
-    else:
-        # Сохраняем привязки
-        linked_names = []
-        for idea_id in selected_ideas:
-            success = link_article_to_idea(article_id, idea_id, user_id)
-            if success:
-                idea = get_idea_by_id(idea_id, user_id)
-                if idea:
-                    linked_names.append(idea['name'])
-
-        if linked_names:
-            bot.edit_message_text(
-                MSG_LINK_DONE.format(ideas=", ".join(linked_names)),
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-            )
-        else:
+    try:
+        if not selected_ideas:
+            # Ничего не выбрано
             bot.edit_message_text(
                 MSG_LINK_SKIPPED,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
             )
+        else:
+            # Сохраняем привязки
+            linked_names = []
+            for idea_id in selected_ideas:
+                success = link_article_to_idea(article_id, idea_id, user_id)
+                if success:
+                    idea = get_idea_by_id(idea_id, user_id)
+                    if idea:
+                        linked_names.append(idea['name'])
 
-    # Очищаем сессию
-    pending_article_links.pop(user_id, None)
-    bot.answer_callback_query(call.id)
+            if linked_names:
+                bot.edit_message_text(
+                    MSG_LINK_DONE.format(ideas=", ".join(linked_names)),
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+            else:
+                bot.edit_message_text(
+                    MSG_LINK_SKIPPED,
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                )
+    except Exception as e:
+        print(f'Ошибка привязки статьи к идеям для {user_id}: {e}')
+        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+    finally:
+        # Очищаем сессию в любом случае
+        pending_article_links.pop(user_id, None)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == 'link_skip')
@@ -600,15 +613,20 @@ def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
     """
     user_id = call.from_user.id
 
-    bot.edit_message_text(
-        MSG_LINK_SKIPPED,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-    )
-
-    # Очищаем сессию
-    pending_article_links.pop(user_id, None)
+    # Сразу отвечаем на callback, чтобы убрать "часики"
     bot.answer_callback_query(call.id)
+
+    try:
+        bot.edit_message_text(
+            MSG_LINK_SKIPPED,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+    except Exception as e:
+        print(f'Ошибка link_skip для {user_id}: {e}')
+    finally:
+        # Очищаем сессию в любом случае
+        pending_article_links.pop(user_id, None)
 
 
 @bot.message_handler(func=lambda message: extract_url(message.text) is not None)
@@ -670,7 +688,9 @@ def handle_url(message: telebot.types.Message) -> None:
             )
             return
 
-        summary, article_id = result
+        summary, article_data = result
+        # Сохраняем статью в БД и получаем ID
+        article_id = save_article_to_db(article_data, summary, model, user_id, url)
 
         # Удаляем статусное сообщение
         try:

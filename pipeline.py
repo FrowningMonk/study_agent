@@ -31,7 +31,7 @@ from summarizer import generate_summary, AVAILABLE_MODELS, DEFAULT_MODEL
 from database import init_db, article_exists, save_article, update_article, get_article_by_url
 
 # Публичный API модуля
-__all__ = ['process_article', 'ensure_directories']
+__all__ = ['process_article', 'ensure_directories', 'save_article_to_db']
 
 # Конфигурация путей
 DATA_DIR: str = 'data'
@@ -135,9 +135,12 @@ def process_article(
     model: str = DEFAULT_MODEL,
     user_id: int | None = None,
     skip_cache: bool = False,
-) -> tuple[str, int] | None:
+) -> tuple[str, dict] | None:
     """
     Основная функция пайплайна: URL → Конспект.
+
+    Примечание: сохранение в БД НЕ выполняется. Используйте save_article_to_db()
+    для явного сохранения после подтверждения пользователем.
 
     Args:
         url: URL статьи или репозитория для обработки.
@@ -146,7 +149,7 @@ def process_article(
         skip_cache: Пропустить проверку кеша (для принудительной перегенерации).
 
     Returns:
-        Кортеж (summary: str, article_id: int) или None при ошибке.
+        Кортеж (summary: str, article_data: dict) или None при ошибке.
     """
     # Инициализация БД (идемпотентная операция)
     init_db()
@@ -188,30 +191,6 @@ def process_article(
 
     print('✅ Конспект сгенерирован!')
 
-    # ШАГ 3: Сохранение в БД
-    print('\n🗄️ ШАГ 3: Сохранение в базу данных...')
-    print('-' * 40)
-
-    # Проверяем, есть ли уже запись (при skip_cache=True)
-    if article_exists(url):
-        # Обновляем существующую запись
-        update_article(url=url, summary=summary, model=model)
-        print('✅ Обновлено в БД')
-        # Получаем ID существующей записи
-        article_id = None
-        existing_article = get_article_by_url(url)
-        if existing_article:
-            article_id = existing_article['id']
-    else:
-        # Создаём новую запись
-        article_id = save_article(
-            article_data=article_data,
-            summary=summary,
-            model=model,
-            user_id=user_id,
-        )
-        print(f'✅ Сохранено в БД: article_id={article_id}')
-
     # Итог
     print('\n' + '=' * 60)
     print('✨ ПАЙПЛАЙН ЗАВЕРШЁН УСПЕШНО')
@@ -219,7 +198,51 @@ def process_article(
     print(f'📄 Исходный URL: {url}')
     print(f'🤖 Использована модель: {model}')
 
-    return summary, article_id
+    return summary, article_data
+
+
+def save_article_to_db(
+    article_data: dict,
+    summary: str,
+    model: str,
+    user_id: int | None = None,
+    url: str | None = None,
+) -> int:
+    """
+    Сохраняет статью в базу данных.
+
+    Используется для явного сохранения после подтверждения пользователем.
+
+    Args:
+        article_data: Словарь с данными статьи из scraper.
+        summary: Сгенерированный конспект.
+        model: Использованная модель.
+        user_id: Telegram user_id.
+        url: URL статьи (опционально, для проверки дубликата).
+
+    Returns:
+        ID сохранённой статьи или None если статья уже существует.
+    """
+    # Проверяем, есть ли уже запись
+    check_url = url or article_data.get('url')
+    if check_url and article_exists(check_url):
+        # Статья уже существует - возвращаем ID
+        existing = get_article_by_url(check_url)
+        if existing:
+            # Обновляем конспект
+            update_article(url=check_url, summary=summary, model=model)
+            print(f'✅ Обновлено в БД: article_id={existing["id"]}')
+            return existing['id']
+
+    # Создаём новую запись
+    article_id = save_article(
+        article_data=article_data,
+        summary=summary,
+        model=model,
+        user_id=user_id,
+    )
+    print(f'✅ Сохранено в БД: article_id={article_id}')
+    return article_id
 
 
 def interactive_mode() -> None:
