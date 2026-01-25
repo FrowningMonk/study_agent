@@ -27,6 +27,17 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 
+import atexit
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 from pipeline import ensure_directories, process_article, save_article_to_db
 from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
 from database import (
@@ -39,6 +50,7 @@ from database import (
     get_idea_by_id,
     update_idea,
     delete_idea,
+    delete_article,
     link_article_to_idea,
     unlink_article_from_idea,
     get_articles_by_idea,
@@ -127,12 +139,8 @@ MSG_ARTICLE_UNLINKED = "Статья отвязана от идеи."
 
 # Проверяем наличие токена перед запуском
 if not TELEGRAM_TOKEN:
-    print('=' * 60)
-    print('ОШИБКА: Не найден TELEGRAM_BOT_TOKEN в файле .env')
-    print('=' * 60)
-    print('Создайте файл .env и добавьте строку:')
-    print('TELEGRAM_BOT_TOKEN=ваш_токен_от_BotFather')
-    print('=' * 60)
+    logger.critical('Не найден TELEGRAM_BOT_TOKEN в файле .env')
+    logger.critical('Создайте файл .env и добавьте строку: TELEGRAM_BOT_TOKEN=ваш_токен_от_BotFather')
     exit(1)
 
 # Создаем бота (токен точно существует)
@@ -410,7 +418,6 @@ def handle_model_callback(call: telebot.types.CallbackQuery) -> None:
         message_id=call.message.message_id,
     )
     bot.answer_callback_query(call.id, f'Выбрана модель: {model}')
-    print(f'Пользователь {user_id} выбрал модель: {model}')
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cache:'))
@@ -444,7 +451,6 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
             )
             send_long_message(call.message.chat.id, summary)
             bot.answer_callback_query(call.id, 'Показан сохранённый конспект')
-            print(f'Показан кеш для {user_id}: {url}')
         else:
             bot.answer_callback_query(call.id, 'Конспект не найден')
         # Очищаем временное хранилище
@@ -464,9 +470,10 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
         if not is_available:
             error_text = MSG_MODEL_UNAVAILABLE.format(model=model, error=error_message)
             bot.send_message(call.message.chat.id, error_text)
-            print(f'Модель {model} недоступна для {user_id}: {error_message}')
+            logger.warning('Модель %s недоступна для %s: %s', model, user_id, error_message)
             return
 
+        logger.info('Начинаю регенерацию: url=%s, model=%s, user_id=%s', url, model, user_id)
         try:
             # skip_cache=True для принудительной перегенерации
             result = process_article(
@@ -484,8 +491,7 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 return
 
             summary, article_data = result
-            # Сохраняем статью в БД и получаем ID
-            article_id = save_article_to_db(article_data, summary, model, user_id, url)
+            save_article_to_db(article_data, summary, model, user_id, url)
 
             header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
             if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -494,11 +500,9 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 bot.send_message(call.message.chat.id, f'🔄 Перегенерировано! Модель: {model}')
                 send_long_message(call.message.chat.id, summary)
 
-            print(f'Перегенерирован конспект для {user_id}: {url}, article_id={article_id}')
-
         except Exception as e:
             bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
-            print(f'Ошибка перегенерации для {user_id}: {e}')
+            logger.error('Ошибка перегенерации для %s: %s', user_id, e)
 
         # Очищаем временное хранилище
         pending_cache_urls.pop(url_hash, None)
@@ -547,7 +551,7 @@ def handle_toggle_link(call: telebot.types.CallbackQuery) -> None:
             reply_markup=keyboard,
         )
     except Exception as e:
-        print(f'Ошибка toggle_link для {user_id}: {e}')
+        logger.error('Ошибка toggle_link для %s: %s', user_id, e)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == 'link_done')
@@ -599,7 +603,7 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
                     message_id=call.message.message_id,
                 )
     except Exception as e:
-        print(f'Ошибка привязки статьи к идеям для {user_id}: {e}')
+        logger.error('Ошибка привязки статьи к идеям для %s: %s', user_id, e)
         bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
     finally:
         # Очищаем сессию в любом случае
@@ -610,11 +614,30 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
 def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
     """
     Обрабатывает отказ от привязки статьи к идеям.
+    При отказе статья удаляется из базы данных.
     """
     user_id = call.from_user.id
 
     # Сразу отвечаем на callback, чтобы убрать "часики"
     bot.answer_callback_query(call.id)
+
+    # Проверяем наличие активной сессии для пользователя
+    if user_id not in pending_article_links:
+        logger.warning('Сессия не найдена для user_id %s при link_skip', user_id)
+    else:
+        # Извлекаем article_id из сессии
+        article_id = pending_article_links[user_id].get('article_id')
+
+        # Проверяем, что article_id существует (не None и не 0)
+        if article_id is None or article_id == 0:
+            logger.warning('article_id не найден в сессии для user_id %s', user_id)
+        else:
+            # Удаляем статью из БД
+            try:
+                delete_article(article_id)
+                logger.info('Статья ID %s удалена из БД по запросу user_id %s', article_id, user_id)
+            except Exception as exc:
+                logger.error('Ошибка при удалении статьи ID %s для user_id %s: %s', article_id, user_id, exc)
 
     try:
         bot.edit_message_text(
@@ -623,7 +646,7 @@ def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
             message_id=call.message.message_id,
         )
     except Exception as e:
-        print(f'Ошибка link_skip для {user_id}: {e}')
+        logger.error('Ошибка link_skip для %s: %s', user_id, e)
     finally:
         # Очищаем сессию в любом случае
         pending_article_links.pop(user_id, None)
@@ -646,15 +669,13 @@ def handle_url(message: telebot.types.Message) -> None:
     user_id = message.from_user.id
     model = get_user_model(user_id)
 
-    print(f'Получена ссылка от {user_id}: {url}')
-    print(f'Модель: {model}')
-
     if not is_supported_url(url):
         bot.reply_to(message, MSG_UNSUPPORTED)
         return
 
     # Проверяем наличие в кеше
     if article_exists(url):
+        logger.info('Дубликат статьи обнаружен: url=%s, user_id=%s', url, user_id)
         url_hash = str(hash(url))[-10:]
         pending_cache_urls[url_hash] = url
         keyboard = create_cache_keyboard(url)
@@ -663,7 +684,6 @@ def handle_url(message: telebot.types.Message) -> None:
             MSG_DUPLICATE_FOUND,
             reply_markup=keyboard,
         )
-        print(f'Найден дубликат для {user_id}: {url}')
         return
 
     # Проверяем доступность модели
@@ -671,12 +691,13 @@ def handle_url(message: telebot.types.Message) -> None:
     if not is_available:
         error_text = MSG_MODEL_UNAVAILABLE.format(model=model, error=error_message)
         bot.reply_to(message, error_text)
-        print(f'Модель {model} недоступна для {user_id}: {error_message}')
+        logger.warning('Модель %s недоступна для %s: %s', model, user_id, error_message)
         return
 
     bot.send_chat_action(message.chat.id, 'typing')
     status_msg = bot.reply_to(message, MSG_PROCESSING)
 
+    logger.info('Начинаю обработку статьи: url=%s, model=%s, user_id=%s', url, model, user_id)
     try:
         result = process_article(url, model=model, user_id=user_id)
 
@@ -706,8 +727,6 @@ def handle_url(message: telebot.types.Message) -> None:
             bot.send_message(message.chat.id, f'Готово! Модель: {model}')
             send_long_message(message.chat.id, summary)
 
-        print(f'Конспект отправлен пользователю {user_id}, article_id={article_id}')
-
         # Предлагаем привязать статью к идеям
         if article_id:
             _offer_link_to_ideas(message.chat.id, user_id, article_id)
@@ -722,7 +741,7 @@ def handle_url(message: telebot.types.Message) -> None:
             )
         except Exception:
             bot.send_message(message.chat.id, error_text)
-        print(f'Ошибка для {user_id}: {e}')
+        logger.error('Ошибка обработки URL для %s: %s', user_id, e)
 
 
 @bot.message_handler(commands=['new_idea'])
@@ -770,12 +789,11 @@ def process_idea_description(message: telebot.types.Message, user_id: int, idea_
     idea_description = message.text.strip() if message.text else ""
 
     try:
-        idea_id = create_idea(idea_name, idea_description if idea_description else None, user_id)
+        create_idea(idea_name, idea_description if idea_description else None, user_id)
         bot.send_message(message.chat.id, MSG_IDEA_CREATED.format(name=idea_name))
-        print(f'Пользователь {user_id} создал идею {idea_id}: {idea_name}')
     except Exception as e:
         bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
-        print(f'Ошибка создания идеи для {user_id}: {e}')
+        logger.error('Ошибка создания идеи для %s: %s', user_id, e)
 
 
 @bot.message_handler(commands=['ideas'])
@@ -1056,12 +1074,11 @@ def process_edit_description(message: telebot.types.Message, user_id: int, idea_
         success = update_idea(idea_id, user_id, name=new_name, description=new_description)
         if success:
             bot.send_message(message.chat.id, MSG_IDEA_UPDATED.format(name=new_name))
-            print(f'Пользователь {user_id} обновил идею {idea_id}: {new_name}')
         else:
             bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
     except Exception as e:
         bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
-        print(f'Ошибка обновления идеи для {user_id}: {e}')
+        logger.error('Ошибка обновления идеи для %s: %s', user_id, e)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('delete_idea:'))
@@ -1117,7 +1134,6 @@ def handle_confirm_delete(call: telebot.types.CallbackQuery) -> None:
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
             )
-            print(f'Пользователь {user_id} удалил идею {idea_id}')
         else:
             bot.edit_message_text(
                 MSG_IDEA_NOT_FOUND,
@@ -1130,7 +1146,7 @@ def handle_confirm_delete(call: telebot.types.CallbackQuery) -> None:
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
-        print(f'Ошибка удаления идеи для {user_id}: {e}')
+        logger.error('Ошибка удаления идеи для %s: %s', user_id, e)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_delete:'))
@@ -1185,25 +1201,25 @@ def main() -> None:
     ensure_directories()
     init_db()
 
-    print('=' * 60)
-    print('TELEGRAM-БОТ АГЕНТА ДЛЯ ИЗУЧЕНИЯ ИИ')
-    print('=' * 60)
-    print('Бот запущен и готов к работе!')
-    print('Поддерживаемые источники:')
-    for domain in SUPPORTED_SOURCES:
-        print(f'  - {domain}')
-    print('Доступные модели:')
-    for model in AVAILABLE_MODELS.keys():
-        default_mark = ' (по умолчанию)' if model == DEFAULT_MODEL else ''
-        print(f'  - {model}{default_mark}')
-    print('Найди бота в Telegram и отправь /start')
-    print('Для остановки нажми Ctrl+C')
-    print('=' * 60)
+    # Проверяем доступность моделей
+    available = []
+    unavailable = []
+    for model in AVAILABLE_MODELS:
+        is_ok, _ = check_model_availability(model)
+        if is_ok:
+            available.append(model)
+        else:
+            unavailable.append(model)
 
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
-    except KeyboardInterrupt:
-        print('\nБот остановлен')
+    if available:
+        logger.info("Доступные модели: %s", ", ".join(available))
+    if unavailable:
+        logger.warning("Недоступные модели: %s", ", ".join(unavailable))
+
+    logger.info("Бот запущен")
+
+    atexit.register(lambda: logger.info("Бот остановлен"))
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
 if __name__ == '__main__':

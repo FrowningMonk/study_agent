@@ -9,6 +9,7 @@
     - get_article_by_id(id) - получение статьи по ID
     - save_article(...) - сохранение статьи с конспектом
     - update_article(...) - обновление конспекта существующей статьи
+    - delete_article(id) - удаление статьи по ID
 
 Функции для идей (ideas):
     - create_idea(...) - создание новой идеи
@@ -30,9 +31,13 @@ Example для статей:
     ...     save_article(article_data, summary, model, user_id)
 """
 
+import logging
 import os
 import sqlite3
+import time
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # Публичный API модуля
 __all__ = [
@@ -44,6 +49,7 @@ __all__ = [
     'get_article_by_id',
     'save_article',
     'update_article',
+    'delete_article',
     # Таблица ideas
     'create_idea',
     'get_user_ideas',
@@ -166,6 +172,7 @@ def init_db() -> None:
         cursor.executescript(CREATE_IDEA_ARTICLES_TABLE_SQL)
         cursor.executescript(CREATE_IDEA_ARTICLES_INDEXES_SQL)
         conn.commit()
+        logger.info("База данных инициализирована: %s", DB_PATH)
     finally:
         conn.close()
 
@@ -272,6 +279,8 @@ def save_article(
         Для GitHub поле published_date будет NULL.
         Поля github_* заполняются только для source='github'.
     """
+    start_time = time.perf_counter()
+
     source = article_data.get('source', 'unknown')
 
     # Дата публикации (только для статей, не для GitHub)
@@ -319,7 +328,11 @@ def save_article(
             ),
         )
         conn.commit()
-        return cursor.lastrowid
+        article_id = cursor.lastrowid
+        elapsed = time.perf_counter() - start_time
+        logger.info("Статья сохранена: id=%d, url=%s, time=%.2fs",
+                    article_id, article_data.get('url', '')[:80], elapsed)
+        return article_id
     finally:
         conn.close()
 
@@ -354,7 +367,39 @@ def update_article(
             (summary, model, datetime.now().isoformat(), url),
         )
         conn.commit()
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.debug("Статья обновлена: url=%s", url[:80])
+        return updated
+    finally:
+        conn.close()
+
+
+def delete_article(article_id: int) -> bool:
+    """
+    Удаляет статью из базы данных по её ID.
+
+    При удалении статьи также удаляются связанные записи из таблицы idea_articles
+    благодаря FOREIGN KEY с ON DELETE CASCADE.
+
+    Args:
+        article_id: ID статьи в таблице articles
+
+    Returns:
+        True если статья найдена и удалена, False если не найдена
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'DELETE FROM articles WHERE id = ?',
+            (article_id,),
+        )
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.debug("Статья удалена: id=%d", article_id)
+        return deleted
     finally:
         conn.close()
 
@@ -388,7 +433,9 @@ def create_idea(name: str, description: str | None, user_id: int) -> int:
             (name, description, user_id, now, now),
         )
         conn.commit()
-        return cursor.lastrowid
+        idea_id = cursor.lastrowid
+        logger.info("Идея создана: id=%d, name=%s, user_id=%d", idea_id, name, user_id)
+        return idea_id
     finally:
         conn.close()
 
@@ -520,7 +567,10 @@ def delete_idea(idea_id: int, user_id: int) -> bool:
             (idea_id, user_id),
         )
         conn.commit()
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.debug("Идея удалена: id=%d, user_id=%d", idea_id, user_id)
+        return deleted
     finally:
         conn.close()
 
@@ -572,9 +622,11 @@ def link_article_to_idea(article_id: int, idea_id: int, user_id: int) -> bool:
                 (idea_id, article_id, datetime.now().isoformat()),
             )
             conn.commit()
+            logger.debug("Статья привязана к идее: article_id=%d, idea_id=%d", article_id, idea_id)
             return True
         except sqlite3.IntegrityError:
             # Привязка уже существует
+            logger.warning("Связь уже существует: article_id=%d, idea_id=%d", article_id, idea_id)
             return False
     finally:
         conn.close()

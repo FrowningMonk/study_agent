@@ -16,10 +16,15 @@ Example:
     >>> print(data['title'])
 """
 
+import logging
 import re
+import time
 
 import requests
 from bs4 import BeautifulSoup
+
+# Логгер модуля
+logger = logging.getLogger(__name__)
 
 # Публичный API модуля
 __all__ = ['get_article', 'get_structured_habr_article']
@@ -49,16 +54,27 @@ def get_article(url: str) -> dict:
         При ошибке возвращает словарь с единственным полем:
             - error: описание ошибки
     """
+    start_time = time.perf_counter()
     url = url.strip()
 
     if 'habr.com' in url:
-        return _parse_habr(url)
+        result = _parse_habr(url)
     elif 'github.com' in url:
-        return _parse_github(url)
+        result = _parse_github(url)
     elif 'infostart.ru' in url:
-        return _parse_infostart(url)
+        result = _parse_infostart(url)
     else:
-        return {'error': f'Источник не поддерживается: {url}'}
+        result = {'error': f'Источник не поддерживается: {url}'}
+
+    elapsed = time.perf_counter() - start_time
+    if 'error' not in result:
+        logger.info('get_article completed: source=%s, title=%s, time=%.2fs',
+                    result.get('source'), result.get('title', 'N/A')[:50], elapsed)
+    else:
+        logger.warning('get_article failed: url=%s, error=%s, time=%.2fs',
+                       url, result.get('error'), elapsed)
+
+    return result
 
 
 def _fetch_page(url: str) -> tuple[BeautifulSoup | None, dict | None]:
@@ -122,8 +138,6 @@ def _parse_habr(url: str) -> dict:
         Словарь с полями: url, source, title, author, date, content, content_length.
         При ошибке — словарь с полем 'error'.
     """
-    print(f'📥 Загружаю Хабр: {url}')
-
     soup, error = _fetch_page(url)
     if error:
         return error
@@ -195,8 +209,6 @@ def _parse_infostart(url: str) -> dict:
         Словарь с полями: url, source, title, author, content, content_length.
         При ошибке — словарь с полем 'error'.
     """
-    print(f'📥 Загружаю InfoStart: {url}')
-
     soup, error = _fetch_page(url)
     if error:
         return error
@@ -298,8 +310,15 @@ def _fetch_github_api(api_url: str) -> dict | None:
         response = requests.get(api_url, headers=headers, timeout=TIMEOUT_SECONDS)
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.HTTPError as e:
+        # 404 — нормальная ситуация (папка docs может отсутствовать)
+        if e.response is not None and e.response.status_code == 404:
+            logger.debug('GitHub API 404: %s', api_url)
+        else:
+            logger.warning('Ошибка GitHub API: %s', e)
+        return None
     except Exception as e:
-        print(f'⚠️ Ошибка GitHub API: {str(e)}')
+        logger.warning('Ошибка GitHub API: %s', e)
         return None
 
 
@@ -360,7 +379,7 @@ def _fetch_file_content(download_url: str) -> str:
         response.raise_for_status()
         return response.text
     except Exception as e:
-        print(f'⚠️ Ошибка загрузки файла {download_url}: {str(e)}')
+        logger.warning('Ошибка загрузки файла %s: %s', download_url, e)
         return ''
 
 
@@ -411,7 +430,6 @@ def _parse_github(url: str) -> dict:
 
     # Формируем канонический URL репозитория
     repo_url = f'https://github.com/{owner}/{repo}'
-    print(f'📥 Загружаю GitHub: {repo_url}')
 
     soup, error = _fetch_page(repo_url)
     if error:
@@ -424,14 +442,9 @@ def _parse_github(url: str) -> dict:
         description = desc_elem.get_text(strip=True)
 
     # Ищем все важные markdown файлы через API
-    print(f'🔍 Поиск markdown файлов в {owner}/{repo}...')
     markdown_files = _find_markdown_files(owner, repo)
 
     if markdown_files:
-        print(f'📄 Найдено файлов: {len(markdown_files)}')
-        for file in markdown_files:
-            print(f'   • {file["path"]}')
-
         # Объединяем содержимое всех найденных файлов
         combined_content = _combine_markdown_content(markdown_files)
 
@@ -439,7 +452,7 @@ def _parse_github(url: str) -> dict:
         combined_content = _truncate_content(combined_content, max_length=MAX_CONTENT_LENGTH * 2)
     else:
         # Если API не сработал, используем старый способ (парсинг HTML)
-        print('⚠️ Не удалось получить файлы через API, использую парсинг HTML')
+        logger.warning('Не удалось получить файлы через API для %s, использую парсинг HTML', repo_url)
         combined_content = _extract_github_readme(soup)
         markdown_files = [{'name': 'README.md', 'path': 'README.md'}]
 
@@ -498,38 +511,3 @@ def _extract_github_readme(soup: BeautifulSoup) -> str:
     content = re.sub(r'\n{3,}', '\n\n', content)
 
     return _truncate_content(content)
-
-
-# =============================================================================
-# Точка входа для тестирования
-# =============================================================================
-
-
-def _run_tests() -> None:
-    """Запускает тесты парсеров."""
-    test_urls = [
-        'https://habr.com/ru/articles/984968/',
-        'https://github.com/anthropics/anthropic-cookbook',
-        'https://infostart.ru/public/886103/',
-    ]
-
-    for url in test_urls:
-        print(f'\n{"=" * 60}')
-        print(f'ТЕСТ: {url}')
-        print('=' * 60)
-
-        result = get_article(url)
-
-        if 'error' in result:
-            print(f'❌ Ошибка: {result["error"]}')
-        else:
-            print(f'✅ Источник: {result["source"]}')
-            print(f'   Заголовок: {result["title"]}')
-            print(f'   Автор: {result["author"]}')
-            print(f'   Длина контента: {result["content_length"]} символов')
-            print(f'\n   Превью (200 символов):')
-            print(f'   {result["content"][:200]}...')
-
-
-if __name__ == '__main__':
-    _run_tests()
