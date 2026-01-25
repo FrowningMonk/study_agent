@@ -15,8 +15,11 @@ Example:
     >>> summary = generate_summary(article_data, model='gemma3:12b')
 """
 
-import json
+import logging
 import os
+import time
+
+logger = logging.getLogger(__name__)
 
 import ollama
 from dotenv import load_dotenv
@@ -31,7 +34,6 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 # Публичный API модуля
 __all__ = [
     'generate_summary',
-    'read_json_file',
     'check_model_availability',
     'AVAILABLE_MODELS',
     'DEFAULT_MODEL',
@@ -269,6 +271,9 @@ def _generate_with_ollama(
     Raises:
         Exception: При ошибке соединения или генерации.
     """
+    context_length = len(system_prompt) + len(user_prompt)
+    logger.info('Отправляю запрос в Ollama: model=%s, context_length=%d', model, context_length)
+
     response = ollama.chat(
         model=model,
         messages=[
@@ -281,6 +286,7 @@ def _generate_with_ollama(
         },
     )
 
+    logger.info('Ответ от Ollama получен: model=%s, response_length=%d', model, len(response['message']['content']))
     return response['message']['content']
 
 
@@ -387,135 +393,31 @@ def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
     Returns:
         Текст конспекта или сообщение об ошибке (начинается с '❌').
     """
+    start_time = time.perf_counter()
+
     try:
-        source = article_data.get('source', 'unknown')
+        system_prompt, user_prompt = create_prompt(article_data)
         provider = _get_provider(model)
 
-        print(f'🧠 Генерация конспекта для {source}')
-        print(f'   Модель: {model} ({provider})')
-
-        # Получаем промпты для нужного источника
-        system_prompt, user_prompt = create_prompt(article_data)
-
-        # Выбираем провайдера и генерируем
         if provider == 'ollama':
-            summary = _generate_with_ollama(system_prompt, user_prompt, model)
+            result = _generate_with_ollama(system_prompt, user_prompt, model)
         else:
-            summary = _generate_with_openai(system_prompt, user_prompt, model)
+            result = _generate_with_openai(system_prompt, user_prompt, model)
 
-        print('✅ Конспект успешно сгенерирован!')
-        return summary
+        elapsed = time.perf_counter() - start_time
+        if not result.startswith('❌'):
+            logger.info('generate_summary completed: model=%s, source=%s, length=%d, time=%.2fs',
+                        model, article_data.get('source'), len(result), elapsed)
+        else:
+            logger.warning('generate_summary failed: model=%s, error=%s, time=%.2fs',
+                           model, result[:100], elapsed)
+
+        return result
 
     except ValueError as e:
-        # Ошибка выбора промпта
-        error_message = f'❌ Ошибка: {str(e)}'
-        print(error_message)
-        return error_message
+        elapsed = time.perf_counter() - start_time
+        return f'❌ Ошибка: {str(e)}'
 
     except Exception as e:
-        # Ошибка API
-        error_message = f'❌ Ошибка при генерации конспекта: {str(e)}'
-        print(error_message)
-        return error_message
-
-
-def read_json_file(file_path: str) -> dict | None:
-    """
-    Читает JSON файл и возвращает словарь.
-
-    Args:
-        file_path: Путь к JSON файлу.
-
-    Returns:
-        Словарь с данными или None при ошибке.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        print(f'✅ Загружен JSON: {file_path}')
-        print(f'📊 Найдено ключей: {len(data)}')
-        return data
-
-    except FileNotFoundError:
-        print(f'❌ Файл не найден: {file_path}')
-        return None
-    except json.JSONDecodeError:
-        print(f'❌ Ошибка чтения JSON: {file_path}')
-        return None
-    except Exception as e:
-        print(f'❌ Ошибка: {str(e)}')
-        return None
-
-
-# =============================================================================
-# ИНТЕРАКТИВНЫЙ РЕЖИМ
-# =============================================================================
-
-
-def main() -> None:
-    """Интерактивный режим для тестирования."""
-    print('=' * 60)
-    print('🤖 ГЕНЕРАТОР КОНСПЕКТОВ')
-    print('=' * 60)
-
-    # Запрашиваем путь к JSON
-    json_path = input(
-        'Введите путь к JSON (Enter = data/parsed_articles/): '
-    ).strip()
-
-    if not json_path:
-        # Показываем доступные файлы
-        parsed_dir = 'data/parsed_articles'
-        if os.path.exists(parsed_dir):
-            files = [f for f in os.listdir(parsed_dir) if f.endswith('.json')]
-            if files:
-                print(f'\n📂 Доступные файлы в {parsed_dir}:')
-                for i, f in enumerate(files, 1):
-                    print(f'   {i}. {f}')
-                choice = input('Выберите номер файла: ').strip()
-                if choice.isdigit() and 1 <= int(choice) <= len(files):
-                    json_path = os.path.join(parsed_dir, files[int(choice) - 1])
-
-    if not json_path:
-        print('❌ Файл не выбран.')
-        return
-
-    # Загружаем данные
-    article_data = read_json_file(json_path)
-    if not article_data:
-        return
-
-    # Показываем информацию
-    print(f'\n📰 Источник: {article_data.get("source", "unknown")}')
-    print(f'   Заголовок: {article_data.get("title", "Не указан")}')
-    print(f'   Длина: {article_data.get("content_length", 0)} символов')
-
-    # Выбор модели
-    print('\n📊 Выбор модели:')
-    print('   1 — gemma3:12b (локальная, Ollama)')
-    print('   2 — gpt-3.5-turbo (OpenAI)')
-    print('   3 — gpt-4 (OpenAI)')
-
-    model_choice = input('   Ваш выбор (Enter = 1): ').strip()
-
-    if model_choice == '2':
-        model = 'gpt-3.5-turbo'
-    elif model_choice == '3':
-        model = 'gpt-4'
-    else:
-        model = DEFAULT_MODEL
-
-    # Генерация
-    print('\n' + '=' * 60)
-    summary = generate_summary(article_data, model)
-
-    print('\n' + '=' * 60)
-    print('📚 КОНСПЕКТ:')
-    print('=' * 60)
-    print(summary)
-
-    print('\n✨ Готово!')
-
-
-if __name__ == '__main__':
-    main()
+        elapsed = time.perf_counter() - start_time
+        return f'❌ Ошибка при генерации конспекта: {str(e)}'
