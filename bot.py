@@ -54,6 +54,8 @@ from database import (
     link_article_to_idea,
     unlink_article_from_idea,
     get_articles_by_idea,
+    get_user_articles,
+    get_ideas_by_article,
 )
 
 load_dotenv()
@@ -106,6 +108,7 @@ MSG_HELP = """Команды:
 /model - выбор модели
 /new_idea - создать идею
 /ideas - посмотреть идеи
+/articles - все статьи
 
 Поддерживаемые источники: habr.com, github.com, infostart.ru"""
 MSG_PROCESSING = "Обрабатываю..."
@@ -135,6 +138,12 @@ MSG_LINK_SKIPPED = "Статья не привязана ни к одной ид
 MSG_IDEA_ARTICLES_TITLE = "Статьи, привязанные к идее «{name}»:"
 MSG_IDEA_NO_ARTICLES = "К этой идее пока не привязано ни одной статьи."
 MSG_ARTICLE_UNLINKED = "Статья отвязана от идеи."
+MSG_ARTICLES_EMPTY = "В базе нет статей."
+MSG_ARTICLES_TITLE = "Все статьи ({count}):"
+MSG_REASSIGN_SELECT = "Выбери идеи для переноса статьи (можно несколько):"
+MSG_REASSIGN_DONE = "Статья перенесена."
+MSG_REASSIGN_CANCELLED = "Перенос отменен."
+MSG_REASSIGN_NO_IDEAS = "Нет других идей для переноса."
 
 
 # Проверяем наличие токена перед запуском
@@ -225,6 +234,9 @@ pending_cache_urls: dict[str, str] = {}
 # Формат: {user_id: {'article_data': dict, 'summary': str, 'model': str, 'selected_ideas': set[int]}}
 pending_article_links: dict[int, dict] = {}
 
+# Хранилище состояния перепривязки статей
+pending_reassign: dict[int, dict] = {}
+
 
 def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
     """
@@ -289,6 +301,21 @@ def create_link_ideas_keyboard(
     )
     keyboard.row(done_btn, skip_btn)
 
+    return keyboard
+
+
+def create_reassign_keyboard(ideas: list[dict], selected_ids: set[int]) -> types.InlineKeyboardMarkup:
+    """Клавиатура multiselect для перепривязки."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idea in ideas:
+        prefix = "V " if idea['id'] in selected_ids else "_ "
+        keyboard.add(types.InlineKeyboardButton(
+            text=f"{prefix}{idea['name'][:40]}",
+            callback_data=f"toggle_reassign:{idea['id']}",
+        ))
+    done_btn = types.InlineKeyboardButton(text="Готово", callback_data="reassign_done")
+    cancel_btn = types.InlineKeyboardButton(text="Отмена", callback_data="reassign_cancel")
+    keyboard.row(done_btn, cancel_btn)
     return keyboard
 
 
@@ -366,7 +393,7 @@ def create_main_keyboard() -> types.ReplyKeyboardMarkup:
         ReplyKeyboardMarkup с кнопками команд
     """
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.row('/ideas', '/new_idea')
+    keyboard.row('/ideas', '/new_idea', '/articles')
     keyboard.row('/model', '/help')
     return keyboard
 
@@ -823,6 +850,93 @@ def handle_ideas(message: telebot.types.Message) -> None:
     bot.send_message(message.chat.id, MSG_IDEAS_TITLE, reply_markup=keyboard)
     
 
+@bot.message_handler(commands=['articles'])
+def handle_articles(message: telebot.types.Message) -> None:
+    """Показывает все статьи пользователя с привязками к идеям."""
+    user_id = message.from_user.id
+    articles = get_user_articles(user_id)
+    if not articles:
+        bot.send_message(message.chat.id, MSG_ARTICLES_EMPTY)
+        return
+    lines: list[str] = []
+    for idx, art in enumerate(articles, 1):
+        ideas = get_ideas_by_article(art['id'], user_id)
+        idea_names = ", ".join(i['name'] for i in ideas) if ideas else "(без идеи)"
+        lines.append(f"{idx}. [{art['source']}] {art['title'][:50]}\n   Идеи: {idea_names}")
+    text = MSG_ARTICLES_TITLE.format(count=len(articles)) + "\n\n" + "\n".join(lines)
+    send_long_message(message.chat.id, text)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reassign:'))
+def handle_reassign_start(call: telebot.types.CallbackQuery) -> None:
+    """Начало перепривязки. Callback: reassign:{article_id}:{source_idea_id}"""
+    user_id = call.from_user.id
+    parts = call.data.split(':')
+    article_id, source_idea_id = int(parts[1]), int(parts[2])
+    ideas = [i for i in get_user_ideas(user_id) if i['id'] != source_idea_id]
+    if not ideas:
+        bot.answer_callback_query(call.id, MSG_REASSIGN_NO_IDEAS)
+        return
+    pending_reassign[user_id] = {
+        'article_id': article_id,
+        'source_idea_id': source_idea_id,
+        'selected_ideas': set(),
+    }
+    bot.send_message(
+        call.message.chat.id,
+        MSG_REASSIGN_SELECT,
+        reply_markup=create_reassign_keyboard(ideas, set()),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_reassign:'))
+def handle_toggle_reassign(call: telebot.types.CallbackQuery) -> None:
+    """Toggle выбора идеи при перепривязке."""
+    user_id = call.from_user.id
+    session = pending_reassign.get(user_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+    idea_id = int(call.data.split(':')[1])
+    selected = session['selected_ideas']
+    if idea_id in selected:
+        selected.discard(idea_id)
+    else:
+        selected.add(idea_id)
+    ideas = [i for i in get_user_ideas(user_id) if i['id'] != session['source_idea_id']]
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_reassign_keyboard(ideas, selected),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'reassign_done')
+def handle_reassign_done(call: telebot.types.CallbackQuery) -> None:
+    """Завершение перепривязки: link к новым идеям, unlink из старой."""
+    user_id = call.from_user.id
+    session = pending_reassign.pop(user_id, None)
+    if not session or not session['selected_ideas']:
+        bot.answer_callback_query(call.id, MSG_REASSIGN_CANCELLED)
+        return
+    for idea_id in session['selected_ideas']:
+        link_article_to_idea(session['article_id'], idea_id, user_id)
+    unlink_article_from_idea(session['article_id'], session['source_idea_id'], user_id)
+    bot.edit_message_text(MSG_REASSIGN_DONE, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'reassign_cancel')
+def handle_reassign_cancel(call: telebot.types.CallbackQuery) -> None:
+    """Отмена перепривязки."""
+    user_id = call.from_user.id
+    pending_reassign.pop(user_id, None)
+    bot.edit_message_text(MSG_REASSIGN_CANCELLED, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message: telebot.types.Message) -> None:
     """Обрабатывает все остальные сообщения - отправляет подсказку."""
@@ -930,7 +1044,11 @@ def handle_idea_articles(call: telebot.types.CallbackQuery) -> None:
             text="🔗❌",
             callback_data=f"unlink:{article_id}:{idea_id}",
         )
-        keyboard.row(summary_btn, unlink_btn)
+        reassign_btn = types.InlineKeyboardButton(
+            text="->",
+            callback_data=f"reassign:{article_id}:{idea_id}",
+        )
+        keyboard.row(summary_btn, unlink_btn, reassign_btn)
 
     # Кнопка "Назад"
     back_btn = types.InlineKeyboardButton(

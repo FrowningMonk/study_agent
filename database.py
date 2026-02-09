@@ -23,6 +23,7 @@
     - unlink_article_from_idea(...) - отвязка статьи от идеи
     - get_articles_by_idea(...) - получение статей идеи
     - get_ideas_by_article(...) - получение идей статьи
+    - get_user_articles(user_id) - получение всех статей пользователя
 
 Example для статей:
     >>> from database import init_db, article_exists, save_article
@@ -61,6 +62,7 @@ __all__ = [
     'unlink_article_from_idea',
     'get_articles_by_idea',
     'get_ideas_by_article',
+    'get_user_articles',
 ]
 
 # Путь к базе данных
@@ -732,5 +734,20 @@ def get_ideas_by_article(article_id: int, user_id: int) -> list[dict]:
         )
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_user_articles(user_id: int) -> list[dict]:
+    """Получает все статьи пользователя."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, url, source, title, summary, model_used, processed_at "
+            "FROM articles WHERE user_id = ? ORDER BY processed_at DESC",
+            (user_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
     finally:
         conn.close()
