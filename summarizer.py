@@ -37,6 +37,8 @@ __all__ = [
     'check_model_availability',
     'AVAILABLE_MODELS',
     'DEFAULT_MODEL',
+    'generate_idea_md',
+    'revise_idea_md',
 ]
 
 
@@ -152,6 +154,42 @@ GITHUB_USER_PROMPT_TEMPLATE: str = """Дай справку о репозито�
 СОДЕРЖИМОЕ:
 {content}
 """
+
+
+# =============================================================================
+# ПРОМПТЫ ДЛЯ ГЕНЕРАЦИИ .MD ИДЕЙ
+# =============================================================================
+
+IDEA_MD_SYSTEM_PROMPT: str = """Ты -- технический писатель. Создай структурированное .md-описание идеи (темы исследования).
+Документ будет использоваться как контекст для LLM и агентов.
+
+Структура:
+1. Заголовок -- название идеи
+2. Описание -- суть в 2-3 предложениях
+3. Ключевые концепции -- основные понятия из статей
+4. Источники -- список статей с кратким вкладом каждой
+5. Открытые вопросы -- что стоит изучить
+6. Связи -- пересечения с другими темами
+
+Пиши на русском, будь конкретен, опирайся только на материалы."""
+
+IDEA_MD_USER_PROMPT_TEMPLATE: str = """Создай .md-описание для идеи.
+
+НАЗВАНИЕ: {idea_name}
+ОПИСАНИЕ: {idea_description}
+
+СТАТЬИ ({article_count}):
+{articles_text}"""
+
+IDEA_MD_REVISE_SYSTEM_PROMPT: str = """Переработай .md-описание идеи по замечаниям. Сохрани структуру."""
+
+IDEA_MD_REVISE_USER_PROMPT_TEMPLATE: str = """Документ:
+{current_md}
+
+Замечания:
+{feedback}
+
+Верни полный обновленный документ."""
 
 
 # =============================================================================
@@ -421,3 +459,44 @@ def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
     except Exception as e:
         elapsed = time.perf_counter() - start_time
         return f'❌ Ошибка при генерации конспекта: {str(e)}'
+
+
+def generate_idea_md(
+    idea_name: str,
+    idea_description: str,
+    articles: list[dict],
+    model: str = DEFAULT_MODEL,
+) -> str:
+    """Генерирует .md-описание идеи."""
+    articles_text = ""
+    for idx, art in enumerate(articles, 1):
+        summary = (art.get('summary') or '(нет конспекта)')[:500]
+        articles_text += (
+            f"\n--- Статья {idx} ---\n"
+            f"Название: {art.get('title', '')}\n"
+            f"URL: {art.get('url', '')}\n"
+            f"Источник: {art.get('source', '')}\n"
+            f"Конспект: {summary}\n"
+        )
+    user_prompt = IDEA_MD_USER_PROMPT_TEMPLATE.format(
+        idea_name=idea_name,
+        idea_description=idea_description or '(нет описания)',
+        article_count=len(articles),
+        articles_text=articles_text,
+    )
+    provider = _get_provider(model)
+    if provider == 'ollama':
+        return _generate_with_ollama(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+    return _generate_with_openai(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+
+
+def revise_idea_md(current_md: str, feedback: str, model: str = DEFAULT_MODEL) -> str:
+    """Переделывает .md по замечаниям пользователя."""
+    user_prompt = IDEA_MD_REVISE_USER_PROMPT_TEMPLATE.format(
+        current_md=current_md,
+        feedback=feedback,
+    )
+    provider = _get_provider(model)
+    if provider == 'ollama':
+        return _generate_with_ollama(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
+    return _generate_with_openai(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)

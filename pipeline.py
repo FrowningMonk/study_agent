@@ -52,7 +52,7 @@ def ensure_directories() -> None:
     Создаваемые директории:
         - data/
     """
-    for directory in [DATA_DIR]:
+    for directory in [DATA_DIR, 'ideas_md']:
         if not os.path.exists(directory):
             os.makedirs(directory)
             logger.info("Создана папка: %s", directory)
