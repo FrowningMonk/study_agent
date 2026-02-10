@@ -983,6 +983,10 @@ def handle_reassign_start(call: telebot.types.CallbackQuery) -> None:
     user_id = call.from_user.id
     parts = call.data.split(':')
     article_id, source_idea_id = int(parts[1]), int(parts[2])
+    logger.info(
+        'Перепривязка: user_id=%s, article_id=%d, source_idea_id=%d',
+        user_id, article_id, source_idea_id,
+    )
     ideas = [i for i in get_user_ideas(user_id) if i['id'] != source_idea_id]
     if not ideas:
         bot.answer_callback_query(call.id, MSG_REASSIGN_NO_IDEAS)
@@ -1034,6 +1038,11 @@ def handle_reassign_done(call: telebot.types.CallbackQuery) -> None:
     for idea_id in session['selected_ideas']:
         link_article_to_idea(session['article_id'], idea_id, user_id)
     unlink_article_from_idea(session['article_id'], session['source_idea_id'], user_id)
+    logger.info(
+        'Перепривязка завершена: user_id=%s, article_id=%d, из idea_id=%d в ideas=%s',
+        user_id, session['article_id'], session['source_idea_id'],
+        list(session['selected_ideas']),
+    )
     bot.edit_message_text(MSG_REASSIGN_DONE, call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -1052,6 +1061,7 @@ def handle_assign_list_start(call: telebot.types.CallbackQuery) -> None:
     """Начало привязки статьи к идеям из общего списка /articles."""
     user_id = call.from_user.id
     article_id = int(call.data.split(':')[1])
+    logger.info('Привязка из /articles: user_id=%s, article_id=%d', user_id, article_id)
     ideas = get_user_ideas(user_id)
     if not ideas:
         bot.answer_callback_query(call.id, MSG_ASSIGN_NO_IDEAS)
@@ -1101,6 +1111,10 @@ def handle_assign_list_done(call: telebot.types.CallbackQuery) -> None:
         return
     for idea_id in session['selected_ideas']:
         link_article_to_idea(session['article_id'], idea_id, user_id)
+    logger.info(
+        'Привязка из /articles завершена: user_id=%s, article_id=%d, ideas=%s',
+        user_id, session['article_id'], list(session['selected_ideas']),
+    )
     bot.edit_message_text(MSG_ASSIGN_DONE, call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -1580,7 +1594,7 @@ def main() -> None:
     ensure_directories()
     init_db()
 
-    # Проверяем доступность моделей
+    # Проверяем доступность моделей для конспектов
     available = []
     unavailable = []
     for model in AVAILABLE_MODELS:
@@ -1591,9 +1605,24 @@ def main() -> None:
             unavailable.append(model)
 
     if available:
-        logger.info("Доступные модели: %s", ", ".join(available))
+        logger.info("Доступные модели (конспект): %s", ", ".join(available))
     if unavailable:
-        logger.warning("Недоступные модели: %s", ", ".join(unavailable))
+        logger.warning("Недоступные модели (конспект): %s", ", ".join(unavailable))
+
+    # Проверяем доступность моделей для генерации .md
+    available_md = []
+    unavailable_md = []
+    for model in AVAILABLE_MD_MODELS:
+        is_ok, _ = check_model_availability(model)
+        if is_ok:
+            available_md.append(model)
+        else:
+            unavailable_md.append(model)
+
+    if available_md:
+        logger.info("Доступные модели (.md): %s", ", ".join(available_md))
+    if unavailable_md:
+        logger.warning("Недоступные модели (.md): %s", ", ".join(unavailable_md))
 
     logger.info("Бот запущен")
 
