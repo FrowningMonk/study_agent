@@ -1130,7 +1130,7 @@ def handle_assign_list_cancel(call: telebot.types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('gen_md:'))
 def handle_generate_md(call: telebot.types.CallbackQuery) -> None:
-    """Ручная генерация/перегенерация .md описания идеи."""
+    """Показ существующего .md или генерация нового."""
     user_id = call.from_user.id
     idea_id = int(call.data.split(':')[1])
     idea = get_idea_by_id(idea_id, user_id)
@@ -1141,6 +1141,42 @@ def handle_generate_md(call: telebot.types.CallbackQuery) -> None:
         bot.answer_callback_query(call.id, "Добавь описание идеи для генерации .md")
         return
     bot.answer_callback_query(call.id)
+    # Проверяем, есть ли уже сохранённый .md
+    existing_md = get_idea_md(idea_id, user_id)
+    if existing_md:
+        logger.info('Показ существующего .md: idea_id=%d, user_id=%s', idea_id, user_id)
+        send_long_message(call.message.chat.id, existing_md)
+        # Загружаем в сессию для возможности правок
+        pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': existing_md}
+        keyboard = types.InlineKeyboardMarkup(row_width=3)
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text="Перегенерировать", callback_data=f"regen_md:{idea_id}",
+            ),
+            types.InlineKeyboardButton(
+                text="Замечания", callback_data=f"revise_md:{idea_id}",
+            ),
+        )
+        bot.send_message(call.message.chat.id, MSG_MD_READY, reply_markup=keyboard)
+        return
+    # Нет сохранённого — генерируем
+    _auto_generate_md(
+        call.message.chat.id, user_id, idea_id,
+        idea['name'], idea['description'],
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('regen_md:'))
+def handle_regen_md(call: telebot.types.CallbackQuery) -> None:
+    """Принудительная перегенерация .md."""
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+    bot.answer_callback_query(call.id)
+    logger.info('Перегенерация .md: idea_id=%d, user_id=%s', idea_id, user_id)
     _auto_generate_md(
         call.message.chat.id, user_id, idea_id,
         idea['name'], idea['description'],
