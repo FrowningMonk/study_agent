@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 from pipeline import ensure_directories, process_article, save_article_to_db
 from summarizer import (
     AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability,
+    AVAILABLE_MD_MODELS, DEFAULT_MD_MODEL,
     generate_idea_md, revise_idea_md,
 )
 from database import (
@@ -82,6 +83,7 @@ SUPPORTED_SOURCES: dict[str, str] = {
 }
 
 user_models: dict[int, str] = {}
+user_md_models: dict[int, str] = {}
 
 # Сообщения
 MSG_START: str = """👋 Привет!
@@ -158,7 +160,6 @@ MSG_MD_READY = ("Описание готово. Варианты:\n1. Утвер
                 "2. Отправить замечания текстом\n"
                 "3. Отправить свой вариант целиком (начиная с #)")
 MSG_MD_APPROVED = "Описание сохранено."
-MSG_MD_NO_ARTICLES = "Привяжи хотя бы одну статью перед генерацией."
 MSG_MD_REVISING = "Переделываю с учетом замечаний..."
 
 
@@ -213,6 +214,11 @@ def get_user_model(user_id: int) -> str:
         Название модели для генерации конспектов
     """
     return user_models.get(user_id, DEFAULT_MODEL)
+
+
+def get_user_md_model(user_id: int) -> str:
+    """Возвращает выбранную пользователем модель для генерации .md."""
+    return user_md_models.get(user_id, DEFAULT_MD_MODEL)
 
 
 def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
@@ -357,6 +363,54 @@ def create_reassign_keyboard(ideas: list[dict], selected_ids: set[int]) -> types
     cancel_btn = types.InlineKeyboardButton(text="Отмена", callback_data="reassign_cancel")
     keyboard.row(done_btn, cancel_btn)
     return keyboard
+
+
+def _auto_generate_md(
+    chat_id: int,
+    user_id: int,
+    idea_id: int,
+    idea_name: str,
+    idea_description: str | None,
+) -> None:
+    """Автоматически генерирует .md после создания/редактирования идеи."""
+    if not idea_description:
+        return
+    md_model = get_user_md_model(user_id)
+    # Проверяем доступность модели для .md
+    is_available, error_message = check_model_availability(md_model)
+    if not is_available:
+        logger.warning(
+            'Модель .md %s недоступна для %s: %s', md_model, user_id, error_message,
+        )
+        bot.send_message(
+            chat_id,
+            MSG_MODEL_UNAVAILABLE.format(model=md_model, error=error_message),
+        )
+        return
+    bot.send_message(chat_id, MSG_GENERATE_MD)
+    bot.send_chat_action(chat_id, 'typing')
+    logger.info(
+        'Начинаю генерацию .md: idea_id=%d, model=%s, user_id=%s',
+        idea_id, md_model, user_id,
+    )
+    try:
+        md_text = generate_idea_md(idea_name, idea_description, md_model)
+    except Exception as e:
+        logger.error('Ошибка генерации .md для idea_id=%d: %s', idea_id, e)
+        bot.send_message(chat_id, MSG_ERROR.format(error=str(e)))
+        return
+    pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': md_text}
+    send_long_message(chat_id, md_text)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text="Утвердить", callback_data=f"approve_md:{idea_id}",
+        ),
+        types.InlineKeyboardButton(
+            text="Замечания", callback_data=f"revise_md:{idea_id}",
+        ),
+    )
+    bot.send_message(chat_id, MSG_MD_READY, reply_markup=keyboard)
 
 
 def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int) -> None:
@@ -846,7 +900,7 @@ def process_idea_name(message: telebot.types.Message, user_id: int) -> None:
 
 def process_idea_description(message: telebot.types.Message, user_id: int, idea_name: str) -> None:
     """
-    Обрабатывает описание идеи, создаёт идею в базе.
+    Обрабатывает описание идеи, создаёт идею в базе и запускает генерацию .md.
 
     Args:
         message: сообщение с описанием идеи
@@ -856,8 +910,12 @@ def process_idea_description(message: telebot.types.Message, user_id: int, idea_
     idea_description = message.text.strip() if message.text else ""
 
     try:
-        create_idea(idea_name, idea_description if idea_description else None, user_id)
+        idea_id = create_idea(idea_name, idea_description if idea_description else None, user_id)
         bot.send_message(message.chat.id, MSG_IDEA_CREATED.format(name=idea_name))
+        # Автоматическая генерация .md по описанию
+        _auto_generate_md(
+            message.chat.id, user_id, idea_id, idea_name, idea_description or None,
+        )
     except Exception as e:
         bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
         logger.error('Ошибка создания идеи для %s: %s', user_id, e)
@@ -1058,34 +1116,21 @@ def handle_assign_list_cancel(call: telebot.types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('gen_md:'))
 def handle_generate_md(call: telebot.types.CallbackQuery) -> None:
-    """Генерация .md описания идеи."""
+    """Ручная генерация/перегенерация .md описания идеи."""
     user_id = call.from_user.id
     idea_id = int(call.data.split(':')[1])
     idea = get_idea_by_id(idea_id, user_id)
     if not idea:
         bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
         return
-    articles = get_articles_by_idea(idea_id, user_id)
-    if not articles:
-        bot.answer_callback_query(call.id, MSG_MD_NO_ARTICLES)
+    if not idea['description']:
+        bot.answer_callback_query(call.id, "Добавь описание идеи для генерации .md")
         return
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, MSG_GENERATE_MD)
-    bot.send_chat_action(call.message.chat.id, 'typing')
-    model = get_user_model(user_id)
-    try:
-        md_text = generate_idea_md(idea['name'], idea['description'], articles, model)
-    except Exception as e:
-        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
-        return
-    pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': md_text}
-    send_long_message(call.message.chat.id, md_text)
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.row(
-        types.InlineKeyboardButton(text="Утвердить", callback_data=f"approve_md:{idea_id}"),
-        types.InlineKeyboardButton(text="Замечания", callback_data=f"revise_md:{idea_id}"),
+    _auto_generate_md(
+        call.message.chat.id, user_id, idea_id,
+        idea['name'], idea['description'],
     )
-    bot.send_message(call.message.chat.id, MSG_MD_READY, reply_markup=keyboard)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('approve_md:'))
@@ -1128,9 +1173,9 @@ def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
     else:
         bot.send_message(message.chat.id, MSG_MD_REVISING)
         bot.send_chat_action(message.chat.id, 'typing')
-        model = get_user_model(user_id)
+        md_model = get_user_md_model(user_id)
         try:
-            revised = revise_idea_md(session['draft_md'], feedback, model)
+            revised = revise_idea_md(session['draft_md'], feedback, md_model)
         except Exception as e:
             bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
             return
@@ -1403,6 +1448,11 @@ def process_edit_description(message: telebot.types.Message, user_id: int, idea_
         success = update_idea(idea_id, user_id, name=new_name, description=new_description)
         if success:
             bot.send_message(message.chat.id, MSG_IDEA_UPDATED.format(name=new_name))
+            # Перегенерация .md при изменении описания
+            if new_description:
+                _auto_generate_md(
+                    message.chat.id, user_id, idea_id, new_name, new_description,
+                )
         else:
             bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
     except Exception as e:

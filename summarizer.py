@@ -37,6 +37,8 @@ __all__ = [
     'check_model_availability',
     'AVAILABLE_MODELS',
     'DEFAULT_MODEL',
+    'AVAILABLE_MD_MODELS',
+    'DEFAULT_MD_MODEL',
     'generate_idea_md',
     'revise_idea_md',
 ]
@@ -55,6 +57,16 @@ AVAILABLE_MODELS: dict[str, str] = {
 
 # Модель по умолчанию (локальная)
 DEFAULT_MODEL: str = 'gemma3:12b'
+
+# Модели для генерации .md описаний идей
+AVAILABLE_MD_MODELS: dict[str, str] = {
+    'gpt-4': 'openai',
+    'gpt-3.5-turbo': 'openai',
+    'gemma3:12b': 'ollama',
+}
+
+# Модель по умолчанию для .md (облачная, более качественная)
+DEFAULT_MD_MODEL: str = 'gpt-4'
 
 
 def _get_provider(model: str) -> str:
@@ -166,20 +178,16 @@ IDEA_MD_SYSTEM_PROMPT: str = """Ты -- технический писатель.
 Структура:
 1. Заголовок -- название идеи
 2. Описание -- суть в 2-3 предложениях
-3. Ключевые концепции -- основные понятия из статей
-4. Источники -- список статей с кратким вкладом каждой
-5. Открытые вопросы -- что стоит изучить
-6. Связи -- пересечения с другими темами
+3. Ключевые концепции -- основные понятия и термины
+4. Открытые вопросы -- что стоит изучить
+5. Возможные направления -- как развивать тему
 
-Пиши на русском, будь конкретен, опирайся только на материалы."""
+Пиши на русском, будь конкретен, опирайся только на предоставленное описание."""
 
 IDEA_MD_USER_PROMPT_TEMPLATE: str = """Создай .md-описание для идеи.
 
 НАЗВАНИЕ: {idea_name}
-ОПИСАНИЕ: {idea_description}
-
-СТАТЬИ ({article_count}):
-{articles_text}"""
+ОПИСАНИЕ: {idea_description}"""
 
 IDEA_MD_REVISE_SYSTEM_PROMPT: str = """Переработай .md-описание идеи по замечаниям. Сохрани структуру."""
 
@@ -464,39 +472,42 @@ def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
 def generate_idea_md(
     idea_name: str,
     idea_description: str,
-    articles: list[dict],
-    model: str = DEFAULT_MODEL,
+    model: str = DEFAULT_MD_MODEL,
 ) -> str:
-    """Генерирует .md-описание идеи."""
-    articles_text = ""
-    for idx, art in enumerate(articles, 1):
-        summary = (art.get('summary') or '(нет конспекта)')[:500]
-        articles_text += (
-            f"\n--- Статья {idx} ---\n"
-            f"Название: {art.get('title', '')}\n"
-            f"URL: {art.get('url', '')}\n"
-            f"Источник: {art.get('source', '')}\n"
-            f"Конспект: {summary}\n"
-        )
+    """Генерирует .md-описание идеи на основе названия и описания."""
+    start_time = time.perf_counter()
     user_prompt = IDEA_MD_USER_PROMPT_TEMPLATE.format(
         idea_name=idea_name,
         idea_description=idea_description or '(нет описания)',
-        article_count=len(articles),
-        articles_text=articles_text,
     )
     provider = _get_provider(model)
     if provider == 'ollama':
-        return _generate_with_ollama(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
-    return _generate_with_openai(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+        result = _generate_with_ollama(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+    else:
+        result = _generate_with_openai(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+    elapsed = time.perf_counter() - start_time
+    logger.info(
+        'generate_idea_md completed: model=%s, idea=%s, length=%d, time=%.2fs',
+        model, idea_name[:50], len(result), elapsed,
+    )
+    return result
 
 
-def revise_idea_md(current_md: str, feedback: str, model: str = DEFAULT_MODEL) -> str:
+def revise_idea_md(current_md: str, feedback: str, model: str = DEFAULT_MD_MODEL) -> str:
     """Переделывает .md по замечаниям пользователя."""
+    start_time = time.perf_counter()
     user_prompt = IDEA_MD_REVISE_USER_PROMPT_TEMPLATE.format(
         current_md=current_md,
         feedback=feedback,
     )
     provider = _get_provider(model)
     if provider == 'ollama':
-        return _generate_with_ollama(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
-    return _generate_with_openai(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
+        result = _generate_with_ollama(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
+    else:
+        result = _generate_with_openai(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
+    elapsed = time.perf_counter() - start_time
+    logger.info(
+        'revise_idea_md completed: model=%s, length=%d, time=%.2fs',
+        model, len(result), elapsed,
+    )
+    return result
