@@ -293,3 +293,154 @@ Git не смог автоматически объединить изменен
 git add .
 git commit -m "Разрешил конфликт"
 ```
+
+---
+
+## Работа с внешними ветками (агенты, другие разработчики)
+
+Claude Code и другие агенты создают ветки через `git worktree` — это отдельные рабочие директории, привязанные к веткам вида `claude/название-задачи`. Ветки появляются локально, но не видны на GitHub, пока их не запушат.
+
+---
+
+### Шаг 1: Посмотреть, какие ветки создали агенты
+
+```bash
+# Все локальные ветки (включая агентские)
+git branch
+
+# Ветки с последним коммитом — удобно для обзора
+git branch -v
+
+# Если агент уже запушил ветку на GitHub
+git fetch origin
+git branch -a
+```
+
+Ветки агентов обычно имеют префикс `claude/`, например `claude/hardcore-newton`.
+
+---
+
+### Шаг 2: Проверить изменения в ветке агента (ДО мерджа)
+
+```bash
+# Посмотреть коммиты, которых нет в main
+git log main..claude/hardcore-newton --oneline
+
+# Посмотреть что именно изменено (диф относительно main)
+git diff main..claude/hardcore-newton
+
+# Посмотреть список изменённых файлов
+git diff main..claude/hardcore-newton --stat
+```
+
+**Совет:** Всегда проверяй диф перед мерджем. Агент мог допустить ошибку или внести лишние изменения.
+
+---
+
+### Шаг 3: Протестировать ветку агента локально
+
+Если хочешь запустить код из ветки перед мерджем:
+
+```bash
+# Вариант А: Переключиться на ветку агента
+git checkout claude/hardcore-newton
+# ... тестируешь ...
+git checkout main  # вернуться обратно
+
+# Вариант Б: Посмотреть через worktree (если агент работал через worktree)
+# Код уже лежит в папке worktree, можно зайти и проверить
+```
+
+---
+
+### Шаг 4: Смержить ветку агента в main
+
+```bash
+# 1. Убедись, что main актуален
+git checkout main
+git pull origin main
+
+# 2. Смержи ветку агента
+git merge claude/hardcore-newton
+
+# 3. Если конфликты — разреши их, потом:
+git add .
+git commit -m "Разрешил конфликт при мердже claude/hardcore-newton"
+
+# 4. Отправь на GitHub
+git push origin main
+```
+
+---
+
+### Шаг 5: Навести порядок после мерджа
+
+```bash
+# Удалить локальную ветку агента
+git branch -d claude/hardcore-newton
+
+# Если агент работал через worktree — удалить worktree
+git worktree list                              # посмотреть все worktree
+git worktree remove путь/к/worktree            # удалить
+
+# Если ветка была на GitHub — удалить удалённую
+git push origin --delete claude/hardcore-newton
+```
+
+---
+
+### Альтернатива: через Pull Request (рекомендуется для важных изменений)
+
+Если хочешь ревью на GitHub перед мерджем:
+
+```bash
+# 1. Запушить ветку агента на GitHub
+git push origin claude/hardcore-newton
+
+# 2. Создать PR через CLI
+gh pr create --base main --head claude/hardcore-newton \
+  --title "Описание изменений" \
+  --body "Что сделано и зачем"
+
+# 3. Посмотреть PR в браузере, проверить диф
+# 4. Смержить через GitHub или CLI
+gh pr merge --merge
+```
+
+---
+
+### Полный пример: агент создал ветку, ты проверяешь и мерджишь
+
+```bash
+# 1. Посмотри что есть
+git branch -v
+
+# 2. Проверь изменения
+git log main..claude/hardcore-newton --oneline
+git diff main..claude/hardcore-newton --stat
+
+# 3. Если всё ок — мерджи
+git checkout main
+git pull origin main
+git merge claude/hardcore-newton
+git push origin main
+
+# 4. Убери за собой
+git branch -d claude/hardcore-newton
+```
+
+---
+
+### Полезные команды для работы с внешними ветками
+
+| Команда | Описание |
+|---------|----------|
+| `git branch -v` | Список веток с последним коммитом |
+| `git log main..ветка --oneline` | Коммиты ветки, которых нет в main |
+| `git diff main..ветка --stat` | Какие файлы изменены в ветке |
+| `git diff main..ветка` | Полный диф ветки относительно main |
+| `git merge ветка` | Смержить ветку в текущую |
+| `git worktree list` | Список всех worktree |
+| `git worktree remove путь` | Удалить worktree |
+| `gh pr create --head ветка` | Создать PR из ветки |
+| `gh pr merge` | Смержить PR через CLI |

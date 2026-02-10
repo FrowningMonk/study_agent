@@ -23,6 +23,7 @@
     - unlink_article_from_idea(...) - отвязка статьи от идеи
     - get_articles_by_idea(...) - получение статей идеи
     - get_ideas_by_article(...) - получение идей статьи
+    - get_user_articles(user_id) - получение всех статей пользователя
 
 Example для статей:
     >>> from database import init_db, article_exists, save_article
@@ -61,6 +62,9 @@ __all__ = [
     'unlink_article_from_idea',
     'get_articles_by_idea',
     'get_ideas_by_article',
+    'get_user_articles',
+    'update_idea_md',
+    'get_idea_md',
 ]
 
 # Путь к базе данных
@@ -172,6 +176,13 @@ def init_db() -> None:
         cursor.executescript(CREATE_IDEA_ARTICLES_TABLE_SQL)
         cursor.executescript(CREATE_IDEA_ARTICLES_INDEXES_SQL)
         conn.commit()
+        # Миграция: добавляем поле generated_md в ideas
+        try:
+            cursor.execute("ALTER TABLE ideas ADD COLUMN generated_md TEXT")
+            conn.commit()
+            logger.info("Миграция: добавлено поле generated_md в ideas")
+        except sqlite3.OperationalError:
+            pass
         logger.info("База данных инициализирована: %s", DB_PATH)
     finally:
         conn.close()
@@ -734,3 +745,67 @@ def get_ideas_by_article(article_id: int, user_id: int) -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def get_user_articles(user_id: int) -> list[dict]:
+    """Получает все статьи пользователя."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, url, source, title, summary, model_used, processed_at "
+            "FROM articles WHERE user_id = ? ORDER BY processed_at DESC",
+            (user_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+# ========================
+# Функции для генерации .md идей
+# ========================
+
+IDEAS_MD_DIR: str = 'ideas_md'
+
+
+def update_idea_md(idea_id: int, user_id: int, md_content: str) -> bool:
+    """Сохраняет .md идеи в БД и на диск."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE ideas SET generated_md = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (md_content, datetime.now().isoformat(), idea_id, user_id),
+        )
+        conn.commit()
+        if cursor.rowcount > 0:
+            _save_idea_md_file(idea_id, md_content)
+            return True
+        return False
+    finally:
+        conn.close()
+
+
+def get_idea_md(idea_id: int, user_id: int) -> str | None:
+    """Получает generated_md идеи."""
+    conn = _get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT generated_md FROM ideas WHERE id = ? AND user_id = ?",
+            (idea_id, user_id),
+        )
+        row = cursor.fetchone()
+        return row['generated_md'] if row else None
+    finally:
+        conn.close()
+
+
+def _save_idea_md_file(idea_id: int, md_content: str) -> None:
+    """Сохраняет .md файл на диск."""
+    os.makedirs(IDEAS_MD_DIR, exist_ok=True)
+    filepath = os.path.join(IDEAS_MD_DIR, f'idea_{idea_id}.md')
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(md_content)
+    logger.debug("Файл идеи сохранен: %s", filepath)

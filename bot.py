@@ -39,7 +39,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from pipeline import ensure_directories, process_article, save_article_to_db
-from summarizer import AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability
+from summarizer import (
+    AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability,
+    AVAILABLE_MD_MODELS, DEFAULT_MD_MODEL,
+    generate_idea_md, revise_idea_md,
+)
 from database import (
     init_db,
     article_exists,
@@ -54,6 +58,10 @@ from database import (
     link_article_to_idea,
     unlink_article_from_idea,
     get_articles_by_idea,
+    get_user_articles,
+    get_ideas_by_article,
+    get_idea_md,
+    update_idea_md,
 )
 
 load_dotenv()
@@ -75,6 +83,7 @@ SUPPORTED_SOURCES: dict[str, str] = {
 }
 
 user_models: dict[int, str] = {}
+user_md_models: dict[int, str] = {}
 
 # Сообщения
 MSG_START: str = """👋 Привет!
@@ -106,6 +115,7 @@ MSG_HELP = """Команды:
 /model - выбор модели
 /new_idea - создать идею
 /ideas - посмотреть идеи
+/articles - все статьи
 
 Поддерживаемые источники: habr.com, github.com, infostart.ru"""
 MSG_PROCESSING = "Обрабатываю..."
@@ -135,6 +145,22 @@ MSG_LINK_SKIPPED = "Статья не привязана ни к одной ид
 MSG_IDEA_ARTICLES_TITLE = "Статьи, привязанные к идее «{name}»:"
 MSG_IDEA_NO_ARTICLES = "К этой идее пока не привязано ни одной статьи."
 MSG_ARTICLE_UNLINKED = "Статья отвязана от идеи."
+MSG_ARTICLES_EMPTY = "В базе нет статей."
+MSG_ARTICLES_TITLE = "Все статьи ({count}):"
+MSG_REASSIGN_SELECT = "Выбери идеи для переноса статьи (можно несколько):"
+MSG_REASSIGN_DONE = "Статья перенесена."
+MSG_REASSIGN_CANCELLED = "Перенос отменен."
+MSG_REASSIGN_NO_IDEAS = "Нет других идей для переноса."
+MSG_ASSIGN_SELECT = "Выбери идеи для привязки статьи (можно несколько):"
+MSG_ASSIGN_DONE = "Статья привязана."
+MSG_ASSIGN_CANCELLED = "Привязка отменена."
+MSG_ASSIGN_NO_IDEAS = "Нет идей. Создай идею: /new_idea"
+MSG_GENERATE_MD = "Генерирую описание идеи..."
+MSG_MD_READY = ("Описание готово. Варианты:\n1. Утвердить\n"
+                "2. Отправить замечания текстом\n"
+                "3. Отправить свой вариант целиком (начиная с #)")
+MSG_MD_APPROVED = "Описание сохранено."
+MSG_MD_REVISING = "Переделываю с учетом замечаний..."
 
 
 # Проверяем наличие токена перед запуском
@@ -190,6 +216,11 @@ def get_user_model(user_id: int) -> str:
     return user_models.get(user_id, DEFAULT_MODEL)
 
 
+def get_user_md_model(user_id: int) -> str:
+    """Возвращает выбранную пользователем модель для генерации .md."""
+    return user_md_models.get(user_id, DEFAULT_MD_MODEL)
+
+
 def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
     """
     Создает inline-клавиатуру для выбора действия при дубликате.
@@ -224,6 +255,15 @@ pending_cache_urls: dict[str, str] = {}
 # Хранилище состояния multiselect для привязки статей к идеям
 # Формат: {user_id: {'article_data': dict, 'summary': str, 'model': str, 'selected_ideas': set[int]}}
 pending_article_links: dict[int, dict] = {}
+
+# Хранилище состояния перепривязки статей
+pending_reassign: dict[int, dict] = {}
+
+# Хранилище состояния привязки из общего списка статей
+pending_assign_list: dict[int, dict] = {}
+
+# Хранилище состояния генерации .md идей
+pending_md_generation: dict[int, dict] = {}
 
 
 def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
@@ -290,6 +330,87 @@ def create_link_ideas_keyboard(
     keyboard.row(done_btn, skip_btn)
 
     return keyboard
+
+
+def create_assign_list_keyboard(
+    ideas: list[dict],
+    selected_ids: set[int],
+) -> types.InlineKeyboardMarkup:
+    """Клавиатура multiselect для привязки статьи из общего списка."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idea in ideas:
+        prefix = "V " if idea['id'] in selected_ids else "_ "
+        keyboard.add(types.InlineKeyboardButton(
+            text=f"{prefix}{idea['name'][:40]}",
+            callback_data=f"toggle_assign_list:{idea['id']}",
+        ))
+    done_btn = types.InlineKeyboardButton(text="Готово", callback_data="assign_list_done")
+    cancel_btn = types.InlineKeyboardButton(text="Отмена", callback_data="assign_list_cancel")
+    keyboard.row(done_btn, cancel_btn)
+    return keyboard
+
+
+def create_reassign_keyboard(ideas: list[dict], selected_ids: set[int]) -> types.InlineKeyboardMarkup:
+    """Клавиатура multiselect для перепривязки."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idea in ideas:
+        prefix = "V " if idea['id'] in selected_ids else "_ "
+        keyboard.add(types.InlineKeyboardButton(
+            text=f"{prefix}{idea['name'][:40]}",
+            callback_data=f"toggle_reassign:{idea['id']}",
+        ))
+    done_btn = types.InlineKeyboardButton(text="Готово", callback_data="reassign_done")
+    cancel_btn = types.InlineKeyboardButton(text="Отмена", callback_data="reassign_cancel")
+    keyboard.row(done_btn, cancel_btn)
+    return keyboard
+
+
+def _auto_generate_md(
+    chat_id: int,
+    user_id: int,
+    idea_id: int,
+    idea_name: str,
+    idea_description: str | None,
+) -> None:
+    """Автоматически генерирует .md после создания/редактирования идеи."""
+    if not idea_description:
+        return
+    md_model = get_user_md_model(user_id)
+    # Проверяем доступность модели для .md
+    is_available, error_message = check_model_availability(md_model)
+    if not is_available:
+        logger.warning(
+            'Модель .md %s недоступна для %s: %s', md_model, user_id, error_message,
+        )
+        bot.send_message(
+            chat_id,
+            MSG_MODEL_UNAVAILABLE.format(model=md_model, error=error_message),
+        )
+        return
+    bot.send_message(chat_id, MSG_GENERATE_MD)
+    bot.send_chat_action(chat_id, 'typing')
+    logger.info(
+        'Начинаю генерацию .md: idea_id=%d, model=%s, user_id=%s',
+        idea_id, md_model, user_id,
+    )
+    try:
+        md_text = generate_idea_md(idea_name, idea_description, md_model)
+    except Exception as e:
+        logger.error('Ошибка генерации .md для idea_id=%d: %s', idea_id, e)
+        bot.send_message(chat_id, MSG_ERROR.format(error=str(e)))
+        return
+    pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': md_text}
+    send_long_message(chat_id, md_text)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text="Утвердить", callback_data=f"approve_md:{idea_id}",
+        ),
+        types.InlineKeyboardButton(
+            text="Замечания", callback_data=f"revise_md:{idea_id}",
+        ),
+    )
+    bot.send_message(chat_id, MSG_MD_READY, reply_markup=keyboard)
 
 
 def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int) -> None:
@@ -366,7 +487,7 @@ def create_main_keyboard() -> types.ReplyKeyboardMarkup:
         ReplyKeyboardMarkup с кнопками команд
     """
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.row('/ideas', '/new_idea')
+    keyboard.row('/ideas', '/new_idea', '/articles')
     keyboard.row('/model', '/help')
     return keyboard
 
@@ -779,7 +900,7 @@ def process_idea_name(message: telebot.types.Message, user_id: int) -> None:
 
 def process_idea_description(message: telebot.types.Message, user_id: int, idea_name: str) -> None:
     """
-    Обрабатывает описание идеи, создаёт идею в базе.
+    Обрабатывает описание идеи, создаёт идею в базе и запускает генерацию .md.
 
     Args:
         message: сообщение с описанием идеи
@@ -789,8 +910,12 @@ def process_idea_description(message: telebot.types.Message, user_id: int, idea_
     idea_description = message.text.strip() if message.text else ""
 
     try:
-        create_idea(idea_name, idea_description if idea_description else None, user_id)
+        idea_id = create_idea(idea_name, idea_description if idea_description else None, user_id)
         bot.send_message(message.chat.id, MSG_IDEA_CREATED.format(name=idea_name))
+        # Автоматическая генерация .md по описанию
+        _auto_generate_md(
+            message.chat.id, user_id, idea_id, idea_name, idea_description or None,
+        )
     except Exception as e:
         bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
         logger.error('Ошибка создания идеи для %s: %s', user_id, e)
@@ -822,6 +947,297 @@ def handle_ideas(message: telebot.types.Message) -> None:
 
     bot.send_message(message.chat.id, MSG_IDEAS_TITLE, reply_markup=keyboard)
     
+
+@bot.message_handler(commands=['articles'])
+def handle_articles(message: telebot.types.Message) -> None:
+    """Показывает все статьи пользователя с привязками к идеям и кнопкой привязки."""
+    user_id = message.from_user.id
+    articles = get_user_articles(user_id)
+    if not articles:
+        bot.send_message(message.chat.id, MSG_ARTICLES_EMPTY)
+        return
+    # Формируем текст и inline-кнопки привязки
+    lines: list[str] = []
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    for idx, art in enumerate(articles, 1):
+        ideas = get_ideas_by_article(art['id'], user_id)
+        idea_names = ", ".join(i['name'] for i in ideas) if ideas else "(без идеи)"
+        lines.append(f"{idx}. [{art['source']}] {art['title'][:50]}\n   Идеи: {idea_names}")
+        assign_btn = types.InlineKeyboardButton(
+            text=f"-> {idx}. {art['title'][:20]}",
+            callback_data=f"assign_list:{art['id']}",
+        )
+        keyboard.add(assign_btn)
+    text = MSG_ARTICLES_TITLE.format(count=len(articles)) + "\n\n" + "\n".join(lines)
+    # Разбиваем длинный текст, клавиатуру добавляем к последнему сообщению
+    if len(text) <= MESSAGE_CHUNK_SIZE:
+        bot.send_message(message.chat.id, text, reply_markup=keyboard)
+    else:
+        send_long_message(message.chat.id, text)
+        bot.send_message(message.chat.id, "Привязка статей к идеям:", reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reassign:'))
+def handle_reassign_start(call: telebot.types.CallbackQuery) -> None:
+    """Начало перепривязки. Callback: reassign:{article_id}:{source_idea_id}"""
+    user_id = call.from_user.id
+    parts = call.data.split(':')
+    article_id, source_idea_id = int(parts[1]), int(parts[2])
+    logger.info(
+        'Перепривязка: user_id=%s, article_id=%d, source_idea_id=%d',
+        user_id, article_id, source_idea_id,
+    )
+    ideas = [i for i in get_user_ideas(user_id) if i['id'] != source_idea_id]
+    if not ideas:
+        bot.answer_callback_query(call.id, MSG_REASSIGN_NO_IDEAS)
+        return
+    pending_reassign[user_id] = {
+        'article_id': article_id,
+        'source_idea_id': source_idea_id,
+        'selected_ideas': set(),
+    }
+    bot.send_message(
+        call.message.chat.id,
+        MSG_REASSIGN_SELECT,
+        reply_markup=create_reassign_keyboard(ideas, set()),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_reassign:'))
+def handle_toggle_reassign(call: telebot.types.CallbackQuery) -> None:
+    """Toggle выбора идеи при перепривязке."""
+    user_id = call.from_user.id
+    session = pending_reassign.get(user_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+    idea_id = int(call.data.split(':')[1])
+    selected = session['selected_ideas']
+    if idea_id in selected:
+        selected.discard(idea_id)
+    else:
+        selected.add(idea_id)
+    ideas = [i for i in get_user_ideas(user_id) if i['id'] != session['source_idea_id']]
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_reassign_keyboard(ideas, selected),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'reassign_done')
+def handle_reassign_done(call: telebot.types.CallbackQuery) -> None:
+    """Завершение перепривязки: link к новым идеям, unlink из старой."""
+    user_id = call.from_user.id
+    session = pending_reassign.pop(user_id, None)
+    if not session or not session['selected_ideas']:
+        bot.answer_callback_query(call.id, MSG_REASSIGN_CANCELLED)
+        return
+    for idea_id in session['selected_ideas']:
+        link_article_to_idea(session['article_id'], idea_id, user_id)
+    unlink_article_from_idea(session['article_id'], session['source_idea_id'], user_id)
+    logger.info(
+        'Перепривязка завершена: user_id=%s, article_id=%d, из idea_id=%d в ideas=%s',
+        user_id, session['article_id'], session['source_idea_id'],
+        list(session['selected_ideas']),
+    )
+    bot.edit_message_text(MSG_REASSIGN_DONE, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'reassign_cancel')
+def handle_reassign_cancel(call: telebot.types.CallbackQuery) -> None:
+    """Отмена перепривязки."""
+    user_id = call.from_user.id
+    pending_reassign.pop(user_id, None)
+    bot.edit_message_text(MSG_REASSIGN_CANCELLED, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('assign_list:'))
+def handle_assign_list_start(call: telebot.types.CallbackQuery) -> None:
+    """Начало привязки статьи к идеям из общего списка /articles."""
+    user_id = call.from_user.id
+    article_id = int(call.data.split(':')[1])
+    logger.info('Привязка из /articles: user_id=%s, article_id=%d', user_id, article_id)
+    ideas = get_user_ideas(user_id)
+    if not ideas:
+        bot.answer_callback_query(call.id, MSG_ASSIGN_NO_IDEAS)
+        return
+    pending_assign_list[user_id] = {
+        'article_id': article_id,
+        'selected_ideas': set(),
+    }
+    bot.send_message(
+        call.message.chat.id,
+        MSG_ASSIGN_SELECT,
+        reply_markup=create_assign_list_keyboard(ideas, set()),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_assign_list:'))
+def handle_toggle_assign_list(call: telebot.types.CallbackQuery) -> None:
+    """Toggle выбора идеи при привязке из общего списка."""
+    user_id = call.from_user.id
+    session = pending_assign_list.get(user_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+    idea_id = int(call.data.split(':')[1])
+    selected = session['selected_ideas']
+    if idea_id in selected:
+        selected.discard(idea_id)
+    else:
+        selected.add(idea_id)
+    ideas = get_user_ideas(user_id)
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_assign_list_keyboard(ideas, selected),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'assign_list_done')
+def handle_assign_list_done(call: telebot.types.CallbackQuery) -> None:
+    """Завершение привязки статьи к идеям из общего списка."""
+    user_id = call.from_user.id
+    session = pending_assign_list.pop(user_id, None)
+    if not session or not session['selected_ideas']:
+        bot.answer_callback_query(call.id, MSG_ASSIGN_CANCELLED)
+        return
+    for idea_id in session['selected_ideas']:
+        link_article_to_idea(session['article_id'], idea_id, user_id)
+    logger.info(
+        'Привязка из /articles завершена: user_id=%s, article_id=%d, ideas=%s',
+        user_id, session['article_id'], list(session['selected_ideas']),
+    )
+    bot.edit_message_text(MSG_ASSIGN_DONE, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'assign_list_cancel')
+def handle_assign_list_cancel(call: telebot.types.CallbackQuery) -> None:
+    """Отмена привязки из общего списка."""
+    user_id = call.from_user.id
+    pending_assign_list.pop(user_id, None)
+    bot.edit_message_text(MSG_ASSIGN_CANCELLED, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('gen_md:'))
+def handle_generate_md(call: telebot.types.CallbackQuery) -> None:
+    """Показ существующего .md или генерация нового."""
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+    if not idea['description']:
+        bot.answer_callback_query(call.id, "Добавь описание идеи для генерации .md")
+        return
+    bot.answer_callback_query(call.id)
+    # Проверяем, есть ли уже сохранённый .md
+    existing_md = get_idea_md(idea_id, user_id)
+    if existing_md:
+        logger.info('Показ существующего .md: idea_id=%d, user_id=%s', idea_id, user_id)
+        send_long_message(call.message.chat.id, existing_md)
+        # Загружаем в сессию для возможности правок
+        pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': existing_md}
+        keyboard = types.InlineKeyboardMarkup(row_width=3)
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text="Перегенерировать", callback_data=f"regen_md:{idea_id}",
+            ),
+            types.InlineKeyboardButton(
+                text="Замечания", callback_data=f"revise_md:{idea_id}",
+            ),
+        )
+        bot.send_message(call.message.chat.id, MSG_MD_READY, reply_markup=keyboard)
+        return
+    # Нет сохранённого — генерируем
+    _auto_generate_md(
+        call.message.chat.id, user_id, idea_id,
+        idea['name'], idea['description'],
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('regen_md:'))
+def handle_regen_md(call: telebot.types.CallbackQuery) -> None:
+    """Принудительная перегенерация .md."""
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+    idea = get_idea_by_id(idea_id, user_id)
+    if not idea:
+        bot.answer_callback_query(call.id, MSG_IDEA_NOT_FOUND)
+        return
+    bot.answer_callback_query(call.id)
+    logger.info('Перегенерация .md: idea_id=%d, user_id=%s', idea_id, user_id)
+    _auto_generate_md(
+        call.message.chat.id, user_id, idea_id,
+        idea['name'], idea['description'],
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('approve_md:'))
+def handle_approve_md(call: telebot.types.CallbackQuery) -> None:
+    """Сохраняет утвержденный .md."""
+    user_id = call.from_user.id
+    idea_id = int(call.data.split(':')[1])
+    session = pending_md_generation.get(user_id)
+    if not session or session['idea_id'] != idea_id:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+    update_idea_md(idea_id, user_id, session['draft_md'])
+    pending_md_generation.pop(user_id, None)
+    bot.edit_message_text(MSG_MD_APPROVED, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('revise_md:'))
+def handle_revise_md(call: telebot.types.CallbackQuery) -> None:
+    """Запрос замечаний для переработки .md."""
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "Отправь замечания текстом или свой вариант .md (начиная с #):",
+    )
+    bot.register_next_step_handler(call.message, process_md_feedback, call.from_user.id)
+
+
+def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
+    """Обработка замечаний/правок .md."""
+    session = pending_md_generation.get(user_id)
+    if not session:
+        bot.send_message(message.chat.id, "Сессия истекла, начни генерацию заново.")
+        return
+    idea_id = session['idea_id']
+    feedback = message.text.strip()
+    if feedback.startswith('#'):
+        session['draft_md'] = feedback
+        send_long_message(message.chat.id, feedback)
+    else:
+        bot.send_message(message.chat.id, MSG_MD_REVISING)
+        bot.send_chat_action(message.chat.id, 'typing')
+        md_model = get_user_md_model(user_id)
+        try:
+            revised = revise_idea_md(session['draft_md'], feedback, md_model)
+        except Exception as e:
+            bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+            return
+        session['draft_md'] = revised
+        send_long_message(message.chat.id, revised)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(text="Утвердить", callback_data=f"approve_md:{idea_id}"),
+        types.InlineKeyboardButton(text="Замечания", callback_data=f"revise_md:{idea_id}"),
+    )
+    bot.send_message(message.chat.id, MSG_MD_READY, reply_markup=keyboard)
+
 
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message: telebot.types.Message) -> None:
@@ -867,7 +1283,11 @@ def handle_view_idea(call: telebot.types.CallbackQuery) -> None:
         text="🗑️ Удалить",
         callback_data=f"delete_idea:{idea_id}",
     )
-    keyboard.row(articles_btn)
+    generate_md_btn = types.InlineKeyboardButton(
+        text="Описание (.md)",
+        callback_data=f"gen_md:{idea_id}",
+    )
+    keyboard.row(articles_btn, generate_md_btn)
     keyboard.row(edit_btn, delete_btn)
 
     bot.edit_message_text(
@@ -930,7 +1350,11 @@ def handle_idea_articles(call: telebot.types.CallbackQuery) -> None:
             text="🔗❌",
             callback_data=f"unlink:{article_id}:{idea_id}",
         )
-        keyboard.row(summary_btn, unlink_btn)
+        reassign_btn = types.InlineKeyboardButton(
+            text="->",
+            callback_data=f"reassign:{article_id}:{idea_id}",
+        )
+        keyboard.row(summary_btn, unlink_btn, reassign_btn)
 
     # Кнопка "Назад"
     back_btn = types.InlineKeyboardButton(
@@ -1074,6 +1498,11 @@ def process_edit_description(message: telebot.types.Message, user_id: int, idea_
         success = update_idea(idea_id, user_id, name=new_name, description=new_description)
         if success:
             bot.send_message(message.chat.id, MSG_IDEA_UPDATED.format(name=new_name))
+            # Перегенерация .md при изменении описания
+            if new_description:
+                _auto_generate_md(
+                    message.chat.id, user_id, idea_id, new_name, new_description,
+                )
         else:
             bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
     except Exception as e:
@@ -1201,7 +1630,7 @@ def main() -> None:
     ensure_directories()
     init_db()
 
-    # Проверяем доступность моделей
+    # Проверяем доступность моделей для конспектов
     available = []
     unavailable = []
     for model in AVAILABLE_MODELS:
@@ -1212,9 +1641,24 @@ def main() -> None:
             unavailable.append(model)
 
     if available:
-        logger.info("Доступные модели: %s", ", ".join(available))
+        logger.info("Доступные модели (конспект): %s", ", ".join(available))
     if unavailable:
-        logger.warning("Недоступные модели: %s", ", ".join(unavailable))
+        logger.warning("Недоступные модели (конспект): %s", ", ".join(unavailable))
+
+    # Проверяем доступность моделей для генерации .md
+    available_md = []
+    unavailable_md = []
+    for model in AVAILABLE_MD_MODELS:
+        is_ok, _ = check_model_availability(model)
+        if is_ok:
+            available_md.append(model)
+        else:
+            unavailable_md.append(model)
+
+    if available_md:
+        logger.info("Доступные модели (.md): %s", ", ".join(available_md))
+    if unavailable_md:
+        logger.warning("Недоступные модели (.md): %s", ", ".join(unavailable_md))
 
     logger.info("Бот запущен")
 
