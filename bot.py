@@ -149,6 +149,10 @@ MSG_REASSIGN_SELECT = "Выбери идеи для переноса стать�
 MSG_REASSIGN_DONE = "Статья перенесена."
 MSG_REASSIGN_CANCELLED = "Перенос отменен."
 MSG_REASSIGN_NO_IDEAS = "Нет других идей для переноса."
+MSG_ASSIGN_SELECT = "Выбери идеи для привязки статьи (можно несколько):"
+MSG_ASSIGN_DONE = "Статья привязана."
+MSG_ASSIGN_CANCELLED = "Привязка отменена."
+MSG_ASSIGN_NO_IDEAS = "Нет идей. Создай идею: /new_idea"
 MSG_GENERATE_MD = "Генерирую описание идеи..."
 MSG_MD_READY = ("Описание готово. Варианты:\n1. Утвердить\n"
                 "2. Отправить замечания текстом\n"
@@ -249,6 +253,9 @@ pending_article_links: dict[int, dict] = {}
 # Хранилище состояния перепривязки статей
 pending_reassign: dict[int, dict] = {}
 
+# Хранилище состояния привязки из общего списка статей
+pending_assign_list: dict[int, dict] = {}
+
 # Хранилище состояния генерации .md идей
 pending_md_generation: dict[int, dict] = {}
 
@@ -316,6 +323,24 @@ def create_link_ideas_keyboard(
     )
     keyboard.row(done_btn, skip_btn)
 
+    return keyboard
+
+
+def create_assign_list_keyboard(
+    ideas: list[dict],
+    selected_ids: set[int],
+) -> types.InlineKeyboardMarkup:
+    """Клавиатура multiselect для привязки статьи из общего списка."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idea in ideas:
+        prefix = "V " if idea['id'] in selected_ids else "_ "
+        keyboard.add(types.InlineKeyboardButton(
+            text=f"{prefix}{idea['name'][:40]}",
+            callback_data=f"toggle_assign_list:{idea['id']}",
+        ))
+    done_btn = types.InlineKeyboardButton(text="Готово", callback_data="assign_list_done")
+    cancel_btn = types.InlineKeyboardButton(text="Отмена", callback_data="assign_list_cancel")
+    keyboard.row(done_btn, cancel_btn)
     return keyboard
 
 
@@ -867,19 +892,31 @@ def handle_ideas(message: telebot.types.Message) -> None:
 
 @bot.message_handler(commands=['articles'])
 def handle_articles(message: telebot.types.Message) -> None:
-    """Показывает все статьи пользователя с привязками к идеям."""
+    """Показывает все статьи пользователя с привязками к идеям и кнопкой привязки."""
     user_id = message.from_user.id
     articles = get_user_articles(user_id)
     if not articles:
         bot.send_message(message.chat.id, MSG_ARTICLES_EMPTY)
         return
+    # Формируем текст и inline-кнопки привязки
     lines: list[str] = []
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
     for idx, art in enumerate(articles, 1):
         ideas = get_ideas_by_article(art['id'], user_id)
         idea_names = ", ".join(i['name'] for i in ideas) if ideas else "(без идеи)"
         lines.append(f"{idx}. [{art['source']}] {art['title'][:50]}\n   Идеи: {idea_names}")
+        assign_btn = types.InlineKeyboardButton(
+            text=f"-> {idx}. {art['title'][:20]}",
+            callback_data=f"assign_list:{art['id']}",
+        )
+        keyboard.add(assign_btn)
     text = MSG_ARTICLES_TITLE.format(count=len(articles)) + "\n\n" + "\n".join(lines)
-    send_long_message(message.chat.id, text)
+    # Разбиваем длинный текст, клавиатуру добавляем к последнему сообщению
+    if len(text) <= MESSAGE_CHUNK_SIZE:
+        bot.send_message(message.chat.id, text, reply_markup=keyboard)
+    else:
+        send_long_message(message.chat.id, text)
+        bot.send_message(message.chat.id, "Привязка статей к идеям:", reply_markup=keyboard)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('reassign:'))
@@ -949,6 +986,73 @@ def handle_reassign_cancel(call: telebot.types.CallbackQuery) -> None:
     user_id = call.from_user.id
     pending_reassign.pop(user_id, None)
     bot.edit_message_text(MSG_REASSIGN_CANCELLED, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('assign_list:'))
+def handle_assign_list_start(call: telebot.types.CallbackQuery) -> None:
+    """Начало привязки статьи к идеям из общего списка /articles."""
+    user_id = call.from_user.id
+    article_id = int(call.data.split(':')[1])
+    ideas = get_user_ideas(user_id)
+    if not ideas:
+        bot.answer_callback_query(call.id, MSG_ASSIGN_NO_IDEAS)
+        return
+    pending_assign_list[user_id] = {
+        'article_id': article_id,
+        'selected_ideas': set(),
+    }
+    bot.send_message(
+        call.message.chat.id,
+        MSG_ASSIGN_SELECT,
+        reply_markup=create_assign_list_keyboard(ideas, set()),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_assign_list:'))
+def handle_toggle_assign_list(call: telebot.types.CallbackQuery) -> None:
+    """Toggle выбора идеи при привязке из общего списка."""
+    user_id = call.from_user.id
+    session = pending_assign_list.get(user_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Сессия истекла")
+        return
+    idea_id = int(call.data.split(':')[1])
+    selected = session['selected_ideas']
+    if idea_id in selected:
+        selected.discard(idea_id)
+    else:
+        selected.add(idea_id)
+    ideas = get_user_ideas(user_id)
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_assign_list_keyboard(ideas, selected),
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'assign_list_done')
+def handle_assign_list_done(call: telebot.types.CallbackQuery) -> None:
+    """Завершение привязки статьи к идеям из общего списка."""
+    user_id = call.from_user.id
+    session = pending_assign_list.pop(user_id, None)
+    if not session or not session['selected_ideas']:
+        bot.answer_callback_query(call.id, MSG_ASSIGN_CANCELLED)
+        return
+    for idea_id in session['selected_ideas']:
+        link_article_to_idea(session['article_id'], idea_id, user_id)
+    bot.edit_message_text(MSG_ASSIGN_DONE, call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'assign_list_cancel')
+def handle_assign_list_cancel(call: telebot.types.CallbackQuery) -> None:
+    """Отмена привязки из общего списка."""
+    user_id = call.from_user.id
+    pending_assign_list.pop(user_id, None)
+    bot.edit_message_text(MSG_ASSIGN_CANCELLED, call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
 
