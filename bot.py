@@ -6,15 +6,13 @@ Telegram-бот для агента изучения ИИ.
     - github.com (README репозиториев)
     - infostart.ru (статьи и публикации по 1С)
 
-Поддерживаемые модели:
-    - gemma3:12b (локальная, Ollama) — по умолчанию
-    - gpt-3.5-turbo (OpenAI)
-    - gpt-4 (OpenAI)
+Поддерживаемые провайдеры: ollama, openai, openrouter.
+Название модели вводится пользователем.
 
 Команды бота:
     /start — Приветствие и инструкция
     /help  — Справка по использованию
-    /model — Выбор модели для генерации
+    /model — Выбор провайдера и модели
     <URL>  — Отправить ссылку → получить конспект
 
 Example:
@@ -40,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 from pipeline import ensure_directories, process_article, save_article_to_db
 from summarizer import (
-    AVAILABLE_MODELS, DEFAULT_MODEL, check_model_availability,
-    AVAILABLE_MD_MODELS, DEFAULT_MD_MODEL,
+    DEFAULT_MODEL, DEFAULT_PROVIDER, check_model_availability, check_providers_status,
+    DEFAULT_MD_MODEL, DEFAULT_MD_PROVIDER,
     generate_idea_md, revise_idea_md,
 )
 from database import (
@@ -82,8 +80,26 @@ SUPPORTED_SOURCES: dict[str, str] = {
     'infostart.ru': 'infostart',
 }
 
-user_models: dict[int, str] = {}
-user_md_models: dict[int, str] = {}
+# Формат: {user_id: {'provider': 'ollama', 'model': 'gemma3:12b'}}
+user_models: dict[int, dict[str, str]] = {}
+user_md_models: dict[int, dict[str, str]] = {}
+
+# Промежуточное состояние: провайдер выбран, ждём ввод названия модели
+# Формат: {user_id: {'purpose': 'summary'|'md', 'provider': str}}
+pending_model_selection: dict[int, dict[str, str]] = {}
+
+# Примеры моделей для каждого провайдера (подсказка при вводе)
+PROVIDER_EXAMPLES: dict[str, str] = {
+    'ollama': 'gemma3:12b, llama3:8b, qwen3:8b',
+    'openai': 'gpt-4, gpt-4o, gpt-3.5-turbo',
+    'openrouter': 'anthropic/claude-3-haiku, google/gemma-2-9b-it',
+}
+
+PROVIDER_DISPLAY: dict[str, str] = {
+    'ollama': 'Ollama (локальная)',
+    'openai': 'OpenAI',
+    'openrouter': 'OpenRouter',
+}
 
 # Сообщения
 MSG_START: str = """👋 Привет!
@@ -121,10 +137,16 @@ MSG_HELP = """Команды:
 MSG_PROCESSING = "Обрабатываю..."
 MSG_ERROR = "Ошибка: {error}"
 MSG_UNSUPPORTED = "Я такие ссылки пока не понимаю. Поддерживаемые источники: habr.com, github.com, infostart.ru"
-MSG_MODEL_UNAVAILABLE = "Модель {model} недоступна: {error}\n\nВыбери другую модель: /model"
+MSG_MODEL_UNAVAILABLE = "Модель {model} ({provider}) недоступна: {error}\n\nВыбери другую модель: /model"
 MSG_UNKNOWN = "Без ссылки работать бессмысленно. /help для справки."
-MSG_MODEL_SELECT = "Текущая модель: {current_model}\n\nВыбери модель:"
-MSG_MODEL_CHANGED = "Модель изменена: {model}"
+MSG_CURRENT_MODELS = ("Текущие настройки:\n"
+                      "Конспекты: {summary_model} ({summary_provider})\n"
+                      ".md описания: {md_model} ({md_provider})")
+MSG_PROVIDER_SELECT = "Выбери провайдера для {purpose}:"
+MSG_MODEL_INPUT = "Провайдер: {provider}\n\nВведи название модели (например: {example}):"
+MSG_MODEL_CHECKING = "Проверяю модель {model} ({provider})..."
+MSG_MODEL_SET = "Модель установлена: {model} ({provider})"
+MSG_MODEL_CHECK_FAILED = "Модель {model} ({provider}) недоступна: {error}\n\nПопробуй другое название или /model"
 MSG_DUPLICATE_FOUND = "📦 Эта статья уже обработана.\n\nЧто сделать?"
 
 # Сообщения для идей
@@ -199,26 +221,28 @@ def is_supported_url(url: str) -> bool:
     return any(source in url for source in SUPPORTED_SOURCES)
 
 
-def get_user_model(user_id: int) -> str:
+def get_user_model(user_id: int) -> tuple[str, str]:
     """
-    Возвращает выбранную пользователем модель.
-
-    Если пользователь еще не выбирал модель - возвращает модель по умолчанию.
-    Это позволяет легко изменить способ хранения предпочтений в будущем
-    (например, сохранение в базу данных).
+    Возвращает (модель, провайдер) для генерации конспектов.
 
     Args:
         user_id: Telegram ID пользователя
 
     Returns:
-        Название модели для генерации конспектов
+        Кортеж (model, provider)
     """
-    return user_models.get(user_id, DEFAULT_MODEL)
+    cfg = user_models.get(user_id)
+    if cfg:
+        return cfg['model'], cfg['provider']
+    return DEFAULT_MODEL, DEFAULT_PROVIDER
 
 
-def get_user_md_model(user_id: int) -> str:
-    """Возвращает выбранную пользователем модель для генерации .md."""
-    return user_md_models.get(user_id, DEFAULT_MD_MODEL)
+def get_user_md_model(user_id: int) -> tuple[str, str]:
+    """Возвращает (модель, провайдер) для генерации .md."""
+    cfg = user_md_models.get(user_id)
+    if cfg:
+        return cfg['model'], cfg['provider']
+    return DEFAULT_MD_MODEL, DEFAULT_MD_PROVIDER
 
 
 def create_cache_keyboard(url: str) -> types.InlineKeyboardMarkup:
@@ -266,27 +290,21 @@ pending_assign_list: dict[int, dict] = {}
 pending_md_generation: dict[int, dict] = {}
 
 
-def create_model_keyboard(current_model: str) -> types.InlineKeyboardMarkup:
+def create_provider_keyboard(purpose: str) -> types.InlineKeyboardMarkup:
     """
-    Создает inline-клавиатуру для выбора модели.
-
-    Отображает список доступных моделей с галочкой ✓ у текущей выбранной модели.
-    Каждая кнопка содержит callback_data в формате "model:название_модели".
+    Создаёт inline-клавиатуру для выбора провайдера.
 
     Args:
-        current_model: Название текущей модели пользователя
+        purpose: 'summary' для конспектов, 'md' для генерации .md
 
     Returns:
-        InlineKeyboardMarkup с кнопками выбора моделей
+        InlineKeyboardMarkup с кнопками выбора провайдера
     """
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for model_name in AVAILABLE_MODELS.keys():
-        display_name = model_name
-        if model_name == current_model:
-            display_name = f'✓ {display_name}'
+    for provider_id, display_name in PROVIDER_DISPLAY.items():
         button = types.InlineKeyboardButton(
             text=display_name,
-            callback_data=f'model:{model_name}',
+            callback_data=f'provider:{purpose}:{provider_id}',
         )
         keyboard.add(button)
     return keyboard
@@ -375,26 +393,26 @@ def _auto_generate_md(
     """Автоматически генерирует .md после создания/редактирования идеи."""
     if not idea_description:
         return
-    md_model = get_user_md_model(user_id)
+    md_model, md_provider = get_user_md_model(user_id)
     # Проверяем доступность модели для .md
-    is_available, error_message = check_model_availability(md_model)
+    is_available, error_message = check_model_availability(md_model, md_provider)
     if not is_available:
         logger.warning(
-            'Модель .md %s недоступна для %s: %s', md_model, user_id, error_message,
+            'Модель .md %s (%s) недоступна для %s: %s', md_model, md_provider, user_id, error_message,
         )
         bot.send_message(
             chat_id,
-            MSG_MODEL_UNAVAILABLE.format(model=md_model, error=error_message),
+            MSG_MODEL_UNAVAILABLE.format(model=md_model, provider=md_provider, error=error_message),
         )
         return
     bot.send_message(chat_id, MSG_GENERATE_MD)
     bot.send_chat_action(chat_id, 'typing')
     logger.info(
-        'Начинаю генерацию .md: idea_id=%d, model=%s, user_id=%s',
-        idea_id, md_model, user_id,
+        'Начинаю генерацию .md: idea_id=%d, model=%s, provider=%s, user_id=%s',
+        idea_id, md_model, md_provider, user_id,
     )
     try:
-        md_text = generate_idea_md(idea_name, idea_description, md_model)
+        md_text = generate_idea_md(idea_name, idea_description, md_model, md_provider)
     except Exception as e:
         logger.error('Ошибка генерации .md для idea_id=%d: %s', idea_id, e)
         bot.send_message(chat_id, MSG_ERROR.format(error=str(e)))
@@ -508,37 +526,116 @@ def handle_help(message: telebot.types.Message) -> None:
 
 @bot.message_handler(commands=['model'])
 def handle_model(message: telebot.types.Message) -> None:
-    """Обрабатывает команду /model - показывает меню выбора модели."""
+    """Обрабатывает команду /model — показывает текущие настройки и меню выбора."""
     user_id = message.from_user.id
-    current_model = get_user_model(user_id)
-    keyboard = create_model_keyboard(current_model)
-    bot.send_message(
-        message.chat.id,
-        MSG_MODEL_SELECT.format(current_model=current_model),
-        reply_markup=keyboard,
+    summary_model, summary_provider = get_user_model(user_id)
+    md_model, md_provider = get_user_md_model(user_id)
+
+    text = MSG_CURRENT_MODELS.format(
+        summary_model=summary_model,
+        summary_provider=summary_provider,
+        md_model=md_model,
+        md_provider=md_provider,
     )
 
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='Сменить модель конспектов',
+            callback_data='choose_provider:summary',
+        ),
+        types.InlineKeyboardButton(
+            text='Сменить модель .md описаний',
+            callback_data='choose_provider:md',
+        ),
+    )
+    bot.send_message(message.chat.id, text, reply_markup=keyboard)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('model:'))
-def handle_model_callback(call: telebot.types.CallbackQuery) -> None:
-    """
-    Обрабатывает выбор модели через inline keyboard.
 
-    Callback data имеет формат: "model:название_модели"
-    Например: "model:gemma3:12b"
-    """
-    user_id = call.from_user.id
-    # Извлекаем название модели из callback data (формат: "model:gemma3:12b")
-    # Разбиваем по первому ':', берем вторую часть
-    model = call.data.split(':', 1)[1]
-    user_models[user_id] = model
-
+@bot.callback_query_handler(func=lambda call: call.data.startswith('choose_provider:'))
+def handle_choose_provider(call: telebot.types.CallbackQuery) -> None:
+    """Показывает кнопки выбора провайдера."""
+    purpose = call.data.split(':')[1]  # 'summary' или 'md'
+    purpose_label = 'конспектов' if purpose == 'summary' else '.md описаний'
+    keyboard = create_provider_keyboard(purpose)
     bot.edit_message_text(
-        MSG_MODEL_CHANGED.format(model=model),
+        MSG_PROVIDER_SELECT.format(purpose=purpose_label),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=keyboard,
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('provider:'))
+def handle_provider_callback(call: telebot.types.CallbackQuery) -> None:
+    """Обрабатывает выбор провайдера, запрашивает ввод названия модели."""
+    user_id = call.from_user.id
+    parts = call.data.split(':')
+    purpose = parts[1]   # 'summary' или 'md'
+    provider = parts[2]  # 'ollama', 'openai', 'openrouter'
+
+    pending_model_selection[user_id] = {
+        'purpose': purpose,
+        'provider': provider,
+    }
+
+    example = PROVIDER_EXAMPLES.get(provider, '')
+    bot.edit_message_text(
+        MSG_MODEL_INPUT.format(provider=PROVIDER_DISPLAY.get(provider, provider), example=example),
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
     )
-    bot.answer_callback_query(call.id, f'Выбрана модель: {model}')
+    bot.answer_callback_query(call.id)
+    bot.register_next_step_handler(call.message, process_model_name_input, user_id)
+
+
+def process_model_name_input(message: telebot.types.Message, user_id: int) -> None:
+    """Обрабатывает ввод названия модели от пользователя."""
+    if user_id not in pending_model_selection:
+        bot.send_message(message.chat.id, 'Сессия истекла. Используй /model заново.')
+        return
+
+    model_name = message.text.strip() if message.text else ''
+    if not model_name or model_name.startswith('/'):
+        pending_model_selection.pop(user_id, None)
+        bot.send_message(message.chat.id, 'Ввод модели отменён.')
+        return
+
+    session = pending_model_selection[user_id]
+    provider = session['provider']
+    purpose = session['purpose']
+    provider_label = PROVIDER_DISPLAY.get(provider, provider)
+
+    status_msg = bot.send_message(
+        message.chat.id,
+        MSG_MODEL_CHECKING.format(model=model_name, provider=provider_label),
+    )
+    bot.send_chat_action(message.chat.id, 'typing')
+
+    is_available, error_message = check_model_availability(model_name, provider)
+
+    if not is_available:
+        bot.edit_message_text(
+            MSG_MODEL_CHECK_FAILED.format(model=model_name, provider=provider_label, error=error_message),
+            chat_id=message.chat.id,
+            message_id=status_msg.message_id,
+        )
+        pending_model_selection.pop(user_id, None)
+        return
+
+    model_config = {'provider': provider, 'model': model_name}
+    if purpose == 'summary':
+        user_models[user_id] = model_config
+    else:
+        user_md_models[user_id] = model_config
+
+    bot.edit_message_text(
+        MSG_MODEL_SET.format(model=model_name, provider=provider_label),
+        chat_id=message.chat.id,
+        message_id=status_msg.message_id,
+    )
+    pending_model_selection.pop(user_id, None)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cache:'))
@@ -559,7 +656,7 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
         bot.answer_callback_query(call.id, 'Ссылка устарела, отправьте заново')
         return
 
-    model = get_user_model(user_id)
+    model, provider = get_user_model(user_id)
 
     if action == 'show':
         # Показать сохранённый конспект
@@ -587,19 +684,21 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
         bot.answer_callback_query(call.id, 'Начинаю генерацию')
 
         # Проверяем доступность модели
-        is_available, error_message = check_model_availability(model)
+        is_available, error_message = check_model_availability(model, provider)
         if not is_available:
-            error_text = MSG_MODEL_UNAVAILABLE.format(model=model, error=error_message)
+            error_text = MSG_MODEL_UNAVAILABLE.format(model=model, provider=provider, error=error_message)
             bot.send_message(call.message.chat.id, error_text)
-            logger.warning('Модель %s недоступна для %s: %s', model, user_id, error_message)
+            logger.warning('Модель %s (%s) недоступна для %s: %s', model, provider, user_id, error_message)
             return
 
-        logger.info('Начинаю регенерацию: url=%s, model=%s, user_id=%s', url, model, user_id)
+        logger.info('Начинаю регенерацию: url=%s, model=%s, provider=%s, user_id=%s',
+                    url, model, provider, user_id)
         try:
             # skip_cache=True для принудительной перегенерации
             result = process_article(
                 url,
                 model=model,
+                provider=provider,
                 user_id=user_id,
                 skip_cache=True,
             )
@@ -614,11 +713,11 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
             summary, article_data = result
             save_article_to_db(article_data, summary, model, user_id, url)
 
-            header = f'🔄 Перегенерировано!\nМодель: {model}\n\n'
+            header = f'🔄 Перегенерировано!\nМодель: {model} ({provider})\n\n'
             if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
                 bot.send_message(call.message.chat.id, header + summary)
             else:
-                bot.send_message(call.message.chat.id, f'🔄 Перегенерировано! Модель: {model}')
+                bot.send_message(call.message.chat.id, f'🔄 Перегенерировано! Модель: {model} ({provider})')
                 send_long_message(call.message.chat.id, summary)
 
         except Exception as e:
@@ -788,7 +887,7 @@ def handle_url(message: telebot.types.Message) -> None:
         return
 
     user_id = message.from_user.id
-    model = get_user_model(user_id)
+    model, provider = get_user_model(user_id)
 
     if not is_supported_url(url):
         bot.reply_to(message, MSG_UNSUPPORTED)
@@ -808,19 +907,20 @@ def handle_url(message: telebot.types.Message) -> None:
         return
 
     # Проверяем доступность модели
-    is_available, error_message = check_model_availability(model)
+    is_available, error_message = check_model_availability(model, provider)
     if not is_available:
-        error_text = MSG_MODEL_UNAVAILABLE.format(model=model, error=error_message)
+        error_text = MSG_MODEL_UNAVAILABLE.format(model=model, provider=provider, error=error_message)
         bot.reply_to(message, error_text)
-        logger.warning('Модель %s недоступна для %s: %s', model, user_id, error_message)
+        logger.warning('Модель %s (%s) недоступна для %s: %s', model, provider, user_id, error_message)
         return
 
     bot.send_chat_action(message.chat.id, 'typing')
     status_msg = bot.reply_to(message, MSG_PROCESSING)
 
-    logger.info('Начинаю обработку статьи: url=%s, model=%s, user_id=%s', url, model, user_id)
+    logger.info('Начинаю обработку статьи: url=%s, model=%s, provider=%s, user_id=%s',
+                url, model, provider, user_id)
     try:
-        result = process_article(url, model=model, user_id=user_id)
+        result = process_article(url, model=model, provider=provider, user_id=user_id)
 
         if result is None:
             bot.edit_message_text(
@@ -841,11 +941,11 @@ def handle_url(message: telebot.types.Message) -> None:
             pass
 
         # Отправляем конспект
-        header = f'Готово!\nМодель: {model}\nИсточник: {url}\n\n'
+        header = f'Готово!\nМодель: {model} ({provider})\nИсточник: {url}\n\n'
         if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
             bot.send_message(message.chat.id, header + summary)
         else:
-            bot.send_message(message.chat.id, f'Готово! Модель: {model}')
+            bot.send_message(message.chat.id, f'Готово! Модель: {model} ({provider})')
             send_long_message(message.chat.id, summary)
 
         # Предлагаем привязать статью к идеям
@@ -1223,9 +1323,9 @@ def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
     else:
         bot.send_message(message.chat.id, MSG_MD_REVISING)
         bot.send_chat_action(message.chat.id, 'typing')
-        md_model = get_user_md_model(user_id)
+        md_model, md_provider = get_user_md_model(user_id)
         try:
-            revised = revise_idea_md(session['draft_md'], feedback, md_model)
+            revised = revise_idea_md(session['draft_md'], feedback, md_model, md_provider)
         except Exception as e:
             bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
             return
@@ -1630,35 +1730,25 @@ def main() -> None:
     ensure_directories()
     init_db()
 
-    # Проверяем доступность моделей для конспектов
-    available = []
-    unavailable = []
-    for model in AVAILABLE_MODELS:
-        is_ok, _ = check_model_availability(model)
+    # Проверяем подключение к провайдерам
+    logger.info('Проверка провайдеров...')
+    providers_status = check_providers_status()
+    for prov, (is_ok, msg) in providers_status.items():
         if is_ok:
-            available.append(model)
+            logger.info('Провайдер %s: OK — %s', prov, msg)
         else:
-            unavailable.append(model)
+            logger.warning('Провайдер %s: НЕДОСТУПЕН — %s', prov, msg)
 
-    if available:
-        logger.info("Доступные модели (конспект): %s", ", ".join(available))
-    if unavailable:
-        logger.warning("Недоступные модели (конспект): %s", ", ".join(unavailable))
-
-    # Проверяем доступность моделей для генерации .md
-    available_md = []
-    unavailable_md = []
-    for model in AVAILABLE_MD_MODELS:
-        is_ok, _ = check_model_availability(model)
+    # Проверяем дефолтные модели
+    for label, model, provider in [
+        ('конспект', DEFAULT_MODEL, DEFAULT_PROVIDER),
+        ('.md', DEFAULT_MD_MODEL, DEFAULT_MD_PROVIDER),
+    ]:
+        is_ok, err = check_model_availability(model, provider)
         if is_ok:
-            available_md.append(model)
+            logger.info('Модель по умолчанию (%s): %s (%s) — OK', label, model, provider)
         else:
-            unavailable_md.append(model)
-
-    if available_md:
-        logger.info("Доступные модели (.md): %s", ", ".join(available_md))
-    if unavailable_md:
-        logger.warning("Недоступные модели (.md): %s", ", ".join(unavailable_md))
+            logger.warning('Модель по умолчанию (%s): %s (%s) — НЕДОСТУПНА: %s', label, model, provider, err)
 
     logger.info("Бот запущен")
 

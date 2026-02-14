@@ -6,15 +6,13 @@
     - github.com (README репозиториев)
     - infostart.ru (статьи и публикации по 1С)
 
-Поддерживаемые модели:
-    - gemma3:12b (локальная, Ollama) — по умолчанию
-    - gpt-3.5-turbo (OpenAI)
-    - gpt-4 (OpenAI)
+Поддерживаемые провайдеры: ollama, openai, openrouter.
+Название модели задаётся пользователем.
 
 Example:
     python pipeline.py https://habr.com/ru/articles/123456/
-    python pipeline.py https://habr.com/ru/articles/123456/ gpt-4
-    python pipeline.py https://github.com/anthropics/anthropic-cookbook gemma3:12b
+    python pipeline.py https://habr.com/ru/articles/123456/ gpt-4 openai
+    python pipeline.py https://github.com/anthropics/anthropic-cookbook gemma3:12b ollama
     python pipeline.py https://infostart.ru/public/886103/
 """
 
@@ -28,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Импортируем наши модули
 from scraper import get_article
-from summarizer import generate_summary, DEFAULT_MODEL
+from summarizer import generate_summary, DEFAULT_MODEL, DEFAULT_PROVIDER
 from database import init_db, article_exists, save_article, update_article, get_article_by_url
 
 # Публичный API модуля
@@ -90,6 +88,7 @@ def get_source_name(url: str) -> str:
 def process_article(
     url: str,
     model: str = DEFAULT_MODEL,
+    provider: str = DEFAULT_PROVIDER,
     user_id: int | None = None,
     skip_cache: bool = False,
 ) -> tuple[str, dict] | None:
@@ -101,7 +100,8 @@ def process_article(
 
     Args:
         url: URL статьи или репозитория для обработки.
-        model: Модель для генерации (по умолчанию — локальная Ollama).
+        model: Модель для генерации.
+        provider: Провайдер ('ollama', 'openai', 'openrouter').
         user_id: Telegram user_id для привязки статьи.
         skip_cache: Пропустить проверку кеша (для принудительной перегенерации).
 
@@ -124,15 +124,15 @@ def process_article(
     logger.info('Страница спарсена: url=%s, title=%s, content_length=%d',
                 url, article_data.get('title', 'N/A')[:50], content_length)
 
-    summary = generate_summary(article_data, model)
+    summary = generate_summary(article_data, model, provider)
 
     if summary.startswith('❌'):
         logger.error("Ошибка генерации: %s", summary)
         return None
 
     elapsed = time.perf_counter() - start_time
-    logger.info('Summary сгенерирован: model=%s, url=%s, length=%d, time=%.2fs',
-                model, url, len(summary), elapsed)
+    logger.info('Summary сгенерирован: model=%s, provider=%s, url=%s, length=%d, time=%.2fs',
+                model, provider, url, len(summary), elapsed)
     return summary, article_data
 
 
@@ -182,18 +182,19 @@ def save_article_to_db(
 
 def main() -> None:
     """
-    Точка входа: python pipeline.py <URL> [model]
+    Точка входа: python pipeline.py <URL> [model] [provider]
     """
     ensure_directories()
     init_db()
 
     if len(sys.argv) < 2:
-        print("Использование: python pipeline.py <URL> [model]")
+        print("Использование: python pipeline.py <URL> [model] [provider]")
         sys.exit(1)
 
     url = sys.argv[1]
     model = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_MODEL
-    process_article(url, model=model)
+    provider = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PROVIDER
+    process_article(url, model=model, provider=provider)
 
 
 if __name__ == '__main__':

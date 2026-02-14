@@ -1,5 +1,5 @@
 """
-Модуль генерации конспектов через OpenAI API и Ollama.
+Модуль генерации конспектов через OpenAI API, Ollama и OpenRouter.
 
 Поддерживает разные промпты для разных источников:
     - habr.com — статьи (технические, аналитические)
@@ -7,12 +7,13 @@
     - infostart.ru — статьи и публикации по 1С
 
 Поддерживаемые провайдеры:
-    - ollama — локальные модели (gemma3:12b и др.)
-    - openai — облачные модели (gpt-3.5-turbo, gpt-4)
+    - ollama — локальные модели (любая модель из Ollama)
+    - openai — облачные модели OpenAI (любая модель)
+    - openrouter — OpenRouter API (любая модель)
 
 Example:
     >>> from summarizer import generate_summary
-    >>> summary = generate_summary(article_data, model='gemma3:12b')
+    >>> summary = generate_summary(article_data, model='gemma3:12b', provider='ollama')
 """
 
 import logging
@@ -31,14 +32,22 @@ load_dotenv()
 # Инициализируем клиент OpenAI
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
+# Инициализируем клиент OpenRouter (OpenAI-совместимый API)
+openrouter_client = OpenAI(
+    api_key=os.getenv('OPENROUTER_API_KEY'),
+    base_url='https://openrouter.ai/api/v1',
+)
+
 # Публичный API модуля
 __all__ = [
     'generate_summary',
     'check_model_availability',
-    'AVAILABLE_MODELS',
+    'check_providers_status',
+    'SUPPORTED_PROVIDERS',
     'DEFAULT_MODEL',
-    'AVAILABLE_MD_MODELS',
+    'DEFAULT_PROVIDER',
     'DEFAULT_MD_MODEL',
+    'DEFAULT_MD_PROVIDER',
     'generate_idea_md',
     'revise_idea_md',
 ]
@@ -48,39 +57,16 @@ __all__ = [
 # КОНФИГУРАЦИЯ МОДЕЛЕЙ
 # =============================================================================
 
-# Доступные модели: название → провайдер
-AVAILABLE_MODELS: dict[str, str] = {
-    'gemma3:12b': 'ollama',
-    'gpt-3.5-turbo': 'openai',
-    'gpt-4': 'openai',
-}
+# Поддерживаемые провайдеры
+SUPPORTED_PROVIDERS: list[str] = ['ollama', 'openai', 'openrouter']
 
-# Модель по умолчанию (локальная)
+# Модель и провайдер по умолчанию (для конспектов)
+DEFAULT_PROVIDER: str = 'ollama'
 DEFAULT_MODEL: str = 'gemma3:12b'
 
-# Модели для генерации .md описаний идей
-AVAILABLE_MD_MODELS: dict[str, str] = {
-    'gpt-4': 'openai',
-    'gpt-3.5-turbo': 'openai',
-    'gemma3:12b': 'ollama',
-}
-
-# Модель по умолчанию для .md (облачная, более качественная)
+# Модель и провайдер по умолчанию (для генерации .md)
+DEFAULT_MD_PROVIDER: str = 'openai'
 DEFAULT_MD_MODEL: str = 'gpt-4'
-
-
-def _get_provider(model: str) -> str:
-    """
-    Определяет провайдера по названию модели.
-
-    Args:
-        model: Название модели.
-
-    Returns:
-        Провайдер ('ollama' или 'openai').
-        Если модель неизвестна, возвращает 'ollama'.
-    """
-    return AVAILABLE_MODELS.get(model, 'ollama')
 
 
 # =============================================================================
@@ -375,52 +361,178 @@ def _generate_with_openai(
 
 
 # =============================================================================
+# ГЕНЕРАЦИЯ ЧЕРЕЗ OPENROUTER
+# =============================================================================
+
+
+def _generate_with_openrouter(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+) -> str:
+    """
+    Генерирует текст через OpenRouter API (OpenAI-совместимый).
+
+    Args:
+        system_prompt: Системный промпт.
+        user_prompt: Пользовательский промпт.
+        model: Название модели в OpenRouter.
+
+    Returns:
+        Сгенерированный текст.
+
+    Raises:
+        Exception: При ошибке API.
+    """
+    response = openrouter_client.chat.completions.create(
+        model=model,
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=1000,
+        timeout=30,
+    )
+
+    return response.choices[0].message.content
+
+
+# =============================================================================
+# ДИСПЕТЧЕР ПРОВАЙДЕРОВ
+# =============================================================================
+
+
+def _generate(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    provider: str,
+) -> str:
+    """
+    Диспетчер: вызывает генерацию через нужного провайдера.
+
+    Args:
+        system_prompt: Системный промпт.
+        user_prompt: Пользовательский промпт.
+        model: Название модели.
+        provider: Провайдер ('ollama', 'openai', 'openrouter').
+
+    Returns:
+        Сгенерированный текст.
+
+    Raises:
+        ValueError: Если провайдер не поддерживается.
+    """
+    if provider == 'ollama':
+        return _generate_with_ollama(system_prompt, user_prompt, model)
+    elif provider == 'openai':
+        return _generate_with_openai(system_prompt, user_prompt, model)
+    elif provider == 'openrouter':
+        return _generate_with_openrouter(system_prompt, user_prompt, model)
+    else:
+        raise ValueError(f'Неподдерживаемый провайдер: {provider}')
+
+
+# =============================================================================
 # ПРОВЕРКА ДОСТУПНОСТИ МОДЕЛЕЙ
 # =============================================================================
 
 
-def check_model_availability(model: str) -> tuple[bool, str | None]:
+def check_model_availability(model: str, provider: str) -> tuple[bool, str | None]:
     """
-    Проверяет доступность модели.
+    Проверяет доступность модели у указанного провайдера.
 
     Args:
         model: Название модели.
+        provider: Провайдер ('ollama', 'openai', 'openrouter').
 
     Returns:
         Кортеж (доступна ли модель, сообщение об ошибке или None).
     """
-    provider = _get_provider(model)
-
     try:
         if provider == 'ollama':
-            # Проверяем доступность Ollama
             try:
-                # Пытаемся получить список моделей
                 models = ollama.list()
-                # Проверяем, есть ли нужная модель
                 available_models = [m.model for m in models.get('models', [])]
                 if model not in available_models:
-                    return False, f'Модель {model} не найдена в Ollama. Доступные модели: {", ".join(available_models) if available_models else "нет"}'
+                    return False, (
+                        f'Модель {model} не найдена в Ollama. '
+                        f'Доступные: {", ".join(available_models) if available_models else "нет"}'
+                    )
                 return True, None
             except Exception as e:
                 error_msg = str(e).lower()
                 if 'connection' in error_msg or 'connect' in error_msg:
                     return False, 'Ollama не запущена. Запустите команду: ollama serve'
                 elif 'keyerror' in error_msg or "'name'" in error_msg:
-                    return False, f'Ошибка версии библиотеки ollama. Обновите: pip install --upgrade ollama'
-                return False, f'Не удалось подключиться к Ollama. Проверьте, что сервис запущен (ollama serve)'
+                    return False, 'Ошибка версии библиотеки ollama. Обновите: pip install --upgrade ollama'
+                return False, 'Не удалось подключиться к Ollama. Проверьте, что сервис запущен (ollama serve)'
 
         elif provider == 'openai':
-            # Проверяем наличие API ключа
             if not os.getenv('OPENAI_API_KEY'):
                 return False, 'API ключ OpenAI не найден. Добавьте OPENAI_API_KEY в .env файл'
-            # Для OpenAI дополнительная проверка не требуется
-            return True, None
+            try:
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{'role': 'user', 'content': 'test'}],
+                    max_tokens=1,
+                    timeout=10,
+                )
+                return True, None
+            except Exception as e:
+                return False, f'Ошибка проверки модели {model} в OpenAI: {str(e)}'
 
-        return True, None
+        elif provider == 'openrouter':
+            if not os.getenv('OPENROUTER_API_KEY'):
+                return False, 'API ключ OpenRouter не найден. Добавьте OPENROUTER_API_KEY в .env файл'
+            try:
+                openrouter_client.chat.completions.create(
+                    model=model,
+                    messages=[{'role': 'user', 'content': 'test'}],
+                    max_tokens=1,
+                    timeout=10,
+                )
+                return True, None
+            except Exception as e:
+                return False, f'Ошибка проверки модели {model} в OpenRouter: {str(e)}'
+
+        return False, f'Неподдерживаемый провайдер: {provider}'
 
     except Exception as e:
         return False, f'Непредвиденная ошибка при проверке модели: {str(e)}'
+
+
+def check_providers_status() -> dict[str, tuple[bool, str]]:
+    """
+    Проверяет подключение ко всем провайдерам при старте.
+
+    Returns:
+        Словарь {провайдер: (доступен, сообщение)}.
+    """
+    result: dict[str, tuple[bool, str]] = {}
+
+    # Ollama
+    try:
+        models = ollama.list()
+        model_names = [m.model for m in models.get('models', [])]
+        result['ollama'] = (True, f'Модели: {", ".join(model_names)}' if model_names else 'Нет моделей')
+    except Exception as e:
+        result['ollama'] = (False, str(e))
+
+    # OpenAI
+    if os.getenv('OPENAI_API_KEY'):
+        result['openai'] = (True, 'API ключ найден')
+    else:
+        result['openai'] = (False, 'OPENAI_API_KEY не задан')
+
+    # OpenRouter
+    if os.getenv('OPENROUTER_API_KEY'):
+        result['openrouter'] = (True, 'API ключ найден')
+    else:
+        result['openrouter'] = (False, 'OPENROUTER_API_KEY не задан')
+
+    return result
 
 
 # =============================================================================
@@ -428,13 +540,18 @@ def check_model_availability(model: str) -> tuple[bool, str | None]:
 # =============================================================================
 
 
-def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
+def generate_summary(
+    article_data: dict,
+    model: str = DEFAULT_MODEL,
+    provider: str = DEFAULT_PROVIDER,
+) -> str:
     """
     Генерирует конспект через выбранную модель.
 
     Args:
         article_data: Словарь с данными статьи/репозитория.
-        model: Название модели (по умолчанию — локальная Ollama).
+        model: Название модели.
+        provider: Провайдер ('ollama', 'openai', 'openrouter').
 
     Returns:
         Текст конспекта или сообщение об ошибке (начинается с '❌').
@@ -443,20 +560,15 @@ def generate_summary(article_data: dict, model: str = DEFAULT_MODEL) -> str:
 
     try:
         system_prompt, user_prompt = create_prompt(article_data)
-        provider = _get_provider(model)
-
-        if provider == 'ollama':
-            result = _generate_with_ollama(system_prompt, user_prompt, model)
-        else:
-            result = _generate_with_openai(system_prompt, user_prompt, model)
+        result = _generate(system_prompt, user_prompt, model, provider)
 
         elapsed = time.perf_counter() - start_time
         if not result.startswith('❌'):
-            logger.info('generate_summary completed: model=%s, source=%s, length=%d, time=%.2fs',
-                        model, article_data.get('source'), len(result), elapsed)
+            logger.info('generate_summary completed: model=%s, provider=%s, source=%s, length=%d, time=%.2fs',
+                        model, provider, article_data.get('source'), len(result), elapsed)
         else:
-            logger.warning('generate_summary failed: model=%s, error=%s, time=%.2fs',
-                           model, result[:100], elapsed)
+            logger.warning('generate_summary failed: model=%s, provider=%s, error=%s, time=%.2fs',
+                           model, provider, result[:100], elapsed)
 
         return result
 
@@ -473,6 +585,7 @@ def generate_idea_md(
     idea_name: str,
     idea_description: str,
     model: str = DEFAULT_MD_MODEL,
+    provider: str = DEFAULT_MD_PROVIDER,
 ) -> str:
     """Генерирует .md-описание идеи на основе названия и описания."""
     start_time = time.perf_counter()
@@ -480,34 +593,31 @@ def generate_idea_md(
         idea_name=idea_name,
         idea_description=idea_description or '(нет описания)',
     )
-    provider = _get_provider(model)
-    if provider == 'ollama':
-        result = _generate_with_ollama(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
-    else:
-        result = _generate_with_openai(IDEA_MD_SYSTEM_PROMPT, user_prompt, model)
+    result = _generate(IDEA_MD_SYSTEM_PROMPT, user_prompt, model, provider)
     elapsed = time.perf_counter() - start_time
     logger.info(
-        'generate_idea_md completed: model=%s, idea=%s, length=%d, time=%.2fs',
-        model, idea_name[:50], len(result), elapsed,
+        'generate_idea_md completed: model=%s, provider=%s, idea=%s, length=%d, time=%.2fs',
+        model, provider, idea_name[:50], len(result), elapsed,
     )
     return result
 
 
-def revise_idea_md(current_md: str, feedback: str, model: str = DEFAULT_MD_MODEL) -> str:
+def revise_idea_md(
+    current_md: str,
+    feedback: str,
+    model: str = DEFAULT_MD_MODEL,
+    provider: str = DEFAULT_MD_PROVIDER,
+) -> str:
     """Переделывает .md по замечаниям пользователя."""
     start_time = time.perf_counter()
     user_prompt = IDEA_MD_REVISE_USER_PROMPT_TEMPLATE.format(
         current_md=current_md,
         feedback=feedback,
     )
-    provider = _get_provider(model)
-    if provider == 'ollama':
-        result = _generate_with_ollama(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
-    else:
-        result = _generate_with_openai(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model)
+    result = _generate(IDEA_MD_REVISE_SYSTEM_PROMPT, user_prompt, model, provider)
     elapsed = time.perf_counter() - start_time
     logger.info(
-        'revise_idea_md completed: model=%s, length=%d, time=%.2fs',
-        model, len(result), elapsed,
+        'revise_idea_md completed: model=%s, provider=%s, length=%d, time=%.2fs',
+        model, provider, len(result), elapsed,
     )
     return result
