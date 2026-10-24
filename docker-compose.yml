@@ -1,0 +1,18 @@
+services:
+  bot:
+    build: .
+    image: study_agent:latest
+    container_name: study_agent
+    restart: unless-stopped
+    env_file: .env
+    # Host dirs (gitignored) so backups are a plain tar of the repo dir
+    volumes:
+      - ./data:/app/data
+      - ./ideas_md:/app/ideas_md
+      - ./conspect:/app/conspect
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

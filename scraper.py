@@ -17,6 +17,7 @@ Example:
 """
 
 import logging
+import os
 import re
 import time
 
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 __all__ = ['get_article', 'get_structured_habr_article']
 
 # Константы
-MAX_CONTENT_LENGTH: int = 8000
+MAX_CONTENT_LENGTH: int = 60000
 TIMEOUT_SECONDS: int = 10
 USER_AGENT: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
@@ -305,6 +306,10 @@ def _fetch_github_api(api_url: str) -> dict | None:
         'Accept': 'application/vnd.github.v3+json',
         'User-Agent': USER_AGENT,
     }
+    # С токеном лимит 5000 запросов/час вместо 60
+    token = os.getenv('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
 
     try:
         response = requests.get(api_url, headers=headers, timeout=TIMEOUT_SECONDS)
@@ -435,11 +440,16 @@ def _parse_github(url: str) -> dict:
     if error:
         return error
 
-    # Описание (короткая строка под названием)
-    description = ''
-    desc_elem = soup.find('p', class_='f4')
-    if desc_elem:
-        description = desc_elem.get_text(strip=True)
+    # Метаданные: сначала через API, при неудаче — из HTML
+    repo_info = _fetch_github_api(f'https://api.github.com/repos/{owner}/{repo}')
+    if repo_info:
+        description = repo_info.get('description') or ''
+        stars = str(repo_info.get('stargazers_count', 0))
+        language = repo_info.get('language') or 'Не определён'
+    else:
+        description = _extract_github_description(soup)
+        stars = _extract_github_stars(soup)
+        language = _extract_github_language(soup)
 
     # Ищем все важные markdown файлы через API
     markdown_files = _find_markdown_files(owner, repo)
@@ -462,16 +472,29 @@ def _parse_github(url: str) -> dict:
         'title': f'{owner}/{repo}',
         'author': owner,
         'description': description,
-        'stars': _extract_github_stars(soup),
-        'language': _extract_github_language(soup),
+        'stars': stars,
+        'language': language,
         'content': combined_content,
         'content_length': len(combined_content),
         'files': [f['path'] for f in markdown_files],
     }
 
 
+def _extract_github_description(soup: BeautifulSoup) -> str:
+    """Извлекает описание репозитория из meta-тега."""
+    meta = soup.find('meta', attrs={'name': 'description'})
+    if meta and meta.get('content'):
+        # Формат: "<описание> - owner/repo"
+        return meta['content'].rsplit(' - ', 1)[0].strip()
+    return ''
+
+
 def _extract_github_stars(soup: BeautifulSoup) -> str:
     """Извлекает количество звёзд репозитория."""
+    # GitHub рендерит страницу на React, данные лежат во встроенном JSON
+    match = re.search(r'"stargazerCount":(\d+)', str(soup))
+    if match:
+        return match.group(1)
     star_elem = soup.find('a', href=lambda x: x and '/stargazers' in x)
     if star_elem:
         star_text = star_elem.get_text(strip=True)

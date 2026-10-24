@@ -1,5 +1,5 @@
 """
-Модуль генерации конспектов через OpenAI API, Ollama и OpenRouter.
+Модуль генерации конспектов через Polza.ai и Ollama.
 
 Поддерживает разные промпты для разных источников:
     - habr.com — статьи (технические, аналитические)
@@ -7,9 +7,8 @@
     - infostart.ru — статьи и публикации по 1С
 
 Поддерживаемые провайдеры:
-    - ollama — локальные модели (любая модель из Ollama)
-    - openai — облачные модели OpenAI (любая модель)
-    - openrouter — OpenRouter API (любая модель)
+    - polza — Polza.ai API (любая модель, основной провайдер)
+    - ollama — локальные модели (резерв для локальной разработки)
 
 Example:
     >>> from summarizer import generate_summary
@@ -27,15 +26,16 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 # Загружаем переменные окружения
-load_dotenv()
+load_dotenv(override=True)
 
-# Инициализируем клиент OpenAI
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+POLZA_API_KEY: str | None = os.getenv('POLZA_API_KEY')
 
-# Инициализируем клиент OpenRouter (OpenAI-совместимый API)
-openrouter_client = OpenAI(
-    api_key=os.getenv('OPENROUTER_API_KEY'),
-    base_url='https://openrouter.ai/api/v1',
+# Инициализируем клиент Polza.ai (OpenAI-совместимый API).
+# Заглушка вместо None обязательна: иначе SDK молча подставит OPENAI_API_KEY
+# и отправит чужой ключ на сервер Polza.
+polza_client = OpenAI(
+    api_key=POLZA_API_KEY or 'not-set',
+    base_url=os.getenv('POLZA_BASE_URL', 'https://api.polza.ai/v1'),
 )
 
 # Публичный API модуля
@@ -58,15 +58,22 @@ __all__ = [
 # =============================================================================
 
 # Поддерживаемые провайдеры
-SUPPORTED_PROVIDERS: list[str] = ['ollama', 'openai', 'openrouter']
+SUPPORTED_PROVIDERS: list[str] = ['polza', 'ollama']
 
 # Модель и провайдер по умолчанию (для конспектов)
-DEFAULT_PROVIDER: str = 'ollama'
-DEFAULT_MODEL: str = 'gemma3:12b'
+DEFAULT_PROVIDER: str = 'polza'
+DEFAULT_MODEL: str = 'deepseek/deepseek-v4.1-flash-1017'
 
 # Модель и провайдер по умолчанию (для генерации .md)
-DEFAULT_MD_PROVIDER: str = 'openai'
-DEFAULT_MD_MODEL: str = 'gpt-4'
+DEFAULT_MD_PROVIDER: str = 'polza'
+DEFAULT_MD_MODEL: str = 'deepseek/deepseek-v4.1-flash-1017'
+
+# Лимиты генерации (общие для всех провайдеров)
+MAX_OUTPUT_TOKENS: int = 4000
+GENERATION_TIMEOUT_SECONDS: int = 120
+# Контекст Ollama по умолчанию 2–8k токенов: длинная статья (до 60k символов)
+# молча обрезалась бы вместе с инструкциями
+OLLAMA_NUM_CTX: int = 32768
 
 
 # =============================================================================
@@ -314,7 +321,8 @@ def _generate_with_ollama(
         ],
         options={
             'temperature': 0.3,
-            'num_predict': 1000,  # аналог max_tokens
+            'num_predict': MAX_OUTPUT_TOKENS,  # аналог max_tokens
+            'num_ctx': OLLAMA_NUM_CTX,
         },
     )
 
@@ -323,76 +331,42 @@ def _generate_with_ollama(
 
 
 # =============================================================================
-# ГЕНЕРАЦИЯ ЧЕРЕЗ OPENAI
+# ГЕНЕРАЦИЯ ЧЕРЕЗ POLZA.AI
 # =============================================================================
 
 
-def _generate_with_openai(
+def _generate_with_polza(
     system_prompt: str,
     user_prompt: str,
     model: str,
 ) -> str:
     """
-    Генерирует текст через OpenAI API.
+    Генерирует текст через Polza.ai API (OpenAI-совместимый).
 
     Args:
         system_prompt: Системный промпт.
         user_prompt: Пользовательский промпт.
-        model: Название модели OpenAI.
+        model: Название модели в Polza.ai.
 
     Returns:
         Сгенерированный текст.
 
     Raises:
+        RuntimeError: Если POLZA_API_KEY не задан.
         Exception: При ошибке API.
     """
-    response = client.chat.completions.create(
+    if not POLZA_API_KEY:
+        raise RuntimeError('POLZA_API_KEY не задан')
+
+    response = polza_client.chat.completions.create(
         model=model,
         messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ],
         temperature=0.3,
-        max_tokens=1000,
-        timeout=30,
-    )
-
-    return response.choices[0].message.content
-
-
-# =============================================================================
-# ГЕНЕРАЦИЯ ЧЕРЕЗ OPENROUTER
-# =============================================================================
-
-
-def _generate_with_openrouter(
-    system_prompt: str,
-    user_prompt: str,
-    model: str,
-) -> str:
-    """
-    Генерирует текст через OpenRouter API (OpenAI-совместимый).
-
-    Args:
-        system_prompt: Системный промпт.
-        user_prompt: Пользовательский промпт.
-        model: Название модели в OpenRouter.
-
-    Returns:
-        Сгенерированный текст.
-
-    Raises:
-        Exception: При ошибке API.
-    """
-    response = openrouter_client.chat.completions.create(
-        model=model,
-        messages=[
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=1000,
-        timeout=30,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        timeout=GENERATION_TIMEOUT_SECONDS,
     )
 
     return response.choices[0].message.content
@@ -416,7 +390,7 @@ def _generate(
         system_prompt: Системный промпт.
         user_prompt: Пользовательский промпт.
         model: Название модели.
-        provider: Провайдер ('ollama', 'openai', 'openrouter').
+        provider: Провайдер ('polza', 'ollama').
 
     Returns:
         Сгенерированный текст.
@@ -426,10 +400,8 @@ def _generate(
     """
     if provider == 'ollama':
         return _generate_with_ollama(system_prompt, user_prompt, model)
-    elif provider == 'openai':
-        return _generate_with_openai(system_prompt, user_prompt, model)
-    elif provider == 'openrouter':
-        return _generate_with_openrouter(system_prompt, user_prompt, model)
+    elif provider == 'polza':
+        return _generate_with_polza(system_prompt, user_prompt, model)
     else:
         raise ValueError(f'Неподдерживаемый провайдер: {provider}')
 
@@ -445,7 +417,7 @@ def check_model_availability(model: str, provider: str) -> tuple[bool, str | Non
 
     Args:
         model: Название модели.
-        provider: Провайдер ('ollama', 'openai', 'openrouter').
+        provider: Провайдер ('polza', 'ollama').
 
     Returns:
         Кортеж (доступна ли модель, сообщение об ошибке или None).
@@ -469,33 +441,19 @@ def check_model_availability(model: str, provider: str) -> tuple[bool, str | Non
                     return False, 'Ошибка версии библиотеки ollama. Обновите: pip install --upgrade ollama'
                 return False, 'Не удалось подключиться к Ollama. Проверьте, что сервис запущен (ollama serve)'
 
-        elif provider == 'openai':
-            if not os.getenv('OPENAI_API_KEY'):
-                return False, 'API ключ OpenAI не найден. Добавьте OPENAI_API_KEY в .env файл'
+        elif provider == 'polza':
+            if not POLZA_API_KEY:
+                return False, 'API ключ Polza.ai не найден. Добавьте POLZA_API_KEY в .env файл'
             try:
-                client.chat.completions.create(
+                polza_client.chat.completions.create(
                     model=model,
                     messages=[{'role': 'user', 'content': 'test'}],
-                    max_tokens=1,
-                    timeout=10,
+                    max_tokens=16,
+                    timeout=30,
                 )
                 return True, None
             except Exception as e:
-                return False, f'Ошибка проверки модели {model} в OpenAI: {str(e)}'
-
-        elif provider == 'openrouter':
-            if not os.getenv('OPENROUTER_API_KEY'):
-                return False, 'API ключ OpenRouter не найден. Добавьте OPENROUTER_API_KEY в .env файл'
-            try:
-                openrouter_client.chat.completions.create(
-                    model=model,
-                    messages=[{'role': 'user', 'content': 'test'}],
-                    max_tokens=1,
-                    timeout=10,
-                )
-                return True, None
-            except Exception as e:
-                return False, f'Ошибка проверки модели {model} в OpenRouter: {str(e)}'
+                return False, f'Ошибка проверки модели {model} в Polza.ai: {str(e)}'
 
         return False, f'Неподдерживаемый провайдер: {provider}'
 
@@ -520,17 +478,11 @@ def check_providers_status() -> dict[str, tuple[bool, str]]:
     except Exception as e:
         result['ollama'] = (False, str(e))
 
-    # OpenAI
-    if os.getenv('OPENAI_API_KEY'):
-        result['openai'] = (True, 'API ключ найден')
+    # Polza.ai
+    if POLZA_API_KEY:
+        result['polza'] = (True, 'API ключ найден')
     else:
-        result['openai'] = (False, 'OPENAI_API_KEY не задан')
-
-    # OpenRouter
-    if os.getenv('OPENROUTER_API_KEY'):
-        result['openrouter'] = (True, 'API ключ найден')
-    else:
-        result['openrouter'] = (False, 'OPENROUTER_API_KEY не задан')
+        result['polza'] = (False, 'POLZA_API_KEY не задан')
 
     return result
 
@@ -551,7 +503,7 @@ def generate_summary(
     Args:
         article_data: Словарь с данными статьи/репозитория.
         model: Название модели.
-        provider: Провайдер ('ollama', 'openai', 'openrouter').
+        provider: Провайдер ('polza', 'ollama').
 
     Returns:
         Текст конспекта или сообщение об ошибке (начинается с '❌').

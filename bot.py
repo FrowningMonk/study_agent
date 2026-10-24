@@ -6,7 +6,7 @@ Telegram-бот для агента изучения ИИ.
     - github.com (README репозиториев)
     - infostart.ru (статьи и публикации по 1С)
 
-Поддерживаемые провайдеры: ollama, openai, openrouter.
+Поддерживаемые провайдеры: polza (основной), ollama (резерв).
 Название модели вводится пользователем.
 
 Команды бота:
@@ -62,7 +62,7 @@ from database import (
     update_idea_md,
 )
 
-load_dotenv()
+load_dotenv(override=True)
 
 __all__ = ['bot', 'main']
 
@@ -90,15 +90,13 @@ pending_model_selection: dict[int, dict[str, str]] = {}
 
 # Примеры моделей для каждого провайдера (подсказка при вводе)
 PROVIDER_EXAMPLES: dict[str, str] = {
+    'polza': 'deepseek/deepseek-v4.1-flash-1017, google/gemini-3.8-flash, anthropic/claude-sonnet-5.5',
     'ollama': 'gemma3:12b, llama3:8b, qwen3:8b',
-    'openai': 'gpt-4, gpt-4o, gpt-3.5-turbo',
-    'openrouter': 'anthropic/claude-3-haiku, google/gemma-2-9b-it',
 }
 
 PROVIDER_DISPLAY: dict[str, str] = {
-    'ollama': 'Ollama (локальная)',
-    'openai': 'OpenAI',
-    'openrouter': 'OpenRouter',
+    'polza': 'Polza.ai',
+    'ollama': 'Ollama (локальная, резерв)',
 }
 
 # Сообщения
@@ -573,7 +571,7 @@ def handle_provider_callback(call: telebot.types.CallbackQuery) -> None:
     user_id = call.from_user.id
     parts = call.data.split(':')
     purpose = parts[1]   # 'summary' или 'md'
-    provider = parts[2]  # 'ollama', 'openai', 'openrouter'
+    provider = parts[2]  # 'polza', 'ollama'
 
     pending_model_selection[user_id] = {
         'purpose': purpose,
@@ -1063,11 +1061,15 @@ def handle_articles(message: telebot.types.Message) -> None:
         ideas = get_ideas_by_article(art['id'], user_id)
         idea_names = ", ".join(i['name'] for i in ideas) if ideas else "(без идеи)"
         lines.append(f"{idx}. [{art['source']}] {art['title'][:50]}\n   Идеи: {idea_names}")
+        read_btn = types.InlineKeyboardButton(
+            text=f"📄 {idx}. Читать",
+            callback_data=f"show_summary:{art['id']}:0",
+        )
         assign_btn = types.InlineKeyboardButton(
-            text=f"-> {idx}. {art['title'][:20]}",
+            text=f"-> {idx}. В идею",
             callback_data=f"assign_list:{art['id']}",
         )
-        keyboard.add(assign_btn)
+        keyboard.row(read_btn, assign_btn)
     text = MSG_ARTICLES_TITLE.format(count=len(articles)) + "\n\n" + "\n".join(lines)
     # Разбиваем длинный текст, клавиатуру добавляем к последнему сообщению
     if len(text) <= MESSAGE_CHUNK_SIZE:
@@ -1492,7 +1494,7 @@ def handle_show_summary(call: telebot.types.CallbackQuery) -> None:
     url = article.get('url', '')
 
     # Отправляем конспект отдельным сообщением
-    header = f"📄 **{title}**\n🔗 {url}\n\n"
+    header = f"📄 {title}\n🔗 {url}\n\n"
     bot.answer_callback_query(call.id)
 
     if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:

@@ -6,12 +6,12 @@
     - github.com (README репозиториев)
     - infostart.ru (статьи и публикации по 1С)
 
-Поддерживаемые провайдеры: ollama, openai, openrouter.
+Поддерживаемые провайдеры: polza (основной), ollama (резерв).
 Название модели задаётся пользователем.
 
 Example:
     python pipeline.py https://habr.com/ru/articles/123456/
-    python pipeline.py https://habr.com/ru/articles/123456/ gpt-4 openai
+    python pipeline.py https://habr.com/ru/articles/123456/ deepseek/deepseek-v4.1-flash-1017 polza
     python pipeline.py https://github.com/anthropics/anthropic-cookbook gemma3:12b ollama
     python pipeline.py https://infostart.ru/public/886103/
 """
@@ -101,7 +101,7 @@ def process_article(
     Args:
         url: URL статьи или репозитория для обработки.
         model: Модель для генерации.
-        provider: Провайдер ('ollama', 'openai', 'openrouter').
+        provider: Провайдер ('polza', 'ollama').
         user_id: Telegram user_id для привязки статьи.
         skip_cache: Пропустить проверку кеша (для принудительной перегенерации).
 
