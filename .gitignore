@@ -7,3 +7,6 @@ venv/
 .claude/
 data/study_agent.db
 ideas_md/
+*.key
+credentials.json
+secrets/
