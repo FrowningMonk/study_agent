@@ -90,6 +90,7 @@ HABR_SYSTEM_PROMPT: str = """Ты — фильтр статей для заня�
 - Максимум 5-7 предложений
 - Передай суть и тон статьи (автор хвалится, жалуется, учит, делится опытом?)
 - В конце — один главный вывод автора
+- Если ниже статьи даны комментарии и в них есть ценное (поправки, критика, альтернативные решения, ответы автора, практический опыт) — добавь в конце отдельный абзац, начинающийся со слов «В комментариях:», 1-3 предложения. Если ценного нет или комментариев нет — этот абзац не пиши.
 """
 
 HABR_USER_PROMPT_TEMPLATE: str = """Перескажи суть статьи в 2-3 предложениях: кто автор, что сделал, каков результат. Потом одно предложение — главный вывод.
@@ -100,7 +101,7 @@ HABR_USER_PROMPT_TEMPLATE: str = """Перескажи суть статьи в 
 
 ТЕКСТ СТАТЬИ:
 {content}
-"""
+{comments}"""
 
 
 # =============================================================================
@@ -117,6 +118,7 @@ INFOSTART_SYSTEM_PROMPT: str = """Ты — помощник разработчи
 - Максимум 5-7 предложений
 - Передай суть: какую проблему решает автор, какой подход использует
 - В конце — главный практический вывод или рекомендацию
+- Если ниже статьи даны комментарии и в них есть ценное (поправки, критика, альтернативные решения, ответы автора, практический опыт) — добавь в конце отдельный абзац, начинающийся со слов «В комментариях:», 1-3 предложения. Если ценного нет или комментариев нет — этот абзац не пиши.
 """
 
 INFOSTART_USER_PROMPT_TEMPLATE: str = """Перескажи суть статьи по 1С в 2-3 предложениях: какая задача решается, какой подход использован, какой результат. Потом одно предложение — главный практический вывод.
@@ -126,7 +128,7 @@ INFOSTART_USER_PROMPT_TEMPLATE: str = """Перескажи суть стать�
 
 ТЕКСТ СТАТЬИ:
 {content}
-"""
+{comments}"""
 
 
 # =============================================================================
@@ -198,6 +200,65 @@ IDEA_MD_REVISE_USER_PROMPT_TEMPLATE: str = """Документ:
 # =============================================================================
 
 
+COMMENTS_MAX_CHARS: int = 12000
+COMMENT_MAX_CHARS: int = 1500
+
+
+def _select_comments(comments: list[dict], budget: int) -> list[dict]:
+    """
+    Отбирает комментарии в пределах бюджета символов.
+
+    Приоритет: ответы автора статьи, затем по рейтингу (если есть), затем по порядку.
+    Комментарии с отрицательным рейтингом отбрасываются. Результат — в исходном порядке.
+    """
+    candidates = [c for c in comments if (c.get('score') or 0) >= 0]
+    ranked = sorted(
+        candidates,
+        key=lambda c: (not c.get('is_post_author'), -(c.get('score') or 0), c['number']),
+    )
+    chosen, used = set(), 0
+    for c in ranked:
+        size = min(len(c['text']), COMMENT_MAX_CHARS)
+        if used + size > budget:
+            continue
+        chosen.add(c['number'])
+        used += size
+    return [c for c in candidates if c['number'] in chosen]
+
+
+def format_comments(comments: list[dict] | None, budget: int = COMMENTS_MAX_CHARS) -> str:
+    """
+    Форматирует комментарии для промпта.
+
+    Строка вида «#3 → #2 alias [автор статьи] (+5): текст».
+    Пустая строка, если комментариев нет.
+    """
+    if not comments:
+        return ''
+
+    selected = _select_comments(comments, budget)
+    if not selected:
+        return ''
+
+    lines = []
+    for c in selected:
+        head = f"#{c['number']}"
+        if c.get('reply_to'):
+            head += f" → #{c['reply_to']}"
+        head += f" {c['author']}"
+        if c.get('is_post_author'):
+            head += ' [автор статьи]'
+        if c.get('score') is not None:
+            head += f" ({c['score']:+d})"
+        text = c['text']
+        if len(text) > COMMENT_MAX_CHARS:
+            text = text[:COMMENT_MAX_CHARS] + '...'
+        lines.append(f'{head}: {text}')
+
+    header = f'\nКОММЕНТАРИИ (показано {len(selected)} из {len(comments)}):\n'
+    return header + '\n'.join(lines) + '\n'
+
+
 def _create_habr_prompt(article_data: dict) -> tuple[str, str]:
     """
     Создаёт промпт для статьи с Хабра.
@@ -213,6 +274,7 @@ def _create_habr_prompt(article_data: dict) -> tuple[str, str]:
         author=article_data.get('author', 'Не указан'),
         date=article_data.get('date', 'Не указана'),
         content=article_data.get('content', 'Текст отсутствует'),
+        comments=format_comments(article_data.get('comments')),
     )
     return HABR_SYSTEM_PROMPT, user_prompt
 
@@ -231,6 +293,7 @@ def _create_infostart_prompt(article_data: dict) -> tuple[str, str]:
         title=article_data.get('title', 'Не указан'),
         author=article_data.get('author', 'Не указан'),
         content=article_data.get('content', 'Текст отсутствует'),
+        comments=format_comments(article_data.get('comments')),
     )
     return INFOSTART_SYSTEM_PROMPT, user_prompt
 
