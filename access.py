@@ -9,6 +9,7 @@
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 
@@ -156,9 +157,22 @@ def decide(target_id: int, approve: bool, by_user_id: int, owner_id: int) -> Dec
     return DecideResult(DecideOutcome.DECIDED, database.get_user(target_id))
 
 
+_NAME_MAX_LENGTH = 64
+
+
+def _clean_name(value: str | None) -> str:
+    """
+    Убирает из имени управляющие и форматирующие символы (переводы строк, RTL-override):
+    имя задаёт заявитель и мог бы подделать в нём «id N» или чужое имя.
+    """
+    cleaned = ''.join(ch for ch in (value or '') if not unicodedata.category(ch).startswith('C'))
+    return ' '.join(cleaned.split())[:_NAME_MAX_LENGTH]
+
+
 def describe_user(record: dict) -> str:
     """Как пользователь выглядит у владельца: «@ivan (Иван), id 12345» или «Иван, id 12345»."""
-    name = record.get('first_name') or 'без имени'
-    if record.get('username'):
-        return f"@{record['username']} ({name}), id {record['user_id']}"
+    name = _clean_name(record.get('first_name')) or 'без имени'
+    username = _clean_name(record.get('username'))
+    if username:
+        return f"@{username} ({name}), id {record['user_id']}"
     return f"{name}, id {record['user_id']}"

@@ -31,6 +31,22 @@ def test_users_migration_on_existing_db(tmp_path, monkeypatch):
     assert database.article_exists('https://habr.com/ru/articles/1/')
 
 
+def test_init_db_twice_keeps_users(tmp_db):
+    tmp_db.create_access_request(1, 'a', 'A')
+    tmp_db.set_user_status(1, 'approved')
+    tmp_db.init_db()
+    assert tmp_db.get_user(1)['status'] == 'approved'
+
+
+def test_users_status_check_constraint(tmp_db):
+    conn = sqlite3.connect(tmp_db.DB_PATH)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO users (user_id, status, requested_at) VALUES (1, 'admin', 'x')")
+    finally:
+        conn.close()
+
+
 def test_set_user_status_unknown_user(tmp_db):
     assert tmp_db.set_user_status(999, 'approved') is False
     assert tmp_db.get_user(999) is None

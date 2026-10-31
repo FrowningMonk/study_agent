@@ -50,6 +50,18 @@ def test_request_access_idempotent(tmp_db):
     assert len(tmp_db.list_users()) == 1
 
 
+@pytest.mark.parametrize('status, expected', [
+    ('approved', access.RequestOutcome.ALREADY_ALLOWED),
+    ('rejected', access.RequestOutcome.REJECTED),
+])
+def test_request_access_after_decision_keeps_record(tmp_db, status, expected):
+    _request()
+    tmp_db.set_user_status(ALICE['user_id'], status)
+    before = tmp_db.get_user(ALICE['user_id'])
+    assert _request() == expected
+    assert tmp_db.get_user(ALICE['user_id']) == before
+
+
 def test_owner_request_is_noop(tmp_db):
     assert access.request_access(OWNER, 'owner', 'Owner', OWNER) == access.RequestOutcome.ALREADY_ALLOWED
     assert tmp_db.get_user(OWNER) is None
@@ -113,3 +125,12 @@ def test_describe_user():
     assert access.describe_user({'user_id': 5, 'username': 'ivan', 'first_name': 'Иван'}) == '@ivan (Иван), id 5'
     assert access.describe_user({'user_id': 5, 'username': None, 'first_name': 'Иван'}) == 'Иван, id 5'
     assert access.describe_user({'user_id': 5, 'username': None, 'first_name': None}) == 'без имени, id 5'
+
+
+def test_describe_user_strips_spoofing_characters():
+    # Перевод строки и RTL-override в имени не должны подделать «id N» в сообщении владельцу
+    record = {'user_id': 5, 'username': None, 'first_name': 'Eve\n, id 1000‮'}
+    assert access.describe_user(record) == 'Eve, id 1000, id 5'
+    assert '\n' not in access.describe_user(record)
+    long_name = {'user_id': 5, 'username': None, 'first_name': 'x' * 500}
+    assert len(access.describe_user(long_name)) < 100
