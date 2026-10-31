@@ -117,6 +117,7 @@ def test_owner_revokes_approved_user(tg, tmp_db):
     # Next-step, оставшийся от гонки с отзывом, сбрасывается и при повторном одобрении
     _register_next_step(FRIEND, calls)
     bot_module.bot.process_new_updates([_callback_update(owner, f'access:approve:{FRIEND}', 6)])
+    assert tmp_db.get_user(FRIEND)['status'] == 'approved'
     bot_module.bot.process_new_updates([_message_update(FRIEND, 'after', update_id=7)])
     assert calls == []
 
@@ -302,3 +303,87 @@ def test_install_redaction_wraps_root_handlers_once():
 def test_error_text_hides_exception_details():
     leaky = ConnectionError(f'https://api.telegram.org/bot{bot_module.TELEGRAM_TOKEN}/sendMessage')
     assert bot_module._error_text(leaky) == 'ConnectionError'
+
+
+def test_telebot_logger_handlers_redacted():
+    import logging
+    handlers = logging.getLogger('TeleBot').handlers
+    assert handlers and all(isinstance(h.formatter, bot_module._RedactTokenFormatter) for h in handlers)
+
+
+def test_blocked_user_notification_failure_reported_to_owner(tg, tmp_db, monkeypatch):
+    owner = bot_module.OWNER_ID
+    tmp_db.create_access_request(STRANGER, 's', 'S')
+    token_url = f'https://api.telegram.org/bot{bot_module.TELEGRAM_TOKEN}/sendMessage'
+
+    def send(chat_id, text, **kw):
+        if chat_id == STRANGER:
+            raise ConnectionError(token_url)
+        tg.append(('send_message', (chat_id, text), kw))
+    monkeypatch.setattr(bot_module.bot, 'send_message', send)
+
+    bot_module.bot.process_new_updates([_callback_update(owner, f'access:approve:{STRANGER}')])
+    assert tmp_db.get_user(STRANGER)['status'] == 'approved'  # решение в силе
+    to_owner = _sent_to(tg, owner)
+    assert len(to_owner) == 1
+    assert to_owner[0][1][1] == bot_module.MSG_ACCESS_NOTIFY_FAILED.format(
+        user=f'id {STRANGER}: @s «S»', error='ConnectionError',
+    )
+    assert bot_module.TELEGRAM_TOKEN not in to_owner[0][1][1]
+
+
+def test_decision_edits_owner_message_with_result(tg, tmp_db):
+    tmp_db.create_access_request(STRANGER, 's', 'S')
+    bot_module.bot.process_new_updates([_callback_update(bot_module.OWNER_ID, f'access:reject:{STRANGER}')])
+    edits = [s for s in tg if s[0] == 'edit_message_text']
+    assert edits == [('edit_message_text', (f'id {STRANGER}: @s «S» — ❌ отклонён', bot_module.OWNER_ID, 11), {})]
+
+
+def test_users_command_rejected_user_gets_approve_button(tg, tmp_db):
+    owner = bot_module.OWNER_ID
+    tmp_db.set_user_status(FRIEND, 'rejected')
+    bot_module.bot.process_new_updates([_message_update(owner, '/users')])
+    buttons = [_buttons(m[2]['reply_markup']) for m in _sent_to(tg, owner)[1:]]
+    assert buttons == [[bot_module.access.decision_callback(FRIEND, True)]]
+
+
+def test_users_command_empty(tg, tmp_db):
+    import sqlite3
+    conn = sqlite3.connect(tmp_db.DB_PATH)
+    conn.execute('DELETE FROM users')
+    conn.commit()
+    conn.close()
+    bot_module.bot.process_new_updates([_message_update(bot_module.OWNER_ID, '/users')])
+    assert tg == [('send_message', (bot_module.OWNER_ID, bot_module.MSG_USERS_EMPTY), {})]
+
+
+@pytest.mark.parametrize('user_id, expected', [
+    (FRIEND, 'MSG_ACCESS_ALREADY'),
+    (STRANGER, 'MSG_ACCESS_PENDING'),
+])
+def test_repeat_request_press_alerts(tg, tmp_db, user_id, expected):
+    tmp_db.create_access_request(STRANGER, 's', 'S')
+    bot_module.bot.process_new_updates([_callback_update(user_id, bot_module.access.REQUEST_CALLBACK)])
+    assert tg == [('answer_callback_query', ('cb1', getattr(bot_module, expected)), {'show_alert': True})]
+
+
+def test_decision_for_unknown_user_alerts(tg):
+    bot_module.bot.process_new_updates([_callback_update(bot_module.OWNER_ID, 'access:approve:777')])
+    assert tg == [('answer_callback_query', ('cb1', bot_module.MSG_ACCESS_USER_NOT_FOUND), {'show_alert': True})]
+
+
+def test_owner_menu_retried_after_failure(tg, monkeypatch):
+    b = bot_module.bot
+    monkeypatch.setattr(b, 'owner_menu_set', False)
+    attempts: list = []
+
+    def flaky(*a, **kw):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError('network')
+    monkeypatch.setattr(b, 'set_my_commands', flaky)
+    owner = bot_module.OWNER_ID
+    for update_id in (20, 21, 22):
+        b.process_new_updates([_message_update(owner, 'x', update_id=update_id)])
+    assert len(attempts) == 2
+    assert b.owner_menu_set is True
