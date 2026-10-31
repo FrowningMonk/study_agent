@@ -13,7 +13,11 @@ Telegram-бот для агента изучения ИИ.
     /start — Приветствие и инструкция
     /help  — Справка по использованию
     /model — Выбор провайдера и модели
+    /users — Пользователи и заявки на доступ (только владелец)
     <URL>  — Отправить ссылку → получить конспект
+
+Доступ: бот приватный. Владелец (OWNER_ID) пущен всегда, остальные
+запрашивают доступ кнопкой и ждут одобрения владельца.
 
 Example:
     python bot.py
@@ -42,6 +46,8 @@ from summarizer import (
     DEFAULT_MD_MODEL, DEFAULT_MD_PROVIDER,
     generate_idea_md, revise_idea_md,
 )
+import access
+from access import Gate, DecideOutcome, RequestOutcome
 from database import (
     init_db,
     article_exists,
@@ -60,6 +66,7 @@ from database import (
     get_ideas_by_article,
     get_idea_md,
     update_idea_md,
+    list_users,
 )
 
 load_dotenv(override=True)
@@ -132,6 +139,7 @@ MSG_HELP = """Команды:
 /articles - все статьи
 
 Поддерживаемые источники: habr.com, github.com, infostart.ru"""
+MSG_HELP_OWNER = MSG_HELP + "\n\nВладельцу:\n/users - пользователи и заявки на доступ"
 MSG_PROCESSING = "Обрабатываю..."
 MSG_ERROR = "Ошибка: {error}"
 MSG_UNSUPPORTED = "Я такие ссылки пока не понимаю. Поддерживаемые источники: habr.com, github.com, infostart.ru"
@@ -182,6 +190,34 @@ MSG_MD_READY = ("Описание готово. Варианты:\n1. Утвер
 MSG_MD_APPROVED = "Описание сохранено."
 MSG_MD_REVISING = "Переделываю с учетом замечаний..."
 
+# Сообщения доступа
+MSG_ACCESS_OFFER = (
+    "👋 Это личный бот: он делает конспекты технических статей "
+    "(habr.com, github.com, infostart.ru) и собирает их в базу знаний.\n\n"
+    "Бот приватный — доступ выдаёт владелец. Если он вам нужен, нажмите кнопку ниже."
+)
+MSG_ACCESS_REQUEST_BTN = "📝 Запросить доступ"
+MSG_ACCESS_REQUESTED = "Заявка отправлена. Вам придёт сообщение, когда владелец её рассмотрит."
+MSG_ACCESS_PENDING = "Заявка на рассмотрении. Вам придёт сообщение, когда владелец примет решение."
+MSG_ACCESS_ALREADY = "Доступ уже открыт, отправьте /start"
+MSG_ACCESS_DENIED_CALLBACK = "Нет доступа."
+MSG_ACCESS_GRANTED = "✅ Доступ открыт, отправьте /start"
+MSG_ACCESS_REJECTED = "В доступе отказано."
+MSG_ACCESS_OWNER_REQUEST = "Запрос доступа: {user}"
+MSG_ACCESS_OWNER_ONLY = "Команда только для владельца."
+MSG_ACCESS_USER_NOT_FOUND = "Пользователь не найден"
+BTN_ACCESS_APPROVE = "✅ Одобрить"
+BTN_ACCESS_REJECT = "❌ Отклонить"
+BTN_ACCESS_REVOKE = "🚫 Отозвать доступ"
+MSG_ACCESS_NOTIFY_FAILED = "Не удалось уведомить {user}: {error}"
+MSG_USERS_EMPTY = "Заявок на доступ не было."
+MSG_USERS_TITLE = "Пользователи ({count}): ожидают {pending}, одобрены {approved}, отклонены {rejected}."
+USER_STATUS_LABEL: dict[str, str] = {
+    'pending': '⏳ ждёт решения',
+    'approved': '✅ одобрен',
+    'rejected': '❌ отклонён',
+}
+
 
 # Проверяем наличие токена перед запуском
 if not TELEGRAM_TOKEN:
@@ -189,8 +225,146 @@ if not TELEGRAM_TOKEN:
     logger.critical('Создайте файл .env и добавьте строку: TELEGRAM_BOT_TOKEN=ваш_токен_от_BotFather')
     exit(1)
 
+# Владелец бота: без него бот не стартует (fail closed — иначе бот открыт всем)
+try:
+    OWNER_ID: int = access.parse_owner_id(os.getenv('OWNER_ID'))
+except ValueError as owner_error:
+    logger.critical('%s. Укажите в .env строку OWNER_ID=<ваш числовой Telegram ID>', owner_error)
+    logger.critical('Свой ID можно узнать у @userinfobot')
+    exit(1)
+
+# Команды в меню Telegram; владельцу дополнительно /users
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ('start', 'начало работы'),
+    ('help', 'справка'),
+    ('model', 'выбор модели'),
+    ('new_idea', 'создать идею'),
+    ('ideas', 'мои идеи'),
+    ('articles', 'все статьи'),
+]
+OWNER_COMMANDS: list[tuple[str, str]] = BOT_COMMANDS + [('users', 'пользователи и заявки')]
+
+
+class AccessControlledBot(telebot.TeleBot):
+    """
+    TeleBot с проверкой доступа до любой диспетчеризации.
+
+    Проверка стоит в process_new_updates, а не в middleware: в pyTelegramBotAPI
+    next-step-обработчики (register_next_step_handler) вызываются раньше
+    middleware и обошли бы её. Апдейты прочих типов отбрасываются.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__(token)
+        self.owner_menu_set = False
+
+    def process_new_updates(self, updates: list[types.Update]) -> None:
+        # Offset двигает только super(): без этого отброшенные апдейты приходили бы
+        # при каждом опросе снова (и незнакомцу повторно слалось бы приглашение)
+        if updates:
+            self.last_update_id = max(self.last_update_id, max(u.update_id for u in updates))
+        allowed = [update for update in updates if _admit_update(update)]
+        if allowed:
+            super().process_new_updates(allowed)
+
+
+def _admit_update(update: types.Update) -> bool:
+    """Решает судьбу апдейта: True — пустить к обработчикам. Любая ошибка → не пускать."""
+    try:
+        if update.message is not None:
+            message = update.message
+            user_id = message.from_user.id if message.from_user else None
+            decision = access.gate(user_id, message.chat.type, None, OWNER_ID)
+            if decision == Gate.OFFER:
+                _send_access_offer(message.chat.id)
+            elif decision == Gate.PENDING:
+                bot.send_message(message.chat.id, MSG_ACCESS_PENDING)
+        elif update.callback_query is not None:
+            call = update.callback_query
+            user_id = call.from_user.id
+            if not call.data:
+                # Обработчики ждут строку в call.data (game-кнопки и т.п. не используем)
+                return False
+            chat_type = call.message.chat.type if call.message else None
+            decision = access.gate(user_id, chat_type, call.data, OWNER_ID)
+            if decision == Gate.DENY_CALLBACK:
+                bot.answer_callback_query(call.id, MSG_ACCESS_DENIED_CALLBACK, show_alert=True)
+        else:
+            # edited_message, my_chat_member, inline и пр. — обработчиков нет, не пускаем
+            return False
+    except Exception:
+        logger.exception('Ошибка проверки доступа для update_id=%s', update.update_id)
+        return False
+
+    if decision != Gate.PASS:
+        # IGNORE — на debug: отклонённый может флудить, лог не должен расти от этого
+        level = logging.DEBUG if decision == Gate.IGNORE else logging.INFO
+        logger.log(level, 'Доступ закрыт: user_id=%s, решение=%s', user_id, decision.value)
+        return False
+    if user_id == OWNER_ID:
+        _ensure_owner_menu()
+    return True
+
+
+def _ensure_owner_menu() -> None:
+    """
+    Меню команд владельца (с /users) ставится при его первом апдейте:
+    до того как владелец написал боту, Telegram отвечает «chat not found».
+    """
+    if bot.owner_menu_set:
+        return
+    try:
+        bot.set_my_commands(
+            [types.BotCommand(name, desc) for name, desc in OWNER_COMMANDS],
+            scope=types.BotCommandScopeChat(OWNER_ID),
+        )
+        bot.owner_menu_set = True
+    except Exception as e:
+        logger.warning('Не удалось установить меню владельца: %s', e)
+
+
+def _send_access_offer(chat_id: int) -> None:
+    """Объяснение для незнакомца + кнопка «Запросить доступ»."""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(text=MSG_ACCESS_REQUEST_BTN, callback_data=access.REQUEST_CALLBACK))
+    bot.send_message(chat_id, MSG_ACCESS_OFFER, reply_markup=keyboard)
+
+
+class _RedactTokenFormatter(logging.Formatter):
+    """
+    Вырезает токен бота из готовой строки лога, включая трейсбек:
+    тексты сетевых ошибок requests содержат URL вида /bot<TOKEN>/...
+    """
+
+    def __init__(self, base: logging.Formatter, token: str) -> None:
+        super().__init__()
+        self._base = base
+        self._token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self._base.format(record).replace(self._token, '<TOKEN>')
+
+
+def _install_token_redaction(token: str) -> None:
+    """Оборачивает форматтеры корневого логгера и логгера telebot."""
+    for name in (None, 'TeleBot'):
+        for handler in logging.getLogger(name).handlers:
+            if not isinstance(handler.formatter, _RedactTokenFormatter):
+                handler.setFormatter(_RedactTokenFormatter(handler.formatter or logging.Formatter(), token))
+
+
+_install_token_redaction(TELEGRAM_TOKEN)
+
+
+def _error_text(error: Exception) -> str:
+    """Безопасный текст ошибки Telegram для пользователя/владельца — без URL с токеном."""
+    if isinstance(error, telebot.apihelper.ApiTelegramException):
+        return error.description
+    return type(error).__name__
+
+
 # Создаем бота (токен точно существует)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+bot = AccessControlledBot(TELEGRAM_TOKEN)
 
 
 def extract_url(text: str | None) -> str | None:
@@ -413,7 +587,7 @@ def _auto_generate_md(
         md_text = generate_idea_md(idea_name, idea_description, md_model, md_provider)
     except Exception as e:
         logger.error('Ошибка генерации .md для idea_id=%d: %s', idea_id, e)
-        bot.send_message(chat_id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(chat_id, MSG_ERROR.format(error=_error_text(e)))
         return
     pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': md_text}
     send_long_message(chat_id, md_text)
@@ -495,16 +669,22 @@ def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_S
         bot.send_message(chat_id, current_chunk)
 
 
-def create_main_keyboard() -> types.ReplyKeyboardMarkup:
+def create_main_keyboard(is_owner: bool = False) -> types.ReplyKeyboardMarkup:
     """
     Создаёт постоянную клавиатуру с основными командами.
+
+    Args:
+        is_owner: добавить /users для владельца
 
     Returns:
         ReplyKeyboardMarkup с кнопками команд
     """
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.row('/ideas', '/new_idea', '/articles')
-    keyboard.row('/model', '/help')
+    if is_owner:
+        keyboard.row('/model', '/users', '/help')
+    else:
+        keyboard.row('/model', '/help')
     return keyboard
 
 
@@ -512,14 +692,146 @@ def create_main_keyboard() -> types.ReplyKeyboardMarkup:
 @bot.message_handler(commands=['start'])
 def handle_start(message: telebot.types.Message) -> None:
     """Обрабатывает команду /start - приветствие и инструкции."""
-    keyboard = create_main_keyboard()
+    keyboard = create_main_keyboard(is_owner=message.from_user.id == OWNER_ID)
     bot.send_message(message.chat.id, MSG_START, reply_markup=keyboard)
 
 
 @bot.message_handler(commands=['help'])
 def handle_help(message: telebot.types.Message) -> None:
     """Обрабатывает команду /help - справка по использованию бота."""
-    bot.reply_to(message, MSG_HELP)
+    bot.reply_to(message, MSG_HELP_OWNER if message.from_user.id == OWNER_ID else MSG_HELP)
+
+
+# ========================
+# Доступ: заявки и решения владельца
+# ========================
+
+
+def _decision_keyboard(user_id: int, status: str) -> types.InlineKeyboardMarkup:
+    """Кнопки смены статуса: для заявки — оба варианта, иначе — противоположный текущему."""
+    approve_btn = types.InlineKeyboardButton(
+        text=BTN_ACCESS_APPROVE, callback_data=access.decision_callback(user_id, True),
+    )
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    if status == 'approved':
+        keyboard.add(types.InlineKeyboardButton(
+            text=BTN_ACCESS_REVOKE, callback_data=access.decision_callback(user_id, False),
+        ))
+    elif status == 'rejected':
+        keyboard.add(approve_btn)
+    else:
+        keyboard.row(approve_btn, types.InlineKeyboardButton(
+            text=BTN_ACCESS_REJECT, callback_data=access.decision_callback(user_id, False),
+        ))
+    return keyboard
+
+
+def _forget_user_state(user_id: int) -> None:
+    """Сбрасывает незавершённые диалоги пользователя при любом решении владельца."""
+    bot.clear_step_handler_by_chat_id(user_id)
+    for state in (pending_model_selection, pending_article_links, pending_reassign,
+                  pending_assign_list, pending_md_generation):
+        state.pop(user_id, None)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == access.REQUEST_CALLBACK)
+def handle_access_request(call: telebot.types.CallbackQuery) -> None:
+    """Кнопка «Запросить доступ»: создаёт заявку и уведомляет владельца (однократно)."""
+    user = call.from_user
+    outcome = access.request_access(user.id, user.username, user.first_name, OWNER_ID)
+    if outcome == RequestOutcome.REQUESTED:
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(MSG_ACCESS_REQUESTED, call.message.chat.id, call.message.message_id)
+        except Exception as e:
+            logger.warning('Не удалось обновить сообщение заявки для %s: %s', user.id, e)
+            bot.send_message(call.message.chat.id, MSG_ACCESS_REQUESTED)
+        record = {'user_id': user.id, 'username': user.username, 'first_name': user.first_name}
+        try:
+            bot.send_message(
+                OWNER_ID,
+                MSG_ACCESS_OWNER_REQUEST.format(user=access.describe_user(record)),
+                reply_markup=_decision_keyboard(user.id, 'pending'),
+            )
+        except Exception as e:
+            # Заявка сохранена — владелец увидит её в /users
+            logger.error('Не удалось отправить заявку владельцу (user_id=%s): %s', user.id, e)
+    elif outcome == RequestOutcome.ALREADY_PENDING:
+        bot.answer_callback_query(call.id, MSG_ACCESS_PENDING, show_alert=True)
+    elif outcome == RequestOutcome.ALREADY_ALLOWED:
+        bot.answer_callback_query(call.id, MSG_ACCESS_ALREADY, show_alert=True)
+    else:
+        bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or '').startswith('access:'))
+def handle_access_decision(call: telebot.types.CallbackQuery) -> None:
+    """Кнопки владельца: access:approve:{user_id} / access:reject:{user_id}."""
+    parsed = access.parse_decision_callback(call.data)
+    if parsed is None:
+        bot.answer_callback_query(call.id)
+        return
+    approve, target_id = parsed
+    result = access.decide(target_id, approve, call.from_user.id, OWNER_ID)
+
+    if result.outcome == DecideOutcome.NOT_OWNER:
+        logger.warning('Решение по доступу не от владельца: user_id=%s', call.from_user.id)
+        bot.answer_callback_query(call.id, MSG_ACCESS_OWNER_ONLY, show_alert=True)
+        return
+    if result.outcome == DecideOutcome.UNKNOWN_USER:
+        bot.answer_callback_query(call.id, MSG_ACCESS_USER_NOT_FOUND, show_alert=True)
+        return
+
+    label = USER_STATUS_LABEL[result.record['status']]
+    bot.answer_callback_query(call.id, label)
+    # Кнопки убираем: решение принято. Повторное нажатие — идемпотентно (UNCHANGED)
+    try:
+        bot.edit_message_text(
+            f"{access.describe_user(result.record)} — {label}",
+            call.message.chat.id,
+            call.message.message_id,
+        )
+    except Exception as e:
+        logger.debug('Сообщение решения не изменено: %s', e)
+
+    if result.outcome == DecideOutcome.UNCHANGED:
+        return
+    logger.info('Доступ: user_id=%s -> %s', target_id, result.record['status'])
+    # Сбрасываем и при одобрении: next-step, зарегистрированный до отзыва, не должен
+    # перехватить первое сообщение после повторного одобрения
+    _forget_user_state(target_id)
+    try:
+        bot.send_message(target_id, MSG_ACCESS_GRANTED if approve else MSG_ACCESS_REJECTED)
+    except Exception as e:
+        # Пользователь мог заблокировать бота — решение всё равно в силе
+        logger.warning('Не удалось уведомить user_id=%s: %s', target_id, _error_text(e))
+        try:
+            bot.send_message(
+                OWNER_ID,
+                MSG_ACCESS_NOTIFY_FAILED.format(user=access.describe_user(result.record), error=_error_text(e)),
+            )
+        except Exception as owner_error:
+            logger.error('Не удалось сообщить владельцу об ошибке уведомления: %s', owner_error)
+
+
+@bot.message_handler(commands=['users'])
+def handle_users(message: telebot.types.Message) -> None:
+    """Только владелец: сводка и по сообщению с кнопками на каждого пользователя."""
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, MSG_ACCESS_OWNER_ONLY)
+        return
+    users = list_users()
+    if not users:
+        bot.send_message(message.chat.id, MSG_USERS_EMPTY)
+        return
+    counts = {status: sum(1 for u in users if u['status'] == status) for status in USER_STATUS_LABEL}
+    bot.send_message(message.chat.id, MSG_USERS_TITLE.format(count=len(users), **counts))
+    for record in users:
+        bot.send_message(
+            message.chat.id,
+            f"{access.describe_user(record)} — {USER_STATUS_LABEL[record['status']]}",
+            reply_markup=_decision_keyboard(record['user_id'], record['status']),
+        )
 
 
 @bot.message_handler(commands=['model'])
@@ -719,7 +1031,7 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 send_long_message(call.message.chat.id, summary)
 
         except Exception as e:
-            bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+            bot.send_message(call.message.chat.id, MSG_ERROR.format(error=_error_text(e)))
             logger.error('Ошибка перегенерации для %s: %s', user_id, e)
 
         # Очищаем временное хранилище
@@ -822,7 +1134,7 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
                 )
     except Exception as e:
         logger.error('Ошибка привязки статьи к идеям для %s: %s', user_id, e)
-        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=_error_text(e)))
     finally:
         # Очищаем сессию в любом случае
         pending_article_links.pop(user_id, None)
@@ -951,7 +1263,7 @@ def handle_url(message: telebot.types.Message) -> None:
             _offer_link_to_ideas(message.chat.id, user_id, article_id)
 
     except Exception as e:
-        error_text = MSG_ERROR.format(error=str(e))
+        error_text = MSG_ERROR.format(error=_error_text(e))
         try:
             bot.edit_message_text(
                 error_text,
@@ -1015,7 +1327,7 @@ def process_idea_description(message: telebot.types.Message, user_id: int, idea_
             message.chat.id, user_id, idea_id, idea_name, idea_description or None,
         )
     except Exception as e:
-        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
         logger.error('Ошибка создания идеи для %s: %s', user_id, e)
 
 
@@ -1329,7 +1641,8 @@ def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
         try:
             revised = revise_idea_md(session['draft_md'], feedback, md_model, md_provider)
         except Exception as e:
-            bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+            logger.error('Ошибка переработки .md для %s: %s', user_id, e)
+            bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
             return
         session['draft_md'] = revised
         send_long_message(message.chat.id, revised)
@@ -1608,7 +1921,7 @@ def process_edit_description(message: telebot.types.Message, user_id: int, idea_
         else:
             bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
     except Exception as e:
-        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
         logger.error('Ошибка обновления идеи для %s: %s', user_id, e)
 
 
@@ -1673,7 +1986,7 @@ def handle_confirm_delete(call: telebot.types.CallbackQuery) -> None:
             )
     except Exception as e:
         bot.edit_message_text(
-            MSG_ERROR.format(error=str(e)),
+            MSG_ERROR.format(error=_error_text(e)),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
@@ -1752,7 +2065,12 @@ def main() -> None:
         else:
             logger.warning('Модель по умолчанию (%s): %s (%s) — НЕДОСТУПНА: %s', label, model, provider, err)
 
-    logger.info("Бот запущен")
+    try:
+        bot.set_my_commands([types.BotCommand(name, desc) for name, desc in BOT_COMMANDS])
+    except Exception as e:
+        logger.warning('Не удалось установить меню команд: %s', e)
+
+    logger.info("Бот запущен, владелец: %s", OWNER_ID)
 
     atexit.register(lambda: logger.info("Бот остановлен"))
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
