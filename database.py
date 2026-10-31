@@ -25,6 +25,12 @@
     - get_ideas_by_article(...) - получение идей статьи
     - get_user_articles(user_id) - получение всех статей пользователя
 
+Функции для пользователей бота (users):
+    - get_user(user_id) - запись о пользователе или None
+    - create_access_request(...) - заявка на доступ (идемпотентно)
+    - set_user_status(user_id, status) - смена статуса доступа
+    - list_users() - все пользователи по времени заявки
+
 Example для статей:
     >>> from database import init_db, article_exists, save_article
     >>> init_db()
@@ -65,6 +71,12 @@ __all__ = [
     'get_user_articles',
     'update_idea_md',
     'get_idea_md',
+    # Таблица users
+    'USER_STATUSES',
+    'get_user',
+    'create_access_request',
+    'set_user_status',
+    'list_users',
 ]
 
 # Путь к базе данных
@@ -142,6 +154,20 @@ CREATE INDEX IF NOT EXISTS idx_idea_articles_idea_id ON idea_articles(idea_id);
 CREATE INDEX IF NOT EXISTS idx_idea_articles_article_id ON idea_articles(article_id);
 """
 
+# SQL для таблицы users (доступ к боту; владелец из OWNER_ID в таблице не хранится)
+CREATE_USERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+    requested_at TEXT NOT NULL,
+    decided_at TEXT
+);
+"""
+
+USER_STATUSES = ('pending', 'approved', 'rejected')
+
 
 def _get_connection() -> sqlite3.Connection:
     """
@@ -175,6 +201,7 @@ def init_db() -> None:
         cursor.executescript(CREATE_IDEAS_INDEXES_SQL)
         cursor.executescript(CREATE_IDEA_ARTICLES_TABLE_SQL)
         cursor.executescript(CREATE_IDEA_ARTICLES_INDEXES_SQL)
+        cursor.executescript(CREATE_USERS_TABLE_SQL)
         conn.commit()
         # Миграция: добавляем поле generated_md в ideas
         try:
@@ -809,3 +836,96 @@ def _save_idea_md_file(idea_id: int, md_content: str) -> None:
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(md_content)
     logger.debug("Файл идеи сохранен: %s", filepath)
+
+
+# ========================
+# Функции для пользователей бота (users)
+# ========================
+
+
+def get_user(user_id: int) -> dict | None:
+    """
+    Получает запись о пользователе бота.
+
+    Args:
+        user_id: Telegram ID пользователя
+
+    Returns:
+        dict с полями user_id, username, first_name, status, requested_at, decided_at
+        или None, если пользователь доступ не запрашивал
+    """
+    conn = _get_connection()
+    try:
+        row = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def create_access_request(user_id: int, username: str | None, first_name: str | None) -> bool:
+    """
+    Создаёт заявку на доступ со статусом pending.
+
+    Идемпотентна: существующая запись (в любом статусе) не меняется,
+    в том числе requested_at.
+
+    Returns:
+        True если заявка создана, False если запись уже была
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, username, first_name, status, requested_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (user_id, username, first_name, datetime.now().isoformat()),
+        )
+        conn.commit()
+        created = cursor.rowcount > 0
+        if created:
+            logger.info("Заявка на доступ: user_id=%d", user_id)
+        return created
+    finally:
+        conn.close()
+
+
+def set_user_status(user_id: int, status: str) -> bool:
+    """
+    Меняет статус доступа пользователя и время решения.
+
+    Args:
+        user_id: Telegram ID пользователя
+        status: 'pending', 'approved' или 'rejected'
+
+    Returns:
+        True если пользователь найден, False если записи нет
+
+    Raises:
+        ValueError: неизвестный статус
+    """
+    if status not in USER_STATUSES:
+        raise ValueError(f'Неизвестный статус пользователя: {status}')
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            'UPDATE users SET status = ?, decided_at = ? WHERE user_id = ?',
+            (status, datetime.now().isoformat(), user_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.info("Статус доступа: user_id=%d -> %s", user_id, status)
+        return updated
+    finally:
+        conn.close()
+
+
+def list_users() -> list[dict]:
+    """Возвращает всех пользователей бота в порядке подачи заявок."""
+    conn = _get_connection()
+    try:
+        rows = conn.execute('SELECT * FROM users ORDER BY requested_at, user_id').fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
