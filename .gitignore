@@ -10,3 +10,4 @@ ideas_md/
 *.key
 credentials.json
 secrets/
+.pytest_cache/

@@ -20,9 +20,10 @@ import logging
 import os
 import re
 import time
+from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # Логгер модуля
 logger = logging.getLogger(__name__)
@@ -100,6 +101,12 @@ def _fetch_page(url: str) -> tuple[BeautifulSoup | None, dict | None]:
             challenge = _parse_cookie_challenge(response.text)
             if challenge:
                 cookie_name, cookie_value, retry_url = challenge
+                # Адрес взят со страницы: разрешаем относительный путь и не уходим на чужой хост
+                retry_url = urljoin(response.url, retry_url)
+                if urlparse(retry_url).netloc != urlparse(response.url).netloc:
+                    logger.warning('Cookie challenge redirects to foreign host: url=%s, retry_url=%s',
+                                   url, retry_url)
+                    return None, {'error': 'Проверка на бота ведёт на посторонний сайт'}
                 logger.info('Cookie challenge detected for %s, retrying with %s', url, cookie_name)
                 session.cookies.set(cookie_name, cookie_value)
                 response = session.get(retry_url, timeout=TIMEOUT_SECONDS)
@@ -265,31 +272,35 @@ def _fetch_habr_comments(url: str) -> list[dict]:
     roots = [cid for cid, c in raw.items() if not c.get('parentId')]
 
     # Обход дерева в глубину: порядок как на странице
-    ordered: list[dict] = []
+    ordered: list[tuple[str, dict]] = []
+    visited: set[str] = set()
     stack = list(reversed(roots))
     while stack:
-        c = raw.get(stack.pop())
-        if not c:
+        cid = stack.pop()
+        c = raw.get(cid)
+        if not c or cid in visited:
             continue
-        ordered.append(c)
+        visited.add(cid)
+        ordered.append((cid, c))
         stack.extend(reversed(c.get('children') or []))
 
-    number_by_id = {c['id']: i for i, c in enumerate(ordered, 1)}
+    number_by_id = {cid: i for i, (cid, _) in enumerate(ordered, 1)}
     comments = []
-    for c in ordered:
+    for cid, c in ordered:
         if c.get('status') != 'published' or c.get('isSuspended'):
             continue
         text = BeautifulSoup(c.get('message') or '', 'html.parser').get_text(' ', strip=True)
         if not text:
             continue
         comments.append(_make_comment(
-            number=number_by_id[c['id']],
+            number=number_by_id[cid],
             author=(c.get('author') or {}).get('alias') or 'аноним',
             text=text,
             reply_to=number_by_id.get(c.get('parentId')),
             is_post_author=bool(c.get('isPostAuthor')),
             score=c.get('score'),
         ))
+    logger.info('Habr comments fetched: url=%s, total=%d, published=%d', url, len(raw), len(comments))
     return comments
 
 
@@ -344,6 +355,7 @@ def _parse_infostart(url: str) -> dict:
     # Комментарии и теги разбираем до чистки контента: она удаляет эти блоки
     comments = _extract_infostart_comments(soup, author_uid)
     tags = _extract_infostart_tags(soup)
+    logger.info('InfoStart comments parsed: url=%s, comments=%d, tags=%d', url, len(comments), len(tags))
 
     # Текст статьи
     content = _extract_infostart_content(soup)
@@ -398,10 +410,16 @@ def _extract_infostart_comments(soup: BeautifulSoup, post_author_uid: str | None
     ссылкой «(N)» (a.comment-ref) в начале текста.
     """
     comments = []
-    for number, wrap in enumerate(soup.select('div.forum-message-wrap'), 1):
+    for position, wrap in enumerate(soup.select('div.forum-message-wrap'), 1):
+        # Блок «лучших комментариев» дублирует сообщения из общего списка
+        if wrap.find_parent('div', class_='fm-best-wrap'):
+            continue
         text_elem = wrap.find('div', class_='forum-message-text')
         if not text_elem:
             continue
+
+        block = wrap.find_parent('div', class_='mes-block-out')
+        number = _infostart_comment_number(block) or position
 
         reply_to = None
         ref = text_elem.find('a', class_='comment-ref')
@@ -420,7 +438,6 @@ def _extract_infostart_comments(soup: BeautifulSoup, post_author_uid: str | None
         if not text:
             continue
 
-        block = wrap.find_parent('div', class_='mes-block-out')
         author_elem = block.find('span', class_='message-author') if block else None
         author_link = author_elem.find('a') if author_elem else None
         uid = author_elem.get('data-uid') if author_elem else None
@@ -433,6 +450,15 @@ def _extract_infostart_comments(soup: BeautifulSoup, post_author_uid: str | None
             is_post_author=bool(uid and uid == post_author_uid),
         ))
     return comments
+
+
+_INFOSTART_MESSAGE_ID_RE = re.compile(r'^message-target-(\d+)$')
+
+
+def _infostart_comment_number(block: Tag | None) -> int | None:
+    """Номер комментария на сайте из id блока (message-target-N) — на него ссылаются «(N)»."""
+    match = _INFOSTART_MESSAGE_ID_RE.match(block.get('id') or '') if block else None
+    return int(match.group(1)) if match else None
 
 
 def _extract_infostart_content(soup: BeautifulSoup) -> str:
@@ -455,15 +481,19 @@ def _extract_infostart_content(soup: BeautifulSoup) -> str:
     for tag in content_elem(['script', 'style', 'aside', 'iframe', 'nav']):
         tag.decompose()
 
-    # Удаляем служебные блоки: комментарии, вкладку файлов с дисклеймером,
-    # теги (извлекаются отдельно), кнопки голосования, галерею скриншотов,
-    # рекламу биржи фриланса
+    # Удаляем служебные блоки: комментарии, теги (извлекаются отдельно),
+    # кнопки голосования, галерею скриншотов, рекламу биржи фриланса
     for elem in content_elem.find_all(['div', 'p'], class_=[
         'forum-message-wrap', 'comments', 'comment',
-        'tab-content', 'public-tags-wrap', 'soc-butt-wrap', 'screen-wrap',
-        'freelance-block',
+        'public-tags-wrap', 'soc-butt-wrap', 'screen-wrap', 'freelance-block',
     ]):
         elem.decompose()
+
+    # Вкладка файлов с дисклеймером. Класс tab-content общий (Bootstrap),
+    # поэтому удаляем только блок с файлами и без текста статьи внутри
+    for elem in content_elem.find_all('div', class_='tab-content'):
+        if elem.find(class_='tab-file-wrap') and not elem.find(class_='detail-text'):
+            elem.decompose()
 
     # Промо-абзац «Вступайте в нашу телеграмм-группу»
     for p in content_elem.find_all('p'):
@@ -631,7 +661,9 @@ def _parse_github(url: str) -> dict:
 
     Returns:
         Словарь с полями: url, source, title, author, description,
-        stars, language, content, content_length, files (список найденных файлов).
+        stars, language, pushed_at (YYYY-MM-DD), archived, license (SPDX id),
+        content, content_length, files (список найденных файлов).
+        pushed_at/archived/license — None, если GitHub API недоступен.
         При ошибке — словарь с полем 'error'.
     """
     # Извлекаем owner/repo из URL
@@ -651,10 +683,15 @@ def _parse_github(url: str) -> dict:
 
     # Метаданные: сначала через API, при неудаче — из HTML
     repo_info = _fetch_github_api(f'https://api.github.com/repos/{owner}/{repo}')
+    # Признаки активности есть только в API; из HTML их не достаём (None = нет данных)
+    pushed_at, archived, license_id = None, None, None
     if repo_info:
         description = repo_info.get('description') or ''
         stars = str(repo_info.get('stargazers_count', 0))
         language = repo_info.get('language') or 'Не определён'
+        pushed_at = (repo_info.get('pushed_at') or '')[:10] or None
+        archived = repo_info.get('archived')
+        license_id = (repo_info.get('license') or {}).get('spdx_id')
     else:
         description = _extract_github_description(soup)
         stars = _extract_github_stars(soup)
@@ -683,6 +720,9 @@ def _parse_github(url: str) -> dict:
         'description': description,
         'stars': stars,
         'language': language,
+        'pushed_at': pushed_at,
+        'archived': archived,
+        'license': license_id,
         'content': combined_content,
         'content_length': len(combined_content),
         'files': [f['path'] for f in markdown_files],

@@ -1,0 +1,42 @@
+{
+  "comments": {
+    "100": {
+      "id": "100", "parentId": null, "level": 0, "status": "published", "isSuspended": false,
+      "isPostAuthor": false, "score": 5, "children": ["101", "103"],
+      "author": {"id": "1", "alias": "alice"},
+      "message": "<p>Отличная статья, но <code>retry</code> стоит ограничить.</p>"
+    },
+    "101": {
+      "id": "101", "parentId": "100", "level": 1, "status": "published", "isSuspended": false,
+      "isPostAuthor": true, "score": 3, "children": ["102"],
+      "author": {"id": "2", "alias": "author"},
+      "message": "Согласен, добавлю лимит."
+    },
+    "102": {
+      "id": "102", "parentId": "101", "level": 2, "status": "moderated", "isSuspended": false,
+      "isPostAuthor": false, "score": 0, "children": [],
+      "author": {"id": "3", "alias": "troll"},
+      "message": "скрытый комментарий"
+    },
+    "103": {
+      "id": "103", "parentId": "100", "level": 1, "status": "published", "isSuspended": false,
+      "isPostAuthor": false, "score": -2, "children": [],
+      "author": null,
+      "message": "Минусую"
+    },
+    "200": {
+      "id": "200", "parentId": null, "level": 0, "status": "published", "isSuspended": true,
+      "isPostAuthor": false, "score": 0, "children": [],
+      "author": {"id": "4", "alias": "banned"},
+      "message": "Комментарий заблокированного"
+    },
+    "300": {
+      "id": "300", "parentId": null, "level": 0, "status": "published", "isSuspended": false,
+      "isPostAuthor": false, "score": 1, "children": [],
+      "author": {"id": "5", "alias": "bob"},
+      "message": "<br>"
+    }
+  },
+  "threads": ["100", "200", "300"],
+  "pinnedCommentIds": []
+}
