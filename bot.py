@@ -330,23 +330,30 @@ def _send_access_offer(chat_id: int) -> None:
     bot.send_message(chat_id, MSG_ACCESS_OFFER, reply_markup=keyboard)
 
 
-class _RedactTokenFilter(logging.Filter):
-    """Вырезает токен бота из логов: тексты сетевых ошибок содержат URL вида /bot<TOKEN>/..."""
+class _RedactTokenFormatter(logging.Formatter):
+    """
+    Вырезает токен бота из готовой строки лога, включая трейсбек:
+    тексты сетевых ошибок requests содержат URL вида /bot<TOKEN>/...
+    """
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, base: logging.Formatter, token: str) -> None:
         super().__init__()
+        self._base = base
         self._token = token
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        if self._token in message:
-            record.msg = message.replace(self._token, '<TOKEN>')
-            record.args = None
-        return True
+    def format(self, record: logging.LogRecord) -> str:
+        return self._base.format(record).replace(self._token, '<TOKEN>')
 
 
-for _handler in logging.getLogger().handlers:
-    _handler.addFilter(_RedactTokenFilter(TELEGRAM_TOKEN))
+def _install_token_redaction(token: str) -> None:
+    """Оборачивает форматтеры корневого логгера и логгера telebot."""
+    for name in (None, 'TeleBot'):
+        for handler in logging.getLogger(name).handlers:
+            if not isinstance(handler.formatter, _RedactTokenFormatter):
+                handler.setFormatter(_RedactTokenFormatter(handler.formatter or logging.Formatter(), token))
+
+
+_install_token_redaction(TELEGRAM_TOKEN)
 
 
 def _error_text(error: Exception) -> str:
@@ -580,7 +587,7 @@ def _auto_generate_md(
         md_text = generate_idea_md(idea_name, idea_description, md_model, md_provider)
     except Exception as e:
         logger.error('Ошибка генерации .md для idea_id=%d: %s', idea_id, e)
-        bot.send_message(chat_id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(chat_id, MSG_ERROR.format(error=_error_text(e)))
         return
     pending_md_generation[user_id] = {'idea_id': idea_id, 'draft_md': md_text}
     send_long_message(chat_id, md_text)
@@ -720,7 +727,7 @@ def _decision_keyboard(user_id: int, status: str) -> types.InlineKeyboardMarkup:
 
 
 def _forget_user_state(user_id: int) -> None:
-    """Сбрасывает незавершённые диалоги пользователя (при отзыве доступа)."""
+    """Сбрасывает незавершённые диалоги пользователя при любом решении владельца."""
     bot.clear_step_handler_by_chat_id(user_id)
     for state in (pending_model_selection, pending_article_links, pending_reassign,
                   pending_assign_list, pending_md_generation):
@@ -1024,7 +1031,7 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
                 send_long_message(call.message.chat.id, summary)
 
         except Exception as e:
-            bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+            bot.send_message(call.message.chat.id, MSG_ERROR.format(error=_error_text(e)))
             logger.error('Ошибка перегенерации для %s: %s', user_id, e)
 
         # Очищаем временное хранилище
@@ -1127,7 +1134,7 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
                 )
     except Exception as e:
         logger.error('Ошибка привязки статьи к идеям для %s: %s', user_id, e)
-        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(call.message.chat.id, MSG_ERROR.format(error=_error_text(e)))
     finally:
         # Очищаем сессию в любом случае
         pending_article_links.pop(user_id, None)
@@ -1256,7 +1263,7 @@ def handle_url(message: telebot.types.Message) -> None:
             _offer_link_to_ideas(message.chat.id, user_id, article_id)
 
     except Exception as e:
-        error_text = MSG_ERROR.format(error=str(e))
+        error_text = MSG_ERROR.format(error=_error_text(e))
         try:
             bot.edit_message_text(
                 error_text,
@@ -1320,7 +1327,7 @@ def process_idea_description(message: telebot.types.Message, user_id: int, idea_
             message.chat.id, user_id, idea_id, idea_name, idea_description or None,
         )
     except Exception as e:
-        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
         logger.error('Ошибка создания идеи для %s: %s', user_id, e)
 
 
@@ -1634,7 +1641,7 @@ def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
         try:
             revised = revise_idea_md(session['draft_md'], feedback, md_model, md_provider)
         except Exception as e:
-            bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+            bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
             return
         session['draft_md'] = revised
         send_long_message(message.chat.id, revised)
@@ -1913,7 +1920,7 @@ def process_edit_description(message: telebot.types.Message, user_id: int, idea_
         else:
             bot.send_message(message.chat.id, MSG_IDEA_NOT_FOUND)
     except Exception as e:
-        bot.send_message(message.chat.id, MSG_ERROR.format(error=str(e)))
+        bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
         logger.error('Ошибка обновления идеи для %s: %s', user_id, e)
 
 
@@ -1978,7 +1985,7 @@ def handle_confirm_delete(call: telebot.types.CallbackQuery) -> None:
             )
     except Exception as e:
         bot.edit_message_text(
-            MSG_ERROR.format(error=str(e)),
+            MSG_ERROR.format(error=_error_text(e)),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )

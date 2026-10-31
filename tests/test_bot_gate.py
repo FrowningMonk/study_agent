@@ -136,8 +136,8 @@ def test_users_command_lists_with_buttons(tg, tmp_db):
     by_text = {m[1][1]: _buttons(m[2]['reply_markup']) for m in msgs[1:]}
     access = bot_module.access
     assert by_text == {
-        f'@friend (Друг), id {FRIEND} — ✅ одобрен': [access.decision_callback(FRIEND, False)],
-        f'@s (S), id {STRANGER} — ⏳ ждёт решения': [
+        f'id {FRIEND}: @friend «Друг» — ✅ одобрен': [access.decision_callback(FRIEND, False)],
+        f'id {STRANGER}: @s «S» — ⏳ ждёт решения': [
             access.decision_callback(STRANGER, True), access.decision_callback(STRANGER, False),
         ],
     }
@@ -206,7 +206,7 @@ def test_request_then_owner_approves(tg, tmp_db):
     bot_module.bot.process_new_updates([_callback_update(STRANGER, access.REQUEST_CALLBACK)])
     to_owner = _sent_to(tg, owner)
     assert len(to_owner) == 1
-    assert to_owner[0][1][1] == bot_module.MSG_ACCESS_OWNER_REQUEST.format(user=f'@u (U), id {STRANGER}')
+    assert to_owner[0][1][1] == bot_module.MSG_ACCESS_OWNER_REQUEST.format(user=f'id {STRANGER}: @u «U»')
     assert _buttons(to_owner[0][2]['reply_markup']) == [
         access.decision_callback(STRANGER, True), access.decision_callback(STRANGER, False),
     ]
@@ -261,13 +261,42 @@ def test_non_message_updates_dropped(tg):
     assert bot_module._admit_update(update) is False
 
 
-def test_token_redacted_in_logs():
+def test_token_redacted_in_logs_including_traceback():
+    import io
     import logging
     token = bot_module.TELEGRAM_TOKEN
-    record = logging.LogRecord('x', logging.WARNING, __file__, 1, 'fail: %s', (f'https://api/bot{token}/send',), None)
-    bot_module._RedactTokenFilter(token).filter(record)
-    assert token not in record.getMessage()
-    assert '<TOKEN>' in record.getMessage()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(bot_module._RedactTokenFormatter(logging.Formatter('%(message)s'), token))
+    log = logging.getLogger('test_redaction')
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        log.warning('fail: %s', f'https://api/bot{token}/send')
+        try:
+            raise ConnectionError(f'Max retries exceeded with url: /bot{token}/sendMessage')
+        except ConnectionError:
+            log.exception('gate error')
+    finally:
+        log.removeHandler(handler)
+    output = stream.getvalue()
+    assert token not in output
+    assert output.count('<TOKEN>') == 2
+    assert 'Traceback' in output
+
+
+def test_install_redaction_wraps_root_handlers_once():
+    import logging
+    root = logging.getLogger()
+    handler = logging.StreamHandler()
+    root.addHandler(handler)
+    try:
+        bot_module._install_token_redaction(bot_module.TELEGRAM_TOKEN)
+        bot_module._install_token_redaction(bot_module.TELEGRAM_TOKEN)
+        assert isinstance(handler.formatter, bot_module._RedactTokenFormatter)
+        assert not isinstance(handler.formatter._base, bot_module._RedactTokenFormatter)
+    finally:
+        root.removeHandler(handler)
 
 
 def test_error_text_hides_exception_details():

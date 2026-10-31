@@ -170,9 +170,15 @@ def _clean_name(value: str | None) -> str:
 
 
 def describe_user(record: dict) -> str:
-    """Как пользователь выглядит у владельца: «@ivan (Иван), id 12345» или «Иван, id 12345»."""
+    """
+    Как пользователь выглядит у владельца: «id 12345: @ivan «Иван»» или «id 12345: «Иван»».
+
+    Настоящий id идёт первым, имя — в кавычках: имя задаёт заявитель и мог бы
+    вписать в него «), id 111» чужого человека.
+    """
     name = _clean_name(record.get('first_name')) or 'без имени'
     username = _clean_name(record.get('username'))
+    prefix = f"id {record['user_id']}: "
     if username:
-        return f"@{username} ({name}), id {record['user_id']}"
-    return f"{name}, id {record['user_id']}"
+        return f"{prefix}@{username} «{name}»"
+    return f"{prefix}«{name}»"

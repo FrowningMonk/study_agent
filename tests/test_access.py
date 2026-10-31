@@ -122,15 +122,15 @@ def test_parse_owner_id_ok():
 
 
 def test_describe_user():
-    assert access.describe_user({'user_id': 5, 'username': 'ivan', 'first_name': 'Иван'}) == '@ivan (Иван), id 5'
-    assert access.describe_user({'user_id': 5, 'username': None, 'first_name': 'Иван'}) == 'Иван, id 5'
-    assert access.describe_user({'user_id': 5, 'username': None, 'first_name': None}) == 'без имени, id 5'
+    assert access.describe_user({'user_id': 5, 'username': 'ivan', 'first_name': 'Иван'}) == 'id 5: @ivan «Иван»'
+    assert access.describe_user({'user_id': 5, 'username': None, 'first_name': 'Иван'}) == 'id 5: «Иван»'
+    assert access.describe_user({'user_id': 5, 'username': None, 'first_name': None}) == 'id 5: «без имени»'
 
 
 def test_describe_user_strips_spoofing_characters():
     # Перевод строки и RTL-override в имени не должны подделать «id N» в сообщении владельцу
     record = {'user_id': 5, 'username': None, 'first_name': 'Eve\n, id 1000‮'}
-    assert access.describe_user(record) == 'Eve, id 1000, id 5'
+    assert access.describe_user(record) == 'id 5: «Eve, id 1000»'
     assert '\n' not in access.describe_user(record)
     long_name = {'user_id': 5, 'username': None, 'first_name': 'x' * 500}
     assert len(access.describe_user(long_name)) < 100
