@@ -286,8 +286,12 @@ def test_token_redacted_in_logs_including_traceback():
     assert 'Traceback' in output
 
 
-def test_install_redaction_wraps_root_handlers_once():
+def test_install_redaction_wraps_root_handlers_once(monkeypatch):
     import logging
+    # Глобальные форматтеры TeleBot вернутся после теста — иначе следующие тесты
+    # не отличат обёртку при импорте от обёртки, сделанной здесь
+    for h in logging.getLogger('TeleBot').handlers:
+        monkeypatch.setattr(h, 'formatter', h.formatter)
     root = logging.getLogger()
     handler = logging.StreamHandler()
     root.addHandler(handler)
@@ -305,10 +309,34 @@ def test_error_text_hides_exception_details():
     assert bot_module._error_text(leaky) == 'ConnectionError'
 
 
-def test_telebot_logger_handlers_redacted():
-    import logging
-    handlers = logging.getLogger('TeleBot').handlers
-    assert handlers and all(isinstance(h.formatter, bot_module._RedactTokenFormatter) for h in handlers)
+_IMPORT_REDACTION_PROBE = """
+import io, logging, sys
+import bot, telebot
+buf = io.StringIO()
+handlers = logging.getLogger().handlers + logging.getLogger('TeleBot').handlers
+for h in handlers:
+    h.setStream(buf)
+url = '/bot' + bot.TELEGRAM_TOKEN + '/getUpdates'
+telebot.logger.error('polling failed: %s', url)
+logging.getLogger('bot').warning('send failed: %s', url)
+out = buf.getvalue()
+ok = bool(handlers) and bot.TELEGRAM_TOKEN not in out and out.count('<TOKEN>') >= 2
+print('OK' if ok else 'LEAK')
+"""
+
+
+def test_token_redaction_installed_at_import():
+    """Свежий процесс: маскировка должна стоять сразу после import bot (basicConfig + TeleBot)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, 'TELEGRAM_BOT_TOKEN': os.environ['TELEGRAM_BOT_TOKEN'], 'OWNER_ID': '1000'}
+    result = subprocess.run(
+        [sys.executable, '-c', _IMPORT_REDACTION_PROBE],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert result.stdout.strip().splitlines()[-1] == 'OK', result.stderr[-500:]
 
 
 def test_blocked_user_notification_failure_reported_to_owner(tg, tmp_db, monkeypatch):
@@ -347,12 +375,8 @@ def test_users_command_rejected_user_gets_approve_button(tg, tmp_db):
     assert buttons == [[bot_module.access.decision_callback(FRIEND, True)]]
 
 
-def test_users_command_empty(tg, tmp_db):
-    import sqlite3
-    conn = sqlite3.connect(tmp_db.DB_PATH)
-    conn.execute('DELETE FROM users')
-    conn.commit()
-    conn.close()
+def test_users_command_empty(tg, monkeypatch):
+    monkeypatch.setattr(bot_module, 'list_users', lambda: [])
     bot_module.bot.process_new_updates([_message_update(bot_module.OWNER_ID, '/users')])
     assert tg == [('send_message', (bot_module.OWNER_ID, bot_module.MSG_USERS_EMPTY), {})]
 
@@ -387,3 +411,35 @@ def test_owner_menu_retried_after_failure(tg, monkeypatch):
         b.process_new_updates([_message_update(owner, 'x', update_id=update_id)])
     assert len(attempts) == 2
     assert b.owner_menu_set is True
+
+
+def test_decision_survives_unreachable_user_and_owner(tg, tmp_db, monkeypatch):
+    tmp_db.create_access_request(STRANGER, 's', 'S')
+
+    def send(*a, **kw):
+        raise ConnectionError('network down')
+    monkeypatch.setattr(bot_module.bot, 'send_message', send)
+    bot_module.bot.process_new_updates([_callback_update(bot_module.OWNER_ID, f'access:approve:{STRANGER}')])
+    assert tmp_db.get_user(STRANGER)['status'] == 'approved'
+
+
+def test_request_falls_back_to_new_message_when_edit_fails(tg, tmp_db, monkeypatch):
+    def edit(*a, **kw):
+        raise ConnectionError('edit failed')
+    monkeypatch.setattr(bot_module.bot, 'edit_message_text', edit)
+    bot_module.bot.process_new_updates([_callback_update(STRANGER, bot_module.access.REQUEST_CALLBACK)])
+    assert ('send_message', (STRANGER, bot_module.MSG_ACCESS_REQUESTED), {}) in tg
+    assert len(_sent_to(tg, bot_module.OWNER_ID)) == 1
+
+
+def test_request_stored_when_owner_unreachable(tg, tmp_db, monkeypatch):
+    owner = bot_module.OWNER_ID
+
+    def send(chat_id, text, **kw):
+        if chat_id == owner:
+            raise ConnectionError('owner unreachable')
+        tg.append(('send_message', (chat_id, text), kw))
+    monkeypatch.setattr(bot_module.bot, 'send_message', send)
+    bot_module.bot.process_new_updates([_callback_update(STRANGER, bot_module.access.REQUEST_CALLBACK)])
+    assert tmp_db.get_user(STRANGER)['status'] == 'pending'
+    assert ('edit_message_text', (bot_module.MSG_ACCESS_REQUESTED, STRANGER, 11), {}) in tg

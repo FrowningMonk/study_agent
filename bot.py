@@ -1641,6 +1641,7 @@ def process_md_feedback(message: telebot.types.Message, user_id: int) -> None:
         try:
             revised = revise_idea_md(session['draft_md'], feedback, md_model, md_provider)
         except Exception as e:
+            logger.error('Ошибка переработки .md для %s: %s', user_id, e)
             bot.send_message(message.chat.id, MSG_ERROR.format(error=_error_text(e)))
             return
         session['draft_md'] = revised
