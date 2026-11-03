@@ -443,3 +443,65 @@ def test_request_stored_when_owner_unreachable(tg, tmp_db, monkeypatch):
     bot_module.bot.process_new_updates([_callback_update(STRANGER, bot_module.access.REQUEST_CALLBACK)])
     assert tmp_db.get_user(STRANGER)['status'] == 'pending'
     assert ('edit_message_text', (bot_module.MSG_ACCESS_REQUESTED, STRANGER, 11), {}) in tg
+
+
+def _seed_articles(db, count: int) -> None:
+    for n in range(count):
+        db.save_article(
+            {'url': f'https://habr.com/ru/articles/{n}/', 'source': 'habr', 'title': 'T', 'content': 'C'},
+            'S', 'm', FRIEND,
+        )
+
+
+def test_wipe_command_owner_only(tg, tmp_db):
+    _seed_articles(tmp_db, 1)
+    bot_module.bot.process_new_updates([_message_update(FRIEND, '/wipe')])
+    assert [s[0] for s in tg] == ['reply_to']
+    assert tg[0][1][1] == bot_module.MSG_ACCESS_OWNER_ONLY
+    assert tmp_db.count_articles() == 1
+
+
+def test_wipe_command_asks_confirmation(tg, tmp_db):
+    _seed_articles(tmp_db, 3)
+    owner = bot_module.OWNER_ID
+    bot_module.bot.process_new_updates([_message_update(owner, '/wipe')])
+    msgs = _sent_to(tg, owner)
+    assert len(msgs) == 1
+    assert msgs[0][1][1] == bot_module.MSG_WIPE_CONFIRM.format(count=3)
+    assert _buttons(msgs[0][2]['reply_markup']) == [bot_module.WIPE_CONFIRM_CALLBACK, bot_module.WIPE_CANCEL_CALLBACK]
+    assert tmp_db.count_articles() == 3  # без подтверждения ничего не удалено
+
+
+def test_wipe_command_nothing_to_delete(tg):
+    bot_module.bot.process_new_updates([_message_update(bot_module.OWNER_ID, '/wipe')])
+    assert tg == [('send_message', (bot_module.OWNER_ID, bot_module.MSG_WIPE_EMPTY), {})]
+
+
+def test_wipe_confirm_deletes_articles_keeps_ideas(tg, tmp_db):
+    _seed_articles(tmp_db, 2)
+    owner = bot_module.OWNER_ID
+    idea_id = tmp_db.create_idea('I', None, owner)
+    bot_module.pending_article_links[owner] = {'article_id': 1}
+    bot_module.pending_assign_list[FRIEND] = {'article_id': 2}
+
+    bot_module.bot.process_new_updates([_callback_update(owner, bot_module.WIPE_CONFIRM_CALLBACK)])
+
+    assert tmp_db.count_articles() == 0
+    assert tmp_db.get_idea_by_id(idea_id, owner) is not None
+    assert bot_module.pending_article_links == {} and bot_module.pending_assign_list == {}
+    assert ('edit_message_text', (bot_module.MSG_WIPE_DONE.format(count=2), owner, 11), {}) in tg
+
+
+def test_wipe_cancel_keeps_articles(tg, tmp_db):
+    _seed_articles(tmp_db, 1)
+    owner = bot_module.OWNER_ID
+    bot_module.bot.process_new_updates([_callback_update(owner, bot_module.WIPE_CANCEL_CALLBACK)])
+    assert tmp_db.count_articles() == 1
+    assert ('edit_message_text', (bot_module.MSG_WIPE_CANCELLED, owner, 11), {}) in tg
+
+
+def test_wipe_forged_confirm_from_approved_user(tg, tmp_db):
+    _seed_articles(tmp_db, 1)
+    bot_module.bot.process_new_updates([_callback_update(FRIEND, bot_module.WIPE_CONFIRM_CALLBACK)])
+    assert tmp_db.count_articles() == 1
+    assert tg == [('answer_callback_query', ('cb1', bot_module.MSG_ACCESS_OWNER_ONLY), {'show_alert': True})]
