@@ -10,6 +10,8 @@
     - save_article(...) - сохранение статьи с конспектом
     - update_article(...) - обновление конспекта существующей статьи
     - delete_article(id) - удаление статьи по ID
+    - count_articles() - количество статей
+    - wipe_articles() - удаление всех статей и их привязок (идеи остаются)
 
 Функции для идей (ideas):
     - create_idea(...) - создание новой идеи
@@ -57,6 +59,8 @@ __all__ = [
     'save_article',
     'update_article',
     'delete_article',
+    'count_articles',
+    'wipe_articles',
     # Таблица ideas
     'create_idea',
     'get_user_ideas',
@@ -178,6 +182,8 @@ def _get_connection() -> sqlite3.Connection:
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # SQLite enforces FOREIGN KEY (and ON DELETE CASCADE) only when enabled per connection
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
 
@@ -210,6 +216,17 @@ def init_db() -> None:
             logger.info("Миграция: добавлено поле generated_md в ideas")
         except sqlite3.OperationalError:
             pass
+        # Чистка сирот: связи, оставшиеся с тех пор, когда внешние ключи были выключены
+        cursor.execute(
+            """
+            DELETE FROM idea_articles
+            WHERE article_id NOT IN (SELECT id FROM articles)
+               OR idea_id NOT IN (SELECT id FROM ideas)
+            """
+        )
+        if cursor.rowcount:
+            logger.info("Удалены связи-сироты в idea_articles: %d", cursor.rowcount)
+        conn.commit()
         logger.info("База данных инициализирована: %s", DB_PATH)
     finally:
         conn.close()
@@ -437,6 +454,36 @@ def delete_article(article_id: int) -> bool:
         deleted = cursor.rowcount > 0
         if deleted:
             logger.debug("Статья удалена: id=%d", article_id)
+        return deleted
+    finally:
+        conn.close()
+
+
+def count_articles() -> int:
+    """Количество статей в базе (всех пользователей)."""
+    conn = _get_connection()
+    try:
+        return conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+    finally:
+        conn.close()
+
+
+def wipe_articles() -> int:
+    """
+    Удаляет все статьи всех пользователей и их привязки к идеям.
+
+    Идеи и пользователи остаются: идеи просто становятся пустыми.
+    Связи удаляются явно, не полагаясь на каскад, в одной транзакции со статьями.
+
+    Returns:
+        Количество удалённых статей
+    """
+    conn = _get_connection()
+    try:
+        with conn:
+            conn.execute('DELETE FROM idea_articles')
+            deleted = conn.execute('DELETE FROM articles').rowcount
+        logger.info("Удалены все статьи: %d", deleted)
         return deleted
     finally:
         conn.close()

@@ -67,6 +67,8 @@ from database import (
     get_idea_md,
     update_idea_md,
     list_users,
+    count_articles,
+    wipe_articles,
 )
 
 load_dotenv(override=True)
@@ -139,7 +141,10 @@ MSG_HELP = """Команды:
 /articles - все статьи
 
 Поддерживаемые источники: habr.com, github.com, infostart.ru"""
-MSG_HELP_OWNER = MSG_HELP + "\n\nВладельцу:\n/users - пользователи и заявки на доступ"
+MSG_HELP_OWNER = MSG_HELP + (
+    "\n\nВладельцу:\n/users - пользователи и заявки на доступ"
+    "\n/wipe - удалить все статьи (идеи останутся)"
+)
 MSG_PROCESSING = "Обрабатываю..."
 MSG_ERROR = "Ошибка: {error}"
 MSG_UNSUPPORTED = "Я такие ссылки пока не понимаю. Поддерживаемые источники: habr.com, github.com, infostart.ru"
@@ -212,6 +217,18 @@ BTN_ACCESS_REVOKE = "🚫 Отозвать доступ"
 MSG_ACCESS_NOTIFY_FAILED = "Не удалось уведомить {user}: {error}"
 MSG_USERS_EMPTY = "Заявок на доступ не было."
 MSG_USERS_TITLE = "Пользователи ({count}): ожидают {pending}, одобрены {approved}, отклонены {rejected}."
+MSG_WIPE_EMPTY = "Статей в базе нет."
+MSG_WIPE_CONFIRM = (
+    "🔴 Удалить все статьи из базы: {count} шт.?\n\n"
+    "Удаляются статьи всех пользователей и их привязки к идеям. "
+    "Идеи и пользователи останутся. Отменить удаление нельзя."
+)
+MSG_WIPE_DONE = "Удалено статей: {count}. Идеи на месте, но без статей."
+MSG_WIPE_CANCELLED = "Удаление отменено."
+BTN_WIPE_CONFIRM = "🔴 Да, удалить все статьи"
+BTN_WIPE_CANCEL = "Отмена"
+WIPE_CONFIRM_CALLBACK = 'wipe:confirm'
+WIPE_CANCEL_CALLBACK = 'wipe:cancel'
 USER_STATUS_LABEL: dict[str, str] = {
     'pending': '⏳ ждёт решения',
     'approved': '✅ одобрен',
@@ -242,7 +259,10 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ('ideas', 'мои идеи'),
     ('articles', 'все статьи'),
 ]
-OWNER_COMMANDS: list[tuple[str, str]] = BOT_COMMANDS + [('users', 'пользователи и заявки')]
+OWNER_COMMANDS: list[tuple[str, str]] = BOT_COMMANDS + [
+    ('users', 'пользователи и заявки'),
+    ('wipe', 'удалить все статьи'),
+]
 
 
 class AccessControlledBot(telebot.TeleBot):
@@ -832,6 +852,47 @@ def handle_users(message: telebot.types.Message) -> None:
             f"{access.describe_user(record)} — {USER_STATUS_LABEL[record['status']]}",
             reply_markup=_decision_keyboard(record['user_id'], record['status']),
         )
+
+@bot.message_handler(commands=['wipe'])
+def handle_wipe(message: telebot.types.Message) -> None:
+    """Только владелец: удалить все статьи всех пользователей — с подтверждением."""
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, MSG_ACCESS_OWNER_ONLY)
+        return
+    count = count_articles()
+    if not count:
+        bot.send_message(message.chat.id, MSG_WIPE_EMPTY)
+        return
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(text=BTN_WIPE_CONFIRM, callback_data=WIPE_CONFIRM_CALLBACK),
+        types.InlineKeyboardButton(text=BTN_WIPE_CANCEL, callback_data=WIPE_CANCEL_CALLBACK),
+    )
+    bot.send_message(message.chat.id, MSG_WIPE_CONFIRM.format(count=count), reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in (WIPE_CONFIRM_CALLBACK, WIPE_CANCEL_CALLBACK))
+def handle_wipe_decision(call: telebot.types.CallbackQuery) -> None:
+    """Кнопки /wipe. Владельца проверяем и здесь: callback может прислать любой одобренный."""
+    if call.from_user.id != OWNER_ID:
+        logger.warning('Попытка /wipe не от владельца: user_id=%s', call.from_user.id)
+        bot.answer_callback_query(call.id, MSG_ACCESS_OWNER_ONLY, show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    if call.data == WIPE_CANCEL_CALLBACK:
+        bot.edit_message_text(MSG_WIPE_CANCELLED, call.message.chat.id, call.message.message_id)
+        return
+    try:
+        deleted = wipe_articles()
+    except Exception as e:
+        logger.exception('Ошибка удаления всех статей')
+        bot.edit_message_text(MSG_ERROR.format(error=_error_text(e)), call.message.chat.id, call.message.message_id)
+        return
+    # Незавершённые диалоги ссылаются на удалённые статьи — сбрасываем у всех
+    for state in (pending_article_links, pending_reassign, pending_assign_list, pending_cache_urls):
+        state.clear()
+    logger.info('Владелец удалил все статьи: %d', deleted)
+    bot.edit_message_text(MSG_WIPE_DONE.format(count=deleted), call.message.chat.id, call.message.message_id)
 
 
 @bot.message_handler(commands=['model'])
