@@ -11,3 +11,4 @@ ideas_md/
 credentials.json
 secrets/
 .pytest_cache/
+work/
