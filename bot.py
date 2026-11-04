@@ -32,6 +32,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import telebot
 from telebot import types
@@ -2197,22 +2198,21 @@ def handle_digest(message: telebot.types.Message) -> None:
     """/digest on|off; anything else shows the current state and the usage hint."""
     chat_id, user_id = message.chat.id, message.from_user.id
     args = _command_args(message)
+    # Only the DB work sits in the try: a Telegram send failure is not a settings error
     try:
         if args == ['on']:
             habr_store.set_digest_enabled(user_id, True)
-            bot.send_message(chat_id, MSG_DIGEST_ON)
-            return
-        if args == ['off']:
+            reply = MSG_DIGEST_ON
+        elif args == ['off']:
             habr_store.set_digest_enabled(user_id, False)
-            bot.send_message(chat_id, MSG_DIGEST_OFF)
-            return
-        enabled = habr_store.get_digest_enabled(user_id)
+            reply = MSG_DIGEST_OFF
+        else:
+            state = MSG_DIGEST_STATE_ON if habr_store.get_digest_enabled(user_id) else MSG_DIGEST_STATE_OFF
+            reply = MSG_DIGEST_USAGE.format(state=state)
     except Exception as e:
         logger.exception('/digest: ошибка настроек для %s', user_id)
-        bot.send_message(chat_id, MSG_ERROR.format(error=_error_text(e)))
-        return
-    state = MSG_DIGEST_STATE_ON if enabled else MSG_DIGEST_STATE_OFF
-    bot.send_message(chat_id, MSG_DIGEST_USAGE.format(state=state))
+        reply = MSG_ERROR.format(error=_error_text(e))
+    bot.send_message(chat_id, reply)
 
 
 @bot.message_handler(commands=['digest_now'])
@@ -2237,16 +2237,22 @@ def handle_digest_now(message: telebot.types.Message) -> None:
     bot.send_message(chat_id, MSG_DIGEST_NOW_STARTED if started else digest.TEXT_BUSY)
 
 
+def _run_digest_scheduler() -> None:
+    """Scheduler thread body; digest._spawn names threads 'digest-now', so rename for logs."""
+    threading.current_thread().name = 'digest-scheduler'
+    digest.run_scheduler(digest_send, OWNER_ID, is_allowed)
+
+
 def _start_digest_scheduler() -> None:
     """Starts the scheduler daemon thread; any failure is logged and never stops polling."""
     try:
         logger.info('Дайджест: DIGEST_TIME=%s МСК, ближайший запуск %s',
                     digest.digest_time().strftime('%H:%M'),
-                    digest.next_run_time(digest._now()).strftime('%Y-%m-%d %H:%M'))
+                    digest.next_run_time(datetime.now(feed.MSK)).strftime('%Y-%m-%d %H:%M'))
     except Exception:
         logger.exception('Дайджест: не удалось вычислить время запуска')
     try:
-        digest._spawn(lambda: digest.run_scheduler(digest_send, OWNER_ID, is_allowed))
+        digest._spawn(_run_digest_scheduler)
     except Exception:
         logger.exception('Дайджест: не удалось запустить планировщик')
 

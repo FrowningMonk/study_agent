@@ -412,8 +412,10 @@ def test_digest_now_spawn_failure_reported(tg, tmp_db, monkeypatch, caplog):
         raise RuntimeError('cannot start thread')
     monkeypatch.setattr(digest, '_spawn', broken)
 
-    _send(OWNER, '/digest_now')
+    with caplog.at_level(logging.ERROR, logger='bot'):
+        _send(OWNER, '/digest_now')
 
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
     (reply,) = _replies(tg, OWNER)
     assert 'cannot start thread' not in reply and reply.startswith('Дайджест не собран')
     tg.clear()
@@ -436,15 +438,15 @@ def test_digest_commands_with_url_argument_not_handled_as_url(tg, tmp_db, llm, j
     assert _settings(tmp_db, FRIEND) is None
 
 
-def test_no_real_llm_in_bot_digest_tests(tg, tmp_db, habr, sync_spawn, describe, now):
+def test_no_real_llm_in_bot_digest_tests(tg, tmp_db, habr, sync_spawn, describe, now, monkeypatch):
+    real_calls = []
+    monkeypatch.setattr(summarizer, 'generate_short_description', lambda *a, **kw: real_calls.append(a))
     habr.fill(digest.digest_day(now), site=3)
 
     _send(OWNER, '/digest_now')
 
     assert describe.calls == ['Статья 100', 'Статья 101', 'Статья 102']
-    assert digest._DEFAULT_DESCRIBE is describe
-    with pytest.raises(AssertionError):
-        summarizer.generate_short_description('t', 'l')
+    assert real_calls == []
 
 
 def test_digest_now_after_revoked_user_settings_inert(tg, tmp_db, habr, sync_spawn, now):
@@ -498,6 +500,29 @@ def test_digest_list_buttons_summary_and_more(tg, tmp_db, habr, llm, sync_spawn,
     assert text.endswith(expected_end)
     assert markup is not None and all(cb.startswith('hl:s:') for cb in _callbacks(markup))
     assert _answers(tg) == [None]
+
+    # The hubs part is a separate list with its own id, same handlers
+    hubs_cbs = _callbacks(hubs_markup)
+    assert hubs_cbs[0].split(':')[2] != site_cbs[0].split(':')[2]
+    tg.clear()
+    _press(OWNER, hubs_cbs[0], update_id=4)
+    assert llm.calls[-1] == habr_api.canonical_url(200)
+    _press(OWNER, hubs_cbs[-1], update_id=5)             # positions 6..7 of 7
+    (text, markup) = _messages_with_markup(tg, OWNER)[-1]
+    assert text.endswith(expected_end) and 'Статья 206' in text
+    assert len(_callbacks(markup)) == 2
+
+
+def test_digest_settings_error_reported(tg, tmp_db, monkeypatch):
+    def broken(*a, **kw):
+        raise RuntimeError('db is locked')
+    monkeypatch.setattr(habr_store, 'set_digest_enabled', broken)
+
+    _send(FRIEND, '/digest off')
+
+    (reply,) = _replies(tg, FRIEND)
+    assert reply.startswith('Ошибка')
+    assert _settings(tmp_db, FRIEND) is None
 
 
 def test_digest_list_foreign_user_rejected(tg, tmp_db, habr, llm, sync_spawn, now):
