@@ -248,8 +248,8 @@ def test_summary_buttons_one_to_five(tmp_db):
         summaries = [(t, cb) for row in rows for t, cb in row if t.startswith('Саммари')]
         assert summaries == [(f'Саммари {n}', f'hl:s:{list_id}:{n}') for n in range(1, 6)]
         for _, cb in summaries:
-            decoded = feed.resolve_summary_click(cb, USER)
-            assert decoded is not None
+            decoded = feed.decode_list_callback(cb, USER)
+            assert decoded is not None and decoded.action == 's'
             assert decoded.habr_id == persisted(list_id)[decoded.value - 1]
     for cb in all_callbacks(result):
         assert len(cb.encode('utf-8')) <= 64

@@ -211,7 +211,8 @@ def render_empty_day(digest_date: date) -> list[tuple[str, None]]:
 
 
 def render_page(list_id: int, offset: int) -> tuple[str, feed.Rows] | None:
-    """Paging page of a persisted digest list; the last page ends with 'Это все статьи за …'."""
+    """Paging page of a persisted digest list (used by dry_run); the last page ends with
+    'Это все статьи за …'."""
     return feed.render_list_page(list_id, offset)
 
 

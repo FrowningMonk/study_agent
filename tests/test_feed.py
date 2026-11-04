@@ -347,10 +347,11 @@ def test_callback_out_of_range_rejected(tmp_db):
 
 def test_callback_valid_summary_returns_habr_id(tmp_db):
     list_id = _make_list(n=12)
-    click = feed.resolve_summary_click(f'hl:s:{list_id}:12', 1)
-    assert click.habr_id == 1012 and click.kind == 'feed'
-    assert feed.resolve_summary_click(f'hl:m:{list_id}:10', 1) is None
-    assert feed.resolve_summary_click('hl:s:x:1', 1) is None
+    click = feed.decode_list_callback(f'hl:s:{list_id}:12', 1)
+    assert click.action == 's' and click.habr_id == 1012 and click.kind == 'feed'
+    more = feed.decode_list_callback(f'hl:m:{list_id}:10', 1)
+    assert more.action == 'm' and more.habr_id is None
+    assert feed.decode_list_callback('hl:s:x:1', 1) is None
 
 
 def test_callback_data_max_64_bytes():
@@ -418,7 +419,7 @@ def test_callback_never_calls_habr_or_llm(tmp_db, monkeypatch):
     list_id = _make_list(n=25)
     assert feed.decode_list_callback('hl:s:١:1', 1) is None
     assert feed.decode_list_callback(f'hl:s:{list_id}:3', 2) is None
-    assert feed.resolve_summary_click(f'hl:s:{list_id}:3', 1).habr_id == 1003
+    assert feed.decode_list_callback(f'hl:s:{list_id}:3', 1).habr_id == 1003
     assert feed.decode_list_callback(f'hl:m:{list_id}:10', 1) is not None
     assert feed.render_list_page(list_id, 10) is not None
 
@@ -562,7 +563,7 @@ def test_registry_same_user_second_click_one_generation():
     assert not thread.is_alive()
     assert calls == [1]
     assert out['outcome'] == feed.GenerationOutcome('summary', None, set())
-    assert not registry.is_running(5)
+    assert len(registry) == 0
 
 
 def test_registry_other_user_becomes_waiter():
@@ -585,7 +586,7 @@ def test_registry_other_user_becomes_waiter():
     thread.join(5)
     assert out['outcome'].waiters == {200}
     assert out['outcome'].result == 'summary'
-    assert not registry.is_running(5) and len(registry) == 0
+    assert len(registry) == 0
     assert registry.finish(5) == set()
 
 
@@ -600,7 +601,7 @@ def test_registry_cleared_after_exception():
 
     outcome = registry.run(5, failing)
     assert outcome.error is error and outcome.result is None and outcome.waiters == {200}
-    assert not registry.is_running(5)
+    assert len(registry) == 0
     assert registry.click(5, 100).kind == feed.CLICK_STARTED
 
 
@@ -613,7 +614,7 @@ def test_registry_cleared_after_base_exception():
 
     with pytest.raises(KeyboardInterrupt):
         registry.run(5, interrupted)
-    assert not registry.is_running(5)
+    assert len(registry) == 0
 
 
 def test_registry_distinct_habr_ids_independent():
@@ -622,7 +623,7 @@ def test_registry_distinct_habr_ids_independent():
     assert registry.click(2, 100).kind == feed.CLICK_STARTED
     assert registry.click(2, 200).kind == feed.CLICK_WAITER
     assert registry.finish(1) == set()
-    assert registry.is_running(2) and not registry.is_running(1)
+    assert len(registry) == 1                     # only habr_id 2 is still in flight
     assert registry.finish(2) == {200}
 
 
@@ -632,7 +633,7 @@ def test_module_registry_is_single_instance():
     registry.click(9, 1)
     feed._reset_for_tests()
     assert feed.REGISTRY is registry
-    assert not registry.is_running(9)
+    assert len(registry) == 0
 
 
 # =============================================================================

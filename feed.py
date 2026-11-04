@@ -10,8 +10,7 @@ Contents:
     - ranked-list persistence: create_list, load_page;
     - rendering (Decision 7): render_page / render_list_page -> (text, rows), where rows
       are `list[list[tuple[str, str]]]` of (button text, callback data);
-    - callback codec (Decision 5): encode_summary, encode_more, decode_list_callback,
-      resolve_summary_click;
+    - callback codec (Decision 5): encode_summary, encode_more, decode_list_callback;
     - InFlightRegistry (Decision 13) and the single module instance REGISTRY;
     - view_source(list_kind) for habr_store.record_view.
 
@@ -591,16 +590,6 @@ def decode_list_callback(data: Any, user_id: int, now: datetime | None = None) -
     return ListCallback(action, list_id, value, kind, header['list_date'], total, habr_id)
 
 
-def resolve_summary_click(data: Any, user_id: int, now: datetime | None = None) -> ListCallback | None:
-    """Valid `hl:s` click (with habr_id) or None (stale, or not a summary click)."""
-    result = decode_list_callback(data, user_id, now)
-    if result is None or result.action != 's':
-        if result is not None:
-            _stale(user_id, data, 'not a summary click')
-        return None
-    return result
-
-
 # =============================================================================
 # In-flight summary registry (Decision 13)
 # =============================================================================
@@ -669,10 +658,6 @@ class InFlightRegistry:
         finally:
             waiters = self.finish(habr_id)
         return GenerationOutcome(result, error, waiters)
-
-    def is_running(self, habr_id: int) -> bool:
-        with self._lock:
-            return habr_id in self._entries
 
     def clear(self) -> None:
         with self._lock:

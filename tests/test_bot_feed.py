@@ -871,7 +871,7 @@ def test_summary_thread_named_by_habr_id(tg, habr, llm, monkeypatch):
 def test_reset_for_tests_clears_registry_used_by_bot(tg, habr, llm, captured_spawn):
     list_id = _list_for(FRIEND)
     _press(FRIEND, f'hl:s:{list_id}:1')
-    assert feed.REGISTRY.is_running(HABR_ID)
+    assert len(feed.REGISTRY) == 1                # HABR_ID in flight (job captured, not run)
     assert not [v for v in vars(bot_module).values() if isinstance(v, feed.InFlightRegistry)]
 
     feed._reset_for_tests()
