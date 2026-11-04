@@ -112,6 +112,7 @@ _ARTICLE_PATH_RE = re.compile(
     r'(?:/(?:comments/?)?)?'
 )
 _DIGITS_RE = re.compile(r'[0-9]{1,12}')
+_SAFE_CODE_RE = re.compile(r'[A-Z][A-Z0-9_]{0,39}')
 
 # Throttle state: one per process, shared by handlers, digest and backfill threads
 _lock = threading.Lock()
@@ -142,15 +143,19 @@ class HabrUnavailable(Exception):
         kind: short category — 'timeout', 'network', 'http', 'redirect',
             'too_large', 'invalid_json', 'invalid_shape', 'partial'.
         status: HTTP status when one was received, else None.
+        error_code: kek `errorCode` of a 4xx error envelope (fetch_article), only when it
+            is a short upper-case token (log-safe, never body text), else None.
     """
 
-    def __init__(self, kind: str, status: int | None = None, detail: str = ''):
+    def __init__(self, kind: str, status: int | None = None, detail: str = '',
+                 error_code: str | None = None):
         message = f'Habr unavailable: {kind}' + (f' (HTTP {status})' if status is not None else '')
         if detail:
             message += f': {detail}'
         super().__init__(message)
         self.kind = kind
         self.status = status
+        self.error_code = error_code if isinstance(error_code, str) and _SAFE_CODE_RE.fullmatch(error_code) else None
 
 
 class HabrBusy(Exception):
@@ -486,16 +491,19 @@ def fetch_article(habr_id: int, *, wait_timeout: float | None = None,
     started = time.monotonic()
     try:
         status, body = _request(f'articles/{habr_id}/', {'fl': 'ru', 'hl': 'ru'}, wait_timeout, deadline)
-        if status in _GONE_BY_STATUS:
-            code = _error_code(body)          # the body is already size-capped by _request
-            if code in _GONE_BY_STATUS[status]:
+        if status != 200:
+            # 4xx: the errorCode decides "gone" vs "unknown"; it is kept (sanitized) for logs
+            code = _error_code(body) if 400 <= status < 500 else None   # body already size-capped
+            if code in _GONE_BY_STATUS.get(status, ()):
                 logger.info('Habr article unavailable: id=%d, status=%d, code=%s', habr_id, status, code)
                 raise HabrNotFound(code, status)
-            raise HabrUnavailable('http', status)
-        if status != 200:
-            raise HabrUnavailable('http', status)
+            raise HabrUnavailable('http', status, error_code=code)
         data = _decode_json(status, body)
-        item = _normalize_item(data, expected_id=habr_id)
+        try:
+            item = _normalize_item(data, expected_id=habr_id)
+        except HabrUnavailable as e:
+            e.status = status if e.status is None else e.status   # a 200 whose content is unusable
+            raise
     except HabrUnavailable as e:
         logger.warning('Habr article fetch failed: id=%d, %s', habr_id, e)
         raise

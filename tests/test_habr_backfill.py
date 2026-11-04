@@ -177,9 +177,15 @@ def test_not_found_marks_unavailable_and_not_requested_again(tmp_db, habr, sleep
     habr_api.HabrUnavailable('http', 408),
     habr_api.HabrUnavailable('timeout'),
     habr_api.HabrUnavailable('network', detail='ConnectionError'),
-    habr_api.HabrUnavailable('invalid_shape', 200),
+    habr_api.HabrUnavailable('http', 500),
+    habr_api.HabrUnavailable('too_large', 403),        # a non-http kind with a 4xx status
+    habr_api.HabrUnavailable('invalid_json', 502),
+    habr_api.HabrUnavailable('invalid_shape'),         # no status (e.g. a list-level shape error)
+    habr_api.HabrUnavailable('redirect', 301),
+    habr_api.HabrUnavailable('partial', 200),
     habr_api.HabrBusy('busy'),
-], ids=['http-503', 'http-429', 'http-408', 'timeout', 'network', 'invalid-shape', 'busy'])
+], ids=['http-503', 'http-429', 'http-408', 'timeout', 'network', 'http-500', 'too-large-403',
+        'invalid-json-502', 'invalid-shape-no-status', 'redirect-301', 'partial-200', 'busy'])
 def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps, error):
     for habr_id in (1, 2, 3):
         _save(tmp_db, habr_id)
@@ -224,9 +230,91 @@ def test_unknown_403_code_skipped_and_next_id_processed(tmp_db, sleeps, monkeypa
     assert habr_store.get_habr_article(odd) is None                      # not marked unavailable
     assert habr_store.get_habr_article(normal)['fetched_at'] is not None
     assert habr_store.list_backfill_candidates() == [odd]                # retried on the next start
-    skip_logs = [r.getMessage() for r in caplog.records if 'skipped' in r.getMessage()]
-    assert skip_logs == [f'Backfill: skipped id={odd} (HabrUnavailable http HTTP 403), retried on next start']
-    assert not any('SECRET-TEXT' in r.getMessage() or 'SOMETHING_NEW' in r.getMessage() for r in caplog.records)
+    (skip_log,) = [r.getMessage() for r in caplog.records if 'skipped' in r.getMessage()]
+    assert f'id={odd}' in skip_log and 'HabrUnavailable http HTTP 403' in skip_log
+    assert 'code=SOMETHING_NEW' in skip_log                         # sanitized errorCode helps mapping
+    assert not any('SECRET-TEXT' in r.getMessage() for r in caplog.records)
+
+
+def test_unsafe_error_code_never_logged(tmp_db, sleeps, monkeypatch, caplog):
+    _save(tmp_db, 1)
+    monkeypatch.setattr(habr_api.requests, 'get', lambda url, **kw: KekResponse(
+        403, {'errorCode': 'evil code; with text', 'message': 'SECRET-TEXT'}))
+    with caplog.at_level(logging.WARNING, logger='habr_backfill'):
+        assert habr_backfill.run_once()['skipped'] == 1
+    text = ' '.join(r.getMessage() for r in caplog.records)
+    assert 'evil' not in text and 'SECRET-TEXT' not in text and 'code=' not in text
+
+
+@pytest.mark.parametrize('error', [
+    habr_api.HabrUnavailable('http', 400),
+    habr_api.HabrUnavailable('http', 404),
+    habr_api.HabrUnavailable('http', 410),
+    habr_api.HabrUnavailable('http', 499),
+    habr_api.HabrUnavailable('invalid_shape', 200),
+    habr_api.HabrUnavailable('too_large', 200),
+    habr_api.HabrUnavailable('invalid_json', 200),
+], ids=['http-400', 'http-404', 'http-410', 'http-499', 'invalid-shape-200', 'too-large-200',
+        'invalid-json-200'])
+def test_per_article_failure_skipped_next_id_processed(tmp_db, habr, sleeps, error):
+    for habr_id in (1, 2):
+        _save(tmp_db, habr_id)
+    habr.errors[1] = error
+
+    stats = habr_backfill.run_once()
+
+    assert habr.ids == [1, 2]
+    assert stats['skipped'] == 1 and stats['filled'] == 1 and stats['stopped_on_error'] is False
+    assert habr_store.get_habr_article(1) is None                    # not marked
+    assert habr_store.list_backfill_candidates() == [1]
+
+
+def test_unusable_200_article_skipped_with_real_parsing(tmp_db, sleeps, monkeypatch, fixture_text):
+    """A 200 whose article fails normalization (real habr_api) is skipped, not a stop."""
+    article = json.loads(fixture_text('habr_article.json'))
+    normal = int(article['id'])
+    broken = dict(article, id='1102000')
+    del broken['leadData']
+    for habr_id in (1102000, normal):
+        _save(tmp_db, habr_id)
+
+    def kek(url, params=None, **kw):
+        return KekResponse(200, broken if '/articles/1102000/' in url else article)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+    stats = habr_backfill.run_once()
+    assert stats['skipped'] == 1 and stats['filled'] == 1 and stats['stopped_on_error'] is False
+
+
+def test_consecutive_skips_stop_the_run(tmp_db, habr, sleeps, monkeypatch, caplog):
+    """MAX_CONSECUTIVE_SKIPS per-article failures in a row look like an API change: stop."""
+    assert habr_backfill.MAX_CONSECUTIVE_SKIPS == 5
+    monkeypatch.setattr(habr_backfill, 'MAX_CONSECUTIVE_SKIPS', 3)
+    for habr_id in range(1, 6):
+        _save(tmp_db, habr_id)
+        habr.errors[habr_id] = habr_api.HabrUnavailable('invalid_shape', 200)
+
+    with caplog.at_level(logging.WARNING, logger='habr_backfill'):
+        stats = habr_backfill.run_once()
+
+    assert habr.ids == [1, 2, 3]
+    assert stats['skipped'] == 3 and stats['stopped_on_error'] is True
+    assert any('in a row' in r.getMessage() for r in caplog.records)
+
+
+def test_skip_streak_resets_after_fill_or_unavailable(tmp_db, habr, sleeps, monkeypatch):
+    monkeypatch.setattr(habr_backfill, 'MAX_CONSECUTIVE_SKIPS', 3)
+    for habr_id in range(1, 10):
+        _save(tmp_db, habr_id)
+    for habr_id in (1, 2, 4, 5, 7, 8):
+        habr.errors[habr_id] = habr_api.HabrUnavailable('http', 410)
+    habr.errors[6] = habr_api.HabrNotFound('NOT_FOUND')               # 3 = fill, 6 = mark: both reset
+
+    stats = habr_backfill.run_once()
+
+    assert habr.ids == list(range(1, 10))
+    assert stats == {'candidates': 9, 'requests': 9, 'filled': 2, 'unavailable': 1, 'skipped': 6,
+                     'stopped_on_error': False}
 
 
 def test_server_error_still_stops_after_skip(tmp_db, habr, sleeps):

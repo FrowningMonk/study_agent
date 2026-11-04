@@ -525,6 +525,31 @@ def test_fetch_article_in_drafts_is_not_found_with_status(fake_habr):
     assert excinfo.value.error_code == 'IN_DRAFTS' and excinfo.value.status == 403
 
 
+def test_fetch_article_error_code_and_content_status(fake_habr, article_fixture):
+    fake_habr(FakeResponse(403, {'errorCode': 'SOMETHING_NEW', 'message': 'x'}))
+    with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+        habr_api.fetch_article(1)
+    assert (excinfo.value.kind, excinfo.value.status, excinfo.value.error_code) == ('http', 403, 'SOMETHING_NEW')
+
+    for body in ({'errorCode': 'lower case'}, {'errorCode': 'A' * 41}, '<html>x</html>'):
+        fake_habr(FakeResponse(410, body))
+        with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+            habr_api.fetch_article(1)
+        assert excinfo.value.error_code is None
+
+    fake_habr(FakeResponse(503, {'errorCode': 'OVERLOAD'}))           # 5xx: body not parsed
+    with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+        habr_api.fetch_article(1)
+    assert excinfo.value.error_code is None
+
+    broken = dict(article_fixture)
+    del broken['leadData']
+    fake_habr(FakeResponse(200, broken))
+    with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+        habr_api.fetch_article(int(article_fixture['id']))
+    assert (excinfo.value.kind, excinfo.value.status) == ('invalid_shape', 200)
+
+
 def test_fetch_article_normalizes_fixture(fake_habr, article_fixture):
     fake = fake_habr(FakeResponse(200, article_fixture))
 
