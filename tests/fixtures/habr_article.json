@@ -1,0 +1,120 @@
+{
+ "id": "1102920",
+ "timePublished": "2026-11-03T08:06:04+00:00",
+ "isCorporative": true,
+ "lang": "ru",
+ "titleHtml": "GLOBIT TMS&amp;YMS: Как мы решили проблему с «зоопарком» систем на складе крупного ретейлера «Глобус»",
+ "leadData": {
+  "textHtml": "<p>Всем привет! Хотим поделиться опытом реализации логистического решения для крупного ретейлера.</p><p>Статья будет полезна тем, кто ищет решение для управления транспортной логистикой (<abbr class=\"habraabbr\" title=\"Transport Management System\" data-title=\"&lt;p&gt;Transport Management System&lt;/p&gt;&lt;p&gt;&lt;/p&gt;\" data-abbr=\"TMS\">TMS</abbr>) и грузовым двором (<abbr class=\"habraabbr\" title=\"Yard Management System\" data-title=\"&lt;p&gt;Yard Management System&lt;/p&gt;&lt;p&gt;&lt;/p&gt;\" data-abbr=\"YMS\">YMS</abbr>) в одной системе.</p>",
+  "imageUrl": "https://habrastorage.org/extt/29/44/dd/2944dd2f4fa657f252346f777b1ce631.jpg",
+  "buttonTextHtml": "Читать далее",
+  "image": {
+   "url": "https://habrastorage.org/extt/29/44/dd/2944dd2f4fa657f252346f777b1ce631.jpg",
+   "fit": "cover",
+   "positionY": 0,
+   "positionX": 0
+  }
+ },
+ "editorVersion": "2.0",
+ "postType": "article",
+ "postLabels": [],
+ "statistics": {
+  "commentsCount": 0,
+  "favoritesCount": 6,
+  "readingCount": 372,
+  "score": 10,
+  "votesCount": 8,
+  "votesCountPlus": 8,
+  "votesCountMinus": 0,
+  "reach": 6064,
+  "readers": 235
+ },
+ "hubs": [
+  {
+   "id": "23940",
+   "alias": "globit",
+   "type": "corporative",
+   "title": "Блог компании ГЛОБИТ",
+   "titleHtml": "Блог компании ГЛОБИТ",
+   "isProfiled": false
+  },
+  {
+   "id": "22004",
+   "alias": "transport",
+   "type": "collective",
+   "title": "Транспорт",
+   "titleHtml": "Транспорт",
+   "isProfiled": false
+  },
+  {
+   "id": "397",
+   "alias": "analysis_design",
+   "type": "collective",
+   "title": "Анализ и проектирование систем",
+   "titleHtml": "Анализ и проектирование систем",
+   "isProfiled": true
+  }
+ ],
+ "flows": [
+  {
+   "id": "1",
+   "alias": "develop",
+   "title": "Разработка",
+   "titleHtml": "Разработка"
+  },
+  {
+   "id": "7",
+   "alias": "popsci",
+   "title": "Научпоп",
+   "titleHtml": "Научпоп"
+  }
+ ],
+ "textHtml": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>Всем привет! Хотим поделиться опытом&nbsp;&hellip;</p></div>",
+ "tags": [
+  {
+   "titleHtml": "TMS"
+  },
+  {
+   "titleHtml": "YMS"
+  },
+  {
+   "titleHtml": "автоматизация склада"
+  },
+  {
+   "titleHtml": "управление двором"
+  },
+  {
+   "titleHtml": "логистика"
+  },
+  {
+   "titleHtml": "интеграция систем"
+  },
+  {
+   "titleHtml": "1С"
+  }
+ ],
+ "commentsEnabled": {
+  "status": true,
+  "reason": null
+ },
+ "rulesRemindEnabled": false,
+ "votesEnabled": true,
+ "status": "published",
+ "plannedPublishTime": null,
+ "isSeo": false,
+ "mode": "standard",
+ "checked": null,
+ "hasPinnedComments": false,
+ "format": "case",
+ "multiwidgetUuid": null,
+ "readingTime": 4,
+ "complexity": "low",
+ "isEditorial": false,
+ "flowNew": {
+  "id": "26",
+  "title": "Менеджмент",
+  "alias": "management"
+ },
+ "hasRegionalRestrictions": false,
+ "canExplanation": true
+}

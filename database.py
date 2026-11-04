@@ -7,8 +7,11 @@
     - get_cached_summary(url) - получение сохранённого конспекта
     - get_article_by_url(url) - получение статьи по URL
     - get_article_by_id(id) - получение статьи по ID
+    - get_article_by_habr_id(habr_id) - самая ранняя статья с этим Habr id
     - save_article(...) - сохранение статьи с конспектом
     - update_article(...) - обновление конспекта существующей статьи
+    - update_article_by_id(...) - обновление конспекта по ID статьи
+    - is_article_linked_to_other_users_idea(...) - привязана ли статья к чужой идее
     - delete_article(id) - удаление статьи по ID
     - count_articles() - количество статей
     - wipe_articles() - удаление всех статей и их привязок (идеи остаются)
@@ -56,8 +59,11 @@ __all__ = [
     'get_cached_summary',
     'get_article_by_url',
     'get_article_by_id',
+    'get_article_by_habr_id',
     'save_article',
     'update_article',
+    'update_article_by_id',
+    'is_article_linked_to_other_users_idea',
     'delete_article',
     'count_articles',
     'wipe_articles',
@@ -216,6 +222,19 @@ def init_db() -> None:
             logger.info("Миграция: добавлено поле generated_md в ideas")
         except sqlite3.OperationalError:
             pass
+        # Миграция: Habr id статьи (обычный индекс, не UNIQUE — дубли с utm-хвостами остаются)
+        try:
+            cursor.execute("ALTER TABLE articles ADD COLUMN habr_id INTEGER")
+            conn.commit()
+            logger.info("Миграция: добавлено поле habr_id в articles")
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_articles_habr_id ON articles(habr_id)")
+        conn.commit()
+        # Ленивый импорт: habr_store сам импортирует database
+        import habr_store
+        habr_store.init_schema(conn)
+        habr_store.migrate_articles(conn)
         # Чистка сирот: связи, оставшиеся с тех пор, когда внешние ключи были выключены
         cursor.execute(
             """
@@ -312,11 +331,32 @@ def get_article_by_id(article_id: int) -> dict | None:
         conn.close()
 
 
+def get_article_by_habr_id(habr_id: int) -> dict | None:
+    """
+    Самая ранняя запись статьи с этим Habr id (дубли не сливаются).
+
+    Args:
+        habr_id: числовой id статьи на Хабре
+
+    Returns:
+        dict с полями статьи или None если не найдена
+    """
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            'SELECT * FROM articles WHERE habr_id = ? ORDER BY id LIMIT 1', (habr_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def save_article(
     article_data: dict,
     summary: str,
     model: str,
     user_id: int | None = None,
+    habr_id: int | None = None,
 ) -> int:
     """
     Сохраняет статью с конспектом в базу.
@@ -326,6 +366,7 @@ def save_article(
         summary: сгенерированный конспект
         model: использованная модель
         user_id: telegram user_id
+        habr_id: числовой id статьи на Хабре (None для остальных источников)
 
     Returns:
         ID созданной записи
@@ -363,8 +404,8 @@ def save_article(
                 published_date,
                 github_stars, github_language, github_description,
                 content, summary,
-                model_used, user_id, processed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                model_used, user_id, processed_at, habr_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 article_data.get('url'),
@@ -380,6 +421,7 @@ def save_article(
                 model,
                 user_id,
                 datetime.now().isoformat(),
+                habr_id,
             ),
         )
         conn.commit()
@@ -426,6 +468,49 @@ def update_article(
         if updated:
             logger.debug("Статья обновлена: url=%s", url[:80])
         return updated
+    finally:
+        conn.close()
+
+
+def update_article_by_id(article_id: int, summary: str, model: str) -> bool:
+    """
+    Updates the summary and model of the article with this id.
+
+    Used for Habr articles, whose identity is habr_id rather than the URL string.
+
+    Returns:
+        True if the row exists and was updated.
+    """
+    conn = _get_connection()
+    try:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE articles
+                SET summary = ?, model_used = ?, processed_at = ?
+                WHERE id = ?
+                """,
+                (summary, model, datetime.now().isoformat(), article_id),
+            )
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def is_article_linked_to_other_users_idea(article_id: int, user_id: int) -> bool:
+    """True if an idea owned by a user other than `user_id` links this article."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM idea_articles ia
+            JOIN ideas i ON i.id = ia.idea_id
+            WHERE ia.article_id = ? AND i.user_id IS NOT ?
+            LIMIT 1
+            """,
+            (article_id, user_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 
@@ -669,6 +754,9 @@ def link_article_to_idea(article_id: int, idea_id: int, user_id: int) -> bool:
     """
     Привязывает статью к идее с проверкой ownership.
 
+    Идея должна принадлежать пользователю. Статья — принадлежать ему, быть без
+    владельца или быть просмотренной им (article_views по её habr_id).
+
     Args:
         article_id: ID статьи
         idea_id: ID идеи
@@ -689,10 +777,23 @@ def link_article_to_idea(article_id: int, idea_id: int, user_id: int) -> bool:
         if not cursor.fetchone():
             return False
 
-        # Проверяем ownership статьи (user_id может быть NULL для старых статей)
+        # Доступ к статье (Decision 20): своя, без владельца (старые статьи)
+        # или пользователь видел статью с этим habr_id (запись в article_views).
+        # Строки без habr_id проверяются только по владельцу.
         cursor.execute(
-            'SELECT 1 FROM articles WHERE id = ? AND (user_id = ? OR user_id IS NULL)',
-            (article_id, user_id),
+            """
+            SELECT 1 FROM articles a
+            WHERE a.id = ?
+              AND (
+                  a.user_id = ?
+                  OR a.user_id IS NULL
+                  OR (a.habr_id IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM article_views v
+                      WHERE v.user_id = ? AND v.habr_id = a.habr_id
+                  ))
+              )
+            """,
+            (article_id, user_id, user_id),
         )
         if not cursor.fetchone():
             return False

@@ -9,75 +9,8 @@ import os
 import pytest
 from telebot import types
 
-# bot.py падает при импорте без токена и OWNER_ID; .env (если есть) их переопределит
-os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123456:TEST')
-os.environ.setdefault('OWNER_ID', '1000')
-
-import bot as bot_module  # noqa: E402
-
-STRANGER = 2000
-FRIEND = 3000
-
-
-@pytest.fixture
-def tg(tmp_db, monkeypatch):
-    """Бот без сети и без потоков; возвращает список отправленного."""
-    sent: list[tuple[str, tuple, dict]] = []
-    b = bot_module.bot
-    for name in ('send_message', 'answer_callback_query', 'edit_message_text', 'reply_to', 'set_my_commands'):
-        monkeypatch.setattr(b, name, lambda *a, _n=name, **kw: sent.append((_n, a, kw)))
-    monkeypatch.setattr(b, 'threaded', False)
-    monkeypatch.setattr(b, 'owner_menu_set', True)
-    for state in _SESSION_STATES:
-        monkeypatch.setattr(bot_module, state, {})
-    tmp_db.create_access_request(FRIEND, 'friend', 'Друг')
-    tmp_db.set_user_status(FRIEND, 'approved')
-    yield sent
-    for chat_id in (STRANGER, FRIEND, bot_module.OWNER_ID):
-        b.clear_step_handler_by_chat_id(chat_id)
-
-
-_SESSION_STATES = ('pending_model_selection', 'pending_article_links', 'pending_reassign',
-                   'pending_assign_list', 'pending_md_generation')
-
-
-def _buttons(markup) -> list[str]:
-    return [btn.callback_data for row in markup.keyboard for btn in row]
-
-
-def _sent_to(sent: list, chat_id: int) -> list:
-    return [s for s in sent if s[0] == 'send_message' and s[1][0] == chat_id]
-
-
-def _message_update(user_id: int, text: str, chat_type: str = 'private', update_id: int = 1) -> types.Update:
-    return types.Update.de_json({
-        'update_id': update_id,
-        'message': {
-            'message_id': 10,
-            'date': 0,
-            'chat': {'id': user_id, 'type': chat_type},
-            'from': {'id': user_id, 'is_bot': False, 'first_name': 'U'},
-            'text': text,
-        },
-    })
-
-
-def _callback_update(user_id: int, data: str, update_id: int = 2) -> types.Update:
-    return types.Update.de_json({
-        'update_id': update_id,
-        'callback_query': {
-            'id': 'cb1',
-            'from': {'id': user_id, 'is_bot': False, 'first_name': 'U', 'username': 'u'},
-            'chat_instance': 'x',
-            'data': data,
-            'message': {
-                'message_id': 11,
-                'date': 0,
-                'chat': {'id': user_id, 'type': 'private'},
-                'text': 'old',
-            },
-        },
-    })
+import bot as bot_module
+from conftest import FRIEND, STRANGER, _buttons, _callback_update, _message_update, _sent_to
 
 
 def _register_next_step(chat_id: int, calls: list) -> None:
