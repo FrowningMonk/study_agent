@@ -24,6 +24,8 @@ Example:
 """
 
 import os
+import re
+from dataclasses import dataclass, field
 
 import telebot
 from telebot import types
@@ -40,7 +42,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+import pipeline
 from pipeline import ensure_directories, process_article, save_article_to_db
+import habr_api
+import habr_store
 from summarizer import (
     DEFAULT_MODEL, DEFAULT_PROVIDER, check_model_availability, check_providers_status,
     DEFAULT_MD_MODEL, DEFAULT_MD_PROVIDER,
@@ -50,9 +55,10 @@ import access
 from access import Gate, DecideOutcome, RequestOutcome
 from database import (
     init_db,
-    article_exists,
-    get_cached_summary,
     get_article_by_id,
+    get_article_by_url,
+    get_article_by_habr_id,
+    is_article_linked_to_other_users_idea,
     create_idea,
     get_user_ideas,
     get_idea_by_id,
@@ -81,13 +87,6 @@ TELEGRAM_TOKEN: str | None = os.getenv('TELEGRAM_BOT_TOKEN')
 # Константы Telegram
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096  # Максимальная длина одного сообщения в Telegram
 MESSAGE_CHUNK_SIZE = 4000  # Размер части при разбивке длинных сообщений (оставляем запас)
-
-# Словарь поддерживаемых источников: domain → имя парсера
-SUPPORTED_SOURCES: dict[str, str] = {
-    'habr.com': 'habr',
-    'github.com': 'github',
-    'infostart.ru': 'infostart',
-}
 
 # Формат: {user_id: {'provider': 'ollama', 'model': 'gemma3:12b'}}
 user_models: dict[int, dict[str, str]] = {}
@@ -399,18 +398,8 @@ def extract_url(text: str | None) -> str | None:
 
 
 def is_supported_url(url: str) -> bool:
-    """
-    Проверяет, поддерживается ли источник по URL.
-
-    Проверяет наличие доменов из SUPPORTED_SOURCES в URL.
-
-    Args:
-        url: URL для проверки
-
-    Returns:
-        True если источник поддерживается, иначе False
-    """
-    return any(source in url for source in SUPPORTED_SOURCES)
+    """Single routing implementation lives in pipeline (strict Habr parsing, Decision 3)."""
+    return pipeline.is_supported_url(url)
 
 
 def get_user_model(user_id: int) -> tuple[str, str]:
@@ -472,6 +461,9 @@ pending_cache_urls: dict[str, str] = {}
 # Формат: {user_id: {'article_data': dict, 'summary': str, 'model': str, 'selected_ideas': set[int]}}
 pending_article_links: dict[int, dict] = {}
 
+LINK_SKIP_CALLBACK = 'link_skip'
+_LINK_SKIP_ID_RE = re.compile(r'link_skip:([0-9]{1,12})')
+
 # Хранилище состояния перепривязки статей
 pending_reassign: dict[int, dict] = {}
 
@@ -505,6 +497,7 @@ def create_provider_keyboard(purpose: str) -> types.InlineKeyboardMarkup:
 def create_link_ideas_keyboard(
     ideas: list[dict],
     selected_ids: set[int],
+    article_id: int,
 ) -> types.InlineKeyboardMarkup:
     """
     Создаёт inline-клавиатуру для multiselect привязки к идеям.
@@ -512,6 +505,7 @@ def create_link_ideas_keyboard(
     Args:
         ideas: список идей пользователя
         selected_ids: множество ID уже выбранных идей
+        article_id: article the offer is about; carried by the skip button (Decision 20)
 
     Returns:
         InlineKeyboardMarkup с toggle-кнопками идей
@@ -535,7 +529,7 @@ def create_link_ideas_keyboard(
     )
     skip_btn = types.InlineKeyboardButton(
         text="❌ Не привязывать",
-        callback_data="link_skip",
+        callback_data=f"{LINK_SKIP_CALLBACK}:{article_id}",
     )
     keyboard.row(done_btn, skip_btn)
 
@@ -623,11 +617,13 @@ def _auto_generate_md(
     bot.send_message(chat_id, MSG_MD_READY, reply_markup=keyboard)
 
 
-def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int) -> None:
+def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int, created_now: bool = False) -> None:
     """
     Предлагает пользователю привязать статью к идеям.
 
     Показывает multiselect клавиатуру если у пользователя есть идеи.
+    `created_now` means the row was inserted in this same flow; only then may
+    "Не привязывать" delete it (Decision 20).
     """
     ideas = get_user_ideas(user_id)
 
@@ -639,28 +635,24 @@ def _offer_link_to_ideas(chat_id: int, user_id: int, article_id: int) -> None:
     pending_article_links[user_id] = {
         'article_id': article_id,
         'selected_ideas': set(),
+        'created_now': created_now,
     }
 
-    keyboard = create_link_ideas_keyboard(ideas, set())
+    keyboard = create_link_ideas_keyboard(ideas, set(), article_id)
     bot.send_message(chat_id, MSG_LINK_SELECT_IDEAS, reply_markup=keyboard)
 
 
-def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_SIZE) -> None:
+def split_long_message(text: str, chunk_size: int = MESSAGE_CHUNK_SIZE) -> list[str]:
     """
-    Отправляет длинное сообщение частями.
+    Splits text into the chunks send_long_message sends.
 
-    Разбивает текст по параграфам (двойной перенос строки).
-    Каждая часть не превышает chunk_size символов.
-
-    Args:
-        chat_id: ID чата для отправки
-        text: Текст сообщения
-        chunk_size: Максимальный размер одной части (по умолчанию 4000)
+    Paragraphs (double newline) are packed into chunks of at most chunk_size;
+    a single paragraph longer than chunk_size stays one chunk (as before).
     """
     # Простой случай - весь текст влезает в одно сообщение
     if len(text) <= chunk_size:
-        bot.send_message(chat_id, text)
-        return
+        return [text]
+    chunks: list[str] = []
 
     # Разбиваем на параграфы
     paragraphs = text.split('\n\n')
@@ -681,12 +673,34 @@ def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_S
         else:
             # Текущая часть заполнена - отправляем и начинаем новую
             if current_chunk:
-                bot.send_message(chat_id, current_chunk)
+                chunks.append(current_chunk)
             current_chunk = paragraph
 
     # Отправляем последнюю часть
     if current_chunk:
-        bot.send_message(chat_id, current_chunk)
+        chunks.append(current_chunk)
+    return chunks
+
+
+def send_long_message(chat_id: int, text: str, chunk_size: int = MESSAGE_CHUNK_SIZE) -> list[str]:
+    """
+    Отправляет длинное сообщение частями.
+
+    Разбивает текст по параграфам (двойной перенос строки).
+    Каждая часть не превышает chunk_size символов.
+
+    Args:
+        chat_id: ID чата для отправки
+        text: Текст сообщения
+        chunk_size: Максимальный размер одной части (по умолчанию 4000)
+
+    Returns:
+        The texts sent, in order.
+    """
+    chunks = split_long_message(text, chunk_size)
+    for chunk in chunks:
+        bot.send_message(chat_id, chunk)
+    return chunks
 
 
 def create_main_keyboard(is_owner: bool = False) -> types.ReplyKeyboardMarkup:
@@ -1030,8 +1044,9 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
     model, provider = get_user_model(user_id)
 
     if action == 'show':
-        # Показать сохранённый конспект
-        summary = get_cached_summary(url)
+        # Показать сохранённый конспект (Habr: the earliest row for the habr_id)
+        cached = _find_cached_article(url)
+        summary = cached['summary'] if cached else None
         if summary:
             bot.edit_message_text(
                 '📦 Сохранённый конспект:',
@@ -1065,9 +1080,10 @@ def handle_cache_callback(call: telebot.types.CallbackQuery) -> None:
         logger.info('Начинаю регенерацию: url=%s, model=%s, provider=%s, user_id=%s',
                     url, model, provider, user_id)
         try:
-            # skip_cache=True для принудительной перегенерации
+            # skip_cache=True для принудительной перегенерации; Habr is fetched
+            # via the canonical URL, the user URL is only stored
             result = process_article(
-                url,
+                _fetch_url(url),
                 model=model,
                 provider=provider,
                 user_id=user_id,
@@ -1134,7 +1150,7 @@ def handle_toggle_link(call: telebot.types.CallbackQuery) -> None:
     # Обновляем клавиатуру
     try:
         ideas = get_user_ideas(user_id)
-        keyboard = create_link_ideas_keyboard(ideas, selected)
+        keyboard = create_link_ideas_keyboard(ideas, selected, session['article_id'])
 
         bot.edit_message_reply_markup(
             chat_id=call.message.chat.id,
@@ -1201,34 +1217,55 @@ def handle_link_done(call: telebot.types.CallbackQuery) -> None:
         pending_article_links.pop(user_id, None)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == 'link_skip')
+def _parse_link_skip_id(data: str) -> int | None:
+    """Article id from `link_skip:{id}`; None for the legacy bare `link_skip` or anything malformed."""
+    match = _LINK_SKIP_ID_RE.fullmatch(data)
+    return int(match.group(1)) if match else None
+
+
+def _may_delete_on_skip(user_id: int, session: dict | None, callback_article_id: int | None) -> bool:
+    """Decision 20: delete only a row created in this flow by the caller and not linked to another user's idea."""
+    if not session or session.get('created_now') is not True:
+        return False
+    article_id = session.get('article_id')
+    if not article_id or callback_article_id != article_id:
+        return False
+    article = get_article_by_id(article_id)
+    if not article or article.get('user_id') != user_id:
+        return False
+    return not is_article_linked_to_other_users_idea(article_id, user_id)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == LINK_SKIP_CALLBACK or call.data.startswith(f'{LINK_SKIP_CALLBACK}:'),
+)
 def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
     """
     Обрабатывает отказ от привязки статьи к идеям.
-    При отказе статья удаляется из базы данных.
+
+    The row is deleted only under the Decision 20 conditions (see _may_delete_on_skip);
+    otherwise only the pending state is cleared.
     """
     user_id = call.from_user.id
 
     # Сразу отвечаем на callback, чтобы убрать "часики"
     bot.answer_callback_query(call.id)
 
-    # Проверяем наличие активной сессии для пользователя
-    if user_id not in pending_article_links:
+    session = pending_article_links.get(user_id)
+    callback_article_id = _parse_link_skip_id(call.data)
+    if session is None:
         logger.warning('Сессия не найдена для user_id %s при link_skip', user_id)
     else:
-        # Извлекаем article_id из сессии
-        article_id = pending_article_links[user_id].get('article_id')
-
-        # Проверяем, что article_id существует (не None и не 0)
-        if article_id is None or article_id == 0:
-            logger.warning('article_id не найден в сессии для user_id %s', user_id)
-        else:
-            # Удаляем статью из БД
-            try:
+        try:
+            if _may_delete_on_skip(user_id, session, callback_article_id):
+                article_id = session['article_id']
                 delete_article(article_id)
                 logger.info('Статья ID %s удалена из БД по запросу user_id %s', article_id, user_id)
-            except Exception as exc:
-                logger.error('Ошибка при удалении статьи ID %s для user_id %s: %s', article_id, user_id, exc)
+            else:
+                logger.info('link_skip without deletion: user_id=%s, article_id=%s, callback_id=%s',
+                            user_id, session.get('article_id'), callback_article_id)
+        except Exception as exc:
+            logger.error('Ошибка при удалении статьи для user_id %s: %s', user_id, exc)
 
     try:
         bot.edit_message_text(
@@ -1243,14 +1280,176 @@ def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
         pending_article_links.pop(user_id, None)
 
 
-@bot.message_handler(func=lambda message: extract_url(message.text) is not None)
+@dataclass
+class SummaryOutcome:
+    """What _summarize_for_user sent to its chat; Task 5 re-sends it to waiters."""
+
+    ok: bool
+    messages: list[str] = field(default_factory=list)
+    error_text: str | None = None
+    article_id: int | None = None
+
+
+def _fetch_url(url: str) -> str:
+    """URL to scrape: the canonical Habr URL for a recognized id, else the URL itself."""
+    habr_id = habr_api.parse_article_id(url)
+    return habr_api.canonical_url(habr_id) if habr_id is not None else url
+
+
+def _find_cached_article(url: str) -> dict | None:
+    """Cache entry: the earliest row for the Habr id, or the exact-URL row for other sources."""
+    habr_id = habr_api.parse_article_id(url)
+    if habr_id is not None:
+        return get_article_by_habr_id(habr_id)
+    return get_article_by_url(url)
+
+
+def _send_with_header(chat_id: int, full_header: str, short_header: str, summary: str) -> list[str]:
+    """Sends header+summary in one message if it fits, else a short header plus chunks; returns the texts."""
+    if len(full_header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        text = full_header + summary
+        bot.send_message(chat_id, text)
+        return [text]
+    bot.send_message(chat_id, short_header)
+    return [short_header] + send_long_message(chat_id, summary)
+
+
+def _show_duplicate_keyboard(chat_id: int, url: str) -> None:
+    url_hash = str(hash(url))[-10:]
+    pending_cache_urls[url_hash] = url
+    bot.send_message(chat_id, MSG_DUPLICATE_FOUND, reply_markup=create_cache_keyboard(url))
+
+
+def _replace_status(chat_id: int, status_msg, text: str) -> None:
+    """Shows `text` in place of the status message, or as a new message if that fails."""
+    if status_msg is not None:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id)
+            return
+        except Exception:
+            pass
+    try:
+        bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.error('Не удалось отправить ошибку в чат %s: %s', chat_id, _error_text(e))
+
+
+def _safe_offer_link(chat_id: int, user_id: int, article_id: int, created_now: bool) -> None:
+    # The summary is already delivered: an offer failure must not turn it into an error
+    try:
+        _offer_link_to_ideas(chat_id, user_id, article_id, created_now=created_now)
+    except Exception as e:
+        logger.error('Ошибка предложения привязки для %s: %s', user_id, _error_text(e))
+
+
+def _summarize_for_user(chat_id: int, user_id: int, target: int | str, source: str) -> SummaryOutcome:
+    """
+    Shared summary core of the link flow and the "Саммари" button (Decision 13).
+
+    `target` is a Habr id (int) or a URL (str). Sequence: cache check, model check,
+    status message, process_article (canonical URL for Habr), save_article_to_db,
+    summary message, idea-link offer. Everything is sent to `chat_id` with
+    send_message. Records no views; callers do. Never raises for scrape or
+    generation errors: they become ok=False with the error text shown to the user.
+    """
+    if isinstance(target, bool) or not isinstance(target, (int, str)):
+        raise TypeError(f'target must be a habr_id or a URL, got {type(target).__name__}')
+    if isinstance(target, int):
+        url = habr_api.canonical_url(target)
+    else:
+        url = target
+
+    status_msg = None
+    try:
+        cached = _find_cached_article(url)
+        if cached:
+            if source == 'link':
+                logger.info('Дубликат статьи обнаружен: url=%s, user_id=%s', url, user_id)
+                _show_duplicate_keyboard(chat_id, url)
+                return SummaryOutcome(ok=True, article_id=cached['id'])
+            if cached.get('summary'):
+                messages = _send_with_header(
+                    chat_id, f'📦 Сохранённый конспект:\nИсточник: {url}\n\n', '📦 Сохранённый конспект:',
+                    cached['summary'],
+                )
+                _safe_offer_link(chat_id, user_id, cached['id'], created_now=False)
+                return SummaryOutcome(ok=True, messages=messages, article_id=cached['id'])
+            # A cached row without a summary is regenerated rather than sent empty
+
+        model, provider = get_user_model(user_id)
+        is_available, error_message = check_model_availability(model, provider)
+        if not is_available:
+            error_text = MSG_MODEL_UNAVAILABLE.format(model=model, provider=provider, error=error_message)
+            bot.send_message(chat_id, error_text)
+            logger.warning('Модель %s (%s) недоступна для %s: %s', model, provider, user_id, error_message)
+            return SummaryOutcome(ok=False, error_text=error_text)
+
+        bot.send_chat_action(chat_id, 'typing')
+        status_msg = bot.send_message(chat_id, MSG_PROCESSING)
+
+        logger.info('Начинаю обработку статьи: url=%s, model=%s, provider=%s, user_id=%s',
+                    url, model, provider, user_id)
+        result = process_article(_fetch_url(url), model=model, provider=provider, user_id=user_id)
+
+        if result is None:
+            error_text = MSG_ERROR.format(error='Не удалось обработать статью')
+            _replace_status(chat_id, status_msg, error_text)
+            return SummaryOutcome(ok=False, error_text=error_text)
+
+        summary, article_data = result
+        # Looked up right before saving: a row that appeared meanwhile is not "created now"
+        created_now = _find_cached_article(url) is None
+        article_id = save_article_to_db(article_data, summary, model, user_id, url)
+
+        # Удаляем статусное сообщение
+        try:
+            bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except Exception:
+            pass
+
+        messages = _send_with_header(
+            chat_id,
+            f'Готово!\nМодель: {model} ({provider})\nИсточник: {url}\n\n',
+            f'Готово! Модель: {model} ({provider})',
+            summary,
+        )
+    except Exception as e:
+        error_text = MSG_ERROR.format(error=_error_text(e))
+        _replace_status(chat_id, status_msg, error_text)
+        logger.error('Ошибка обработки URL для %s: %s', user_id, _error_text(e))
+        return SummaryOutcome(ok=False, error_text=error_text)
+
+    # Предлагаем привязать статью к идеям
+    if article_id:
+        _safe_offer_link(chat_id, user_id, article_id, created_now=created_now)
+    return SummaryOutcome(ok=True, messages=messages, article_id=article_id)
+
+
+def _deliver_outcome(chat_id: int, user_id: int, outcome: SummaryOutcome) -> None:
+    """Re-sends an outcome to another chat: no scrape, no LLM; the idea offer never allows deletion."""
+    if not outcome.ok:
+        if outcome.error_text:
+            bot.send_message(chat_id, outcome.error_text)
+        return
+    for text in outcome.messages:
+        bot.send_message(chat_id, text)
+    if outcome.article_id:
+        _safe_offer_link(chat_id, user_id, outcome.article_id, created_now=False)
+
+
+def _is_link_message(message: telebot.types.Message) -> bool:
+    """Text with a URL that is not a command (Decision 16: `/subscribe <url>` belongs to its handler)."""
+    text = message.text
+    return bool(text) and not text.lstrip().startswith('/') and extract_url(text) is not None
+
+
+@bot.message_handler(func=_is_link_message)
 def handle_url(message: telebot.types.Message) -> None:
     """
     Обрабатывает сообщения с URL - создает конспект статьи.
 
-    Извлекает URL из сообщения, проверяет поддержку источника,
-    проверяет наличие в кеше, обрабатывает статью с помощью
-    выбранной модели и отправляет конспект.
+    Извлекает URL, проверяет поддержку источника, для статьи Хабра записывает
+    просмотр `link` (Decision 4) и передаёт работу в _summarize_for_user.
     """
     url = extract_url(message.text)
     if not url:
@@ -1258,82 +1457,21 @@ def handle_url(message: telebot.types.Message) -> None:
         return
 
     user_id = message.from_user.id
-    model, provider = get_user_model(user_id)
 
     if not is_supported_url(url):
         bot.reply_to(message, MSG_UNSUPPORTED)
         return
 
-    # Проверяем наличие в кеше
-    if article_exists(url):
-        logger.info('Дубликат статьи обнаружен: url=%s, user_id=%s', url, user_id)
-        url_hash = str(hash(url))[-10:]
-        pending_cache_urls[url_hash] = url
-        keyboard = create_cache_keyboard(url)
-        bot.send_message(
-            message.chat.id,
-            MSG_DUPLICATE_FOUND,
-            reply_markup=keyboard,
-        )
-        return
-
-    # Проверяем доступность модели
-    is_available, error_message = check_model_availability(model, provider)
-    if not is_available:
-        error_text = MSG_MODEL_UNAVAILABLE.format(model=model, provider=provider, error=error_message)
-        bot.reply_to(message, error_text)
-        logger.warning('Модель %s (%s) недоступна для %s: %s', model, provider, user_id, error_message)
-        return
-
-    bot.send_chat_action(message.chat.id, 'typing')
-    status_msg = bot.reply_to(message, MSG_PROCESSING)
-
-    logger.info('Начинаю обработку статьи: url=%s, model=%s, provider=%s, user_id=%s',
-                url, model, provider, user_id)
-    try:
-        result = process_article(url, model=model, provider=provider, user_id=user_id)
-
-        if result is None:
-            bot.edit_message_text(
-                MSG_ERROR.format(error='Не удалось обработать статью'),
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-            )
-            return
-
-        summary, article_data = result
-        # Сохраняем статью в БД и получаем ID
-        article_id = save_article_to_db(article_data, summary, model, user_id, url)
-
-        # Удаляем статусное сообщение
+    habr_id = habr_api.parse_article_id(url)
+    if habr_id is not None:
+        # Recorded before the cache check, whatever the outcome; its own short DB call
         try:
-            bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
-        except Exception:
-            pass
+            habr_store.record_view(user_id, habr_id, 'link')
+        except Exception as e:
+            logger.error('Не удалось записать просмотр: user_id=%s, habr_id=%s: %s', user_id, habr_id, e)
 
-        # Отправляем конспект
-        header = f'Готово!\nМодель: {model} ({provider})\nИсточник: {url}\n\n'
-        if len(header) + len(summary) <= TELEGRAM_MAX_MESSAGE_LENGTH:
-            bot.send_message(message.chat.id, header + summary)
-        else:
-            bot.send_message(message.chat.id, f'Готово! Модель: {model} ({provider})')
-            send_long_message(message.chat.id, summary)
-
-        # Предлагаем привязать статью к идеям
-        if article_id:
-            _offer_link_to_ideas(message.chat.id, user_id, article_id)
-
-    except Exception as e:
-        error_text = MSG_ERROR.format(error=_error_text(e))
-        try:
-            bot.edit_message_text(
-                error_text,
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-            )
-        except Exception:
-            bot.send_message(message.chat.id, error_text)
-        logger.error('Ошибка обработки URL для %s: %s', user_id, e)
+    # The user URL (not the id) is passed so it is stored and shown as «Источник»
+    _summarize_for_user(message.chat.id, user_id, url, 'link')
 
 
 @bot.message_handler(commands=['new_idea'])

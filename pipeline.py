@@ -27,7 +27,11 @@ logger = logging.getLogger(__name__)
 # Импортируем наши модули
 from scraper import get_article
 from summarizer import generate_summary, DEFAULT_MODEL, DEFAULT_PROVIDER
-from database import init_db, article_exists, save_article, update_article, get_article_by_url
+from database import (
+    init_db, article_exists, save_article, update_article, get_article_by_url,
+    get_article_by_habr_id, update_article_by_id,
+)
+import habr_api
 
 # Публичный API модуля
 __all__ = ['process_article', 'ensure_directories', 'save_article_to_db']
@@ -35,12 +39,14 @@ __all__ = ['process_article', 'ensure_directories', 'save_article_to_db']
 # Конфигурация путей
 DATA_DIR: str = 'data'
 
-# Поддерживаемые источники
+# Поддерживаемые источники. Habr is recognized only by the strict
+# habr_api.parse_article_id (Decision 3); the others keep substring detection.
 SUPPORTED_SOURCES: dict[str, str] = {
     'habr.com': 'habr',
     'github.com': 'github',
     'infostart.ru': 'infostart',
 }
+_HABR_DOMAIN = 'habr.com'
 
 
 def ensure_directories() -> None:
@@ -66,7 +72,7 @@ def is_supported_url(url: str) -> bool:
     Returns:
         True если источник поддерживается, иначе False.
     """
-    return any(source in url for source in SUPPORTED_SOURCES)
+    return get_source_name(url) != 'unknown'
 
 
 def get_source_name(url: str) -> str:
@@ -79,8 +85,14 @@ def get_source_name(url: str) -> str:
     Returns:
         Название источника ('habr', 'github') или 'unknown'.
     """
+    if habr_api.parse_article_id(url) is not None:
+        return 'habr'
+    # A URL that mentions habr.com but is not a strict Habr article URL
+    # (spoofed host, hub page, /sandbox/, ...) is unsupported, never fetched.
+    if _HABR_DOMAIN in url.lower():
+        return 'unknown'
     for domain, name in SUPPORTED_SOURCES.items():
-        if domain in url:
+        if domain != _HABR_DOMAIN and domain in url:
             return name
     return 'unknown'
 
@@ -114,7 +126,11 @@ def process_article(
         logger.warning("Неподдерживаемый источник: %s", url)
         return None
 
-    article_data = get_article(url)
+    # Habr: fetch only the canonical URL built from the integer id; the
+    # user-supplied URL is never fetched.
+    habr_id = habr_api.parse_article_id(url)
+    fetch_url = habr_api.canonical_url(habr_id) if habr_id is not None else url
+    article_data = get_article(fetch_url)
 
     if 'error' in article_data:
         logger.error("Ошибка парсинга: %s", article_data["error"])
@@ -156,10 +172,23 @@ def save_article_to_db(
         url: URL статьи (опционально, для проверки дубликата).
 
     Returns:
-        ID сохранённой статьи или None если статья уже существует.
+        ID сохранённой (или обновлённой существующей) статьи.
     """
-    # Проверяем, есть ли уже запись
     check_url = url or article_data.get('url')
+    habr_id = habr_api.parse_article_id(check_url)
+    if habr_id is None:
+        habr_id = habr_api.parse_article_id(article_data.get('url'))
+    if habr_id is not None:
+        # Habr identity is the id: update the earliest row, never add a utm duplicate
+        existing = get_article_by_habr_id(habr_id)
+        if existing:
+            update_article_by_id(existing['id'], summary=summary, model=model)
+            logger.info("Обновлено в БД: article_id=%d (habr_id=%d)", existing['id'], habr_id)
+            return existing['id']
+        # Store the user-supplied URL, not the canonical one; copy, never mutate the caller's dict
+        article_data = {**article_data, 'url': check_url}
+
+    # Проверяем, есть ли уже запись
     if check_url and article_exists(check_url):
         # Статья уже существует - возвращаем ID
         existing = get_article_by_url(check_url)
@@ -175,6 +204,7 @@ def save_article_to_db(
         summary=summary,
         model=model,
         user_id=user_id,
+        habr_id=habr_id,
     )
     logger.info("Сохранено в БД: article_id=%d", article_id)
     return article_id

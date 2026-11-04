@@ -10,6 +10,8 @@
     - get_article_by_habr_id(habr_id) - самая ранняя статья с этим Habr id
     - save_article(...) - сохранение статьи с конспектом
     - update_article(...) - обновление конспекта существующей статьи
+    - update_article_by_id(...) - обновление конспекта по ID статьи
+    - is_article_linked_to_other_users_idea(...) - привязана ли статья к чужой идее
     - delete_article(id) - удаление статьи по ID
     - count_articles() - количество статей
     - wipe_articles() - удаление всех статей и их привязок (идеи остаются)
@@ -60,6 +62,8 @@ __all__ = [
     'get_article_by_habr_id',
     'save_article',
     'update_article',
+    'update_article_by_id',
+    'is_article_linked_to_other_users_idea',
     'delete_article',
     'count_articles',
     'wipe_articles',
@@ -464,6 +468,49 @@ def update_article(
         if updated:
             logger.debug("Статья обновлена: url=%s", url[:80])
         return updated
+    finally:
+        conn.close()
+
+
+def update_article_by_id(article_id: int, summary: str, model: str) -> bool:
+    """
+    Updates the summary and model of the article with this id.
+
+    Used for Habr articles, whose identity is habr_id rather than the URL string.
+
+    Returns:
+        True if the row exists and was updated.
+    """
+    conn = _get_connection()
+    try:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE articles
+                SET summary = ?, model_used = ?, processed_at = ?
+                WHERE id = ?
+                """,
+                (summary, model, datetime.now().isoformat(), article_id),
+            )
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def is_article_linked_to_other_users_idea(article_id: int, user_id: int) -> bool:
+    """True if an idea owned by a user other than `user_id` links this article."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM idea_articles ia
+            JOIN ideas i ON i.id = ia.idea_id
+            WHERE ia.article_id = ? AND i.user_id IS NOT ?
+            LIMIT 1
+            """,
+            (article_id, user_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

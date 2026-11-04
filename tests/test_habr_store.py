@@ -107,7 +107,7 @@ def test_migration_on_preexisting_db_sets_habr_id(tmp_path, monkeypatch):
         ('https://www.habr.com/en/company/x/blog/106/', 'habr', 1),
         ('https://m.habr.com/ru/articles/107/comments/', 'habr', 1),
         ('HTTPS://HABR.COM/ru/articles/108/', 'habr', 1),
-        ('https://habr.com/ru/articles/123456789012345678/', 'habr', 1),  # 18 digits: at the cap
+        ('https://habr.com/ru/articles/123456789012/', 'habr', 1),  # 12 digits: habr_api's cap
         ('https://github.com/owner/repo', 'github', 1),
         ('https://infostart.ru/1c/articles/2000000/', 'infostart', 1),
     ]
@@ -124,7 +124,7 @@ def test_migration_on_preexisting_db_sets_habr_id(tmp_path, monkeypatch):
     assert got['https://www.habr.com/en/company/x/blog/106/'] == 106
     assert got['https://m.habr.com/ru/articles/107/comments/'] == 107
     assert got['HTTPS://HABR.COM/ru/articles/108/'] == 108
-    assert got['https://habr.com/ru/articles/123456789012345678/'] == 123456789012345678
+    assert got['https://habr.com/ru/articles/123456789012/'] == 123456789012
     assert got['https://github.com/owner/repo'] is None
     assert got['https://infostart.ru/1c/articles/2000000/'] is None
 
@@ -152,6 +152,43 @@ def test_migration_rejects_lookalike_hosts(tmp_path, monkeypatch):
 
     assert all(v is None for v in _habr_ids_by_url(db_file).values())
     assert _query(db_file, 'SELECT COUNT(*) FROM article_views') == [(0,)]
+
+
+_PARITY_URLS = [
+    # positives
+    'https://habr.com/ru/articles/201/',
+    'https://habr.com/ru/post/202/',
+    'https://habr.com/ru/news/203/',
+    'https://habr.com/ru/companies/yandex/articles/204/',
+    'https://habr.com/en/company/x/blog/205/',
+    'https://habr.com/ru/articles/206/?utm_source=tg#comments',
+    'https://m.habr.com/ru/articles/207/comments/',
+    'https://www.habr.com/articles/208/',
+    # negatives
+    'https://evilhabr.com/ru/articles/209/',
+    'http://169.254.169.254/?habr.com',
+    'https://habr.com@evil.com/ru/articles/210/',
+    'https://habr.com.evil.com/ru/articles/211/',
+    'https://habr.com/ru/sandbox/212/',
+    'https://habr.com/ru/posts/213/',
+    'https://habr.com/ru/hubs/python/',
+    'https://habr.com/ru/articles/' + '9' * 13 + '/',
+]
+
+
+def test_migration_parser_matches_habr_api(tmp_path, monkeypatch):
+    import habr_api
+    db_file = _old_shape_db(tmp_path, monkeypatch, [(u, 'habr', 1) for u in _PARITY_URLS])
+
+    database.init_db()
+
+    got = _habr_ids_by_url(db_file)
+    expected = {url: habr_api.parse_article_id(url) for url in _PARITY_URLS}
+    assert got == expected
+    # Sanity: the list really mixes recognized and rejected shapes
+    assert sum(v is not None for v in expected.values()) == 8
+    # habr_api is the only strict parser: habr_store keeps no copy of its own
+    assert not [name for name in vars(habr_store) if 'parse' in name.lower() or name.startswith('_HABR')]
 
 
 def test_migration_creates_legacy_views_once(tmp_path, monkeypatch):

@@ -23,7 +23,6 @@ import re
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
 
 import database
 
@@ -174,51 +173,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# TEMPORARY duplicate of habr_api.parse_article_id (Decision 3). It exists only
-# because of the wave-1 constraint (habr_store must not import habr_api while
-# both are written in parallel); Task 3 replaces it with habr_api.parse_article_id.
-_HABR_HOSTS = frozenset({'habr.com', 'www.habr.com', 'm.habr.com'})
-_HABR_PATH_RE = re.compile(
-    r'(?:/(?:ru|en))?'
-    r'/(?:articles|post|news|specials|amp/publications'
-    r'|companies/[A-Za-z0-9_-]+/articles|company/[A-Za-z0-9_-]+/blog)'
-    # ASCII digits only; 18 digits always fit SQLite's signed 64-bit INTEGER
-    r'/([0-9]{1,18})'
-    r'(?:/(?:comments/?)?)?'
-)
-
-
-def _parse_habr_article_id(url) -> int | None:
-    if not isinstance(url, str):
-        return None
-    try:
-        parts = urlsplit(url.strip())
-    except ValueError:
-        return None
-    if parts.scheme.lower() not in ('http', 'https'):
-        return None
-    netloc = parts.netloc
-    # Userinfo and explicit ports are rejected outright
-    if '@' in netloc or ':' in netloc:
-        return None
-    if netloc.lower() not in _HABR_HOSTS:
-        return None
-    match = _HABR_PATH_RE.fullmatch(parts.path)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
 def migrate_articles(conn: sqlite3.Connection) -> None:
     """
     Network-free migration (Decision 18), idempotent:
     fills articles.habr_id from strictly parsed Habr URLs, then adds one 'legacy'
     view per (user_id, habr_id) that has no view row yet.
     """
+    # Function-level import: habr_api is the single strict Habr URL parser, and a
+    # module-level import here would put habr_api on the database -> habr_store path.
+    import habr_api
+
     candidates = conn.execute('SELECT id, url FROM articles WHERE habr_id IS NULL').fetchall()
     updates = []
     for row in candidates:
-        habr_id = _parse_habr_article_id(row[1])
+        habr_id = habr_api.parse_article_id(row[1])
         if habr_id is not None:
             updates.append((habr_id, row[0]))
     with conn:
