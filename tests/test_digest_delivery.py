@@ -233,6 +233,29 @@ def test_digest_time_parsing(monkeypatch, caplog):
         assert any('DIGEST_TIME' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING), bad
 
 
+def test_digest_time_at_or_after_skip_time_falls_back(monkeypatch, caplog):
+    """DIGEST_TIME=23:59 would start at SKIP_TIME and never create a run (CA-6)."""
+    assert digest.SKIP_TIME.strftime('%H:%M') == '23:59'
+    monkeypatch.setenv('DIGEST_TIME', '23:59')
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        assert digest.digest_time().strftime('%H:%M') == '18:00'
+    assert any('DIGEST_TIME' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    # The last minute before the skip time is still accepted
+    caplog.clear()
+    monkeypatch.setenv('DIGEST_TIME', '23:58')
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        assert digest.digest_time().strftime('%H:%M') == '23:58'
+    assert not caplog.records
+
+
+def test_digest_time_2359_still_creates_run_at_default(tmp_db, habr, send, sleeps, monkeypatch):
+    monkeypatch.setenv('DIGEST_TIME', '23:59')
+    fill_day(habr)
+    tick(at(18, 0), send)
+    assert habr_store.get_run(TODAY.isoformat()) is not None
+    assert len(send.to(OWNER)) == 1
+
+
 def test_digest_time_from_env_moves_the_run(tmp_db, habr, send, sleeps, monkeypatch):
     fill_day(habr, site=2)
     monkeypatch.setenv('DIGEST_TIME', '09:30')
@@ -599,6 +622,51 @@ def test_one_recipient_build_error_does_not_block_others(tmp_db, habr, send, sle
     run = habr_store.get_run(TODAY.isoformat())
     assert run['status'] == 'done' and run['last_error'] is None
     assert any(str(USER) in r.getMessage() for r in caplog.records)
+
+
+def test_delivery_claimed_before_build(tmp_db, habr, send, sleeps, monkeypatch):
+    """A row that stops being pending (e.g. /digest_now final) costs no build/LLM work (CA-5)."""
+    approve(USER)
+    fill_day(habr)
+    built = []
+    real_build = digest.build_user_digest
+    real_claim = habr_store.claim_delivery
+
+    def build(user_id, *a, **kw):
+        built.append((user_id, habr_store.list_deliveries(TODAY.isoformat(), status='sending')))
+        return real_build(user_id, *a, **kw)
+
+    def claim(run_id, user_id):
+        if user_id == OWNER:          # /digest_now final won the race for the owner's row
+            habr_store.set_delivery_status(run_id, OWNER, 'sent')
+        return real_claim(run_id, user_id)
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    monkeypatch.setattr(habr_store, 'claim_delivery', claim)
+    describe = Describe()
+    tick(at(18, 0), send, describe=describe)
+
+    assert [user_id for user_id, _ in built] == [USER]            # owner: no build at all
+    assert [d['user_id'] for d in built[0][1]] == [USER]          # claimed before building
+    assert send.to(OWNER) == [] and len(send.to(USER)) == 1
+    assert statuses() == {OWNER: 'sent', USER: 'sent'}
+
+
+def test_build_error_after_claim_marks_failed(tmp_db, habr, send, sleeps, monkeypatch):
+    """The claim moved the row to 'sending'; a build failure must still end as 'failed'."""
+    fill_day(habr)
+    seen = []
+
+    def build(user_id, *a, **kw):
+        seen.append(statuses()[user_id])     # recorded, not asserted: _attempt swallows errors
+        raise RuntimeError('build broke')
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    tick(at(18, 0), send)
+    assert seen == ['sending']
+    assert statuses() == {OWNER: 'failed'}
+    assert send.attempts == []
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
 
 
 @pytest.mark.parametrize('error', [tg_error(500, 'Internal Server Error'), RuntimeError('network down')],

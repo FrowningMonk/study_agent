@@ -386,15 +386,20 @@ def _reset_for_tests() -> None:
 
 
 def digest_time() -> dtime:
-    """DIGEST_TIME (strict HH:MM, MSK), read at call time; invalid -> 18:00 + warning."""
+    """DIGEST_TIME (strict HH:MM, MSK), read at call time; invalid -> 18:00 + warning.
+
+    A time at or after SKIP_TIME is invalid too: the run would start when the day is
+    already skipped, so no digest would ever be created.
+    """
     raw = os.environ.get('DIGEST_TIME')
     if not raw:
         return DEFAULT_DIGEST_TIME
     match = _DIGEST_TIME_RE.fullmatch(raw)
-    if match is None:
+    value = dtime(int(match.group(1)), int(match.group(2))) if match else None
+    if value is None or value >= SKIP_TIME:
         logger.warning('Invalid DIGEST_TIME %r, using %s', raw[:20], DEFAULT_DIGEST_TIME.strftime('%H:%M'))
         return DEFAULT_DIGEST_TIME
-    return dtime(int(match.group(1)), int(match.group(2)))
+    return value
 
 
 def _at(day: date, moment: dtime) -> datetime:
@@ -555,10 +560,12 @@ def _deliver_one(run_id: str, user_id: int, articles: list[dict], day: date, des
         habr_store.set_delivery_status(run_id, user_id, 'failed')
         logger.info('Digest not delivered, access revoked or digest off: user_id=%s', user_id)
         return
-    with _BUILD_LOCK:
-        parts = build_user_digest(user_id, articles, day, describe=describe)['parts']
+    # Claim first: a row that stopped being pending (e.g. /digest_now final) costs no
+    # build/LLM work. A build error after the claim is marked 'failed' by _attempt.
     if not habr_store.claim_delivery(run_id, user_id):
         return                                       # no longer pending: never sent twice
+    with _BUILD_LOCK:
+        parts = build_user_digest(user_id, articles, day, describe=describe)['parts']
     outcome = _send_parts(send, user_id, parts)
     if outcome == SEND_OK:
         habr_store.set_delivery_status(run_id, user_id, 'sent')
