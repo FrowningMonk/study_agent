@@ -1,7 +1,17 @@
 """
-Daily Habr digest — build and render part (Decisions 5-8). No Telegram code.
+Daily Habr digest (Decisions 5-12): build/render, delivery state machine, scheduler loop,
+/digest_now runner. No Telegram markup code and no `bot` import: messages go out through an
+injected `send(chat_id, text, rows)` whose `rows` are keyboard data.
 
-Public API (used by the delivery/scheduler part of this module, Task 10):
+Delivery API (consumed by bot.py, Task 11):
+    run_scheduler(send, owner_id, is_allowed)
+        Daemon-thread body: closes previous-day runs, then tick() every 60 s.
+    tick(now, *, send, owner_id, is_allowed, describe=_USE_DEFAULT) -> None
+        One scheduler step for an aware `now`.
+    start_digest_now(send, owner_id, final) -> bool
+        Owner's digest in the background; False = already running (send TEXT_BUSY).
+
+Build API:
     digest_day(now) -> date
         The digest day: yesterday by MSK relative to `now`.
     day_bounds(day) -> (start_utc, end_utc)
@@ -37,10 +47,14 @@ short connection of its own.
 
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+import threading
+import time
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from typing import Callable
 
@@ -48,6 +62,7 @@ import database
 import feed
 import habr_api
 import habr_store
+import summarizer
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +87,8 @@ DRY_RUN_FAKE_OWNER_ID = 1        # used only when OWNER_ID is unset; the temp DB
 Describe = Callable[[str, str], 'str | None']
 
 _USE_DEFAULT = object()
-_DEFAULT_DESCRIBE: Describe | None = None
+# Resolved at call time by build_user_digest / dry_run / tick / start_digest_now
+_DEFAULT_DESCRIBE: Describe | None = summarizer.generate_short_description
 
 
 # =============================================================================
@@ -81,8 +97,8 @@ _DEFAULT_DESCRIBE: Describe | None = None
 
 
 def _now() -> datetime:
-    """Clock source (aware UTC); `dry_run(now=...)` overrides it in tests."""
-    return datetime.now(timezone.utc)
+    """Clock source: aware datetime in MSK. Patched in tests."""
+    return datetime.now(feed.MSK)
 
 
 def digest_day(now: datetime) -> date:
@@ -314,3 +330,414 @@ def dry_run(describe=_USE_DEFAULT, *, now: datetime | None = None) -> dict | Non
             return result
         finally:
             database.DB_PATH, database.DATA_DIR = saved_path, saved_dir
+
+
+# =============================================================================
+# Delivery: time settings, texts, injectable hooks (Decisions 9-12)
+# =============================================================================
+
+DEFAULT_DIGEST_TIME = dtime(18, 0)
+SKIP_TIME = dtime(23, 59)               # an unfinished run is skipped at this MSK time
+RETRY_DELAY = timedelta(minutes=15)
+WARN_AFTER = timedelta(hours=3)
+TICK_SECONDS = 60
+RECIPIENT_PAUSE = 0.1                   # seconds between recipients (Telegram flood limits)
+RETRY_AFTER_DEFAULT = 5                 # 429 without a usable retry_after
+RETRY_AFTER_MAX = 3600
+
+TEXT_BUSY = 'Уже собираю дайджест'
+TEXT_OWNER_WARNING = 'Дайджест за сегодня ещё не разослан: {reason}'
+TEXT_OWNER_SKIPPED = 'Дайджест за {date} пропущен: {reason}'
+TEXT_DIGEST_NOW_FAILED = 'Дайджест не собран: {reason}'
+REASON_BOT_DOWN = 'бот не работал'
+
+# Short owner-facing categories (never raw exception text: it may carry URLs or tokens)
+REASON_HTTP = 'Хабр не ответил (HTTP {status})'
+REASON_PARTIAL = 'Хабр вернул неполный список'
+REASON_TIMEOUT = 'Хабр не ответил вовремя'
+REASON_NETWORK = 'Хабр недоступен (ошибка сети)'
+REASON_BAD_RESPONSE = 'Хабр вернул некорректный ответ'
+REASON_INTERNAL = 'внутренняя ошибка бота'
+
+_DIGEST_TIME_RE = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
+
+Send = Callable[[int, str, 'list | None'], None]
+
+_sleep = time.sleep                     # patched in tests (429 waits, pauses, the loop)
+
+# One build at a time: /digest_now and the scheduled run never describe the same article twice
+_BUILD_LOCK = threading.Lock()
+_digest_now_lock = threading.Lock()
+_digest_now_running = False
+_cleanup_done_for: date | None = None
+
+
+def _spawn(target: Callable[[], None]) -> None:
+    """Starts the /digest_now work in a daemon thread. Patched in tests."""
+    threading.Thread(target=target, daemon=True, name='digest-now').start()
+
+
+def _reset_for_tests() -> None:
+    """Clears module state shared across tests (conftest autouse fixture)."""
+    global _digest_now_running, _cleanup_done_for
+    with _digest_now_lock:
+        _digest_now_running = False
+    _cleanup_done_for = None
+
+
+def digest_time() -> dtime:
+    """DIGEST_TIME (strict HH:MM, MSK), read at call time; invalid -> 18:00 + warning."""
+    raw = os.environ.get('DIGEST_TIME')
+    if not raw:
+        return DEFAULT_DIGEST_TIME
+    match = _DIGEST_TIME_RE.fullmatch(raw)
+    if match is None:
+        logger.warning('Invalid DIGEST_TIME %r, using %s', raw[:20], DEFAULT_DIGEST_TIME.strftime('%H:%M'))
+        return DEFAULT_DIGEST_TIME
+    return dtime(int(match.group(1)), int(match.group(2)))
+
+
+def _at(day: date, moment: dtime) -> datetime:
+    return datetime.combine(day, moment, tzinfo=feed.MSK)
+
+
+def _parse_ts(value) -> datetime | None:
+    """Stored aware ISO timestamp -> datetime; anything unusable -> None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def failure_reason(exc: BaseException) -> str:
+    """Short owner-facing category for an attempt failure."""
+    if isinstance(exc, habr_api.HabrUnavailable):
+        if exc.kind == 'partial':
+            return REASON_PARTIAL
+        if exc.kind == 'http' and isinstance(exc.status, int):
+            return REASON_HTTP.format(status=exc.status)
+        if exc.kind == 'timeout':
+            return REASON_TIMEOUT
+        if exc.kind == 'network':
+            return REASON_NETWORK
+        return REASON_BAD_RESPONSE
+    return REASON_INTERNAL
+
+
+def _notify_owner(send: Send, owner_id: int, text: str) -> None:
+    """Owner alert through the same `send`; a failure is logged and never breaks the caller."""
+    try:
+        send(owner_id, text, None)
+    except Exception as e:  # noqa: BLE001
+        logger.warning('Owner alert failed: %s', type(e).__name__)
+
+
+# =============================================================================
+# Telegram error policy (Decision 11)
+# =============================================================================
+
+SEND_OK = 'sent'
+SEND_BLOCKED = 'blocked'
+SEND_FAILED = 'failed'
+
+
+def _telegram_error(exc: BaseException):
+    """The ApiTelegramException or None. telebot is imported lazily (isinstance only), so
+    importing digest pulls in neither telebot nor bot."""
+    from telebot.apihelper import ApiTelegramException
+    return exc if isinstance(exc, ApiTelegramException) else None
+
+
+def _is_blocked(exc: BaseException) -> bool:
+    err = _telegram_error(exc)
+    if err is None:
+        return False
+    if err.error_code == 403:
+        return True
+    return err.error_code == 400 and 'chat not found' in str(err.description or '').lower()
+
+
+def _retry_after(exc: BaseException) -> float | None:
+    """Seconds to wait for a 429, else None. A missing/invalid retry_after -> small default."""
+    err = _telegram_error(exc)
+    if err is None or err.error_code != 429:
+        return None
+    result_json = err.result_json if isinstance(err.result_json, dict) else {}
+    params = result_json.get('parameters')
+    value = params.get('retry_after') if isinstance(params, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= RETRY_AFTER_MAX:
+        return RETRY_AFTER_DEFAULT
+    return value
+
+
+def _send_parts(send: Send, chat_id: int, parts: list) -> str:
+    """
+    Sends all digest messages to one chat. Returns SEND_OK, SEND_BLOCKED (403 / 400 chat
+    not found) or SEND_FAILED. A 429 is retried once per recipient after retry_after.
+    A partial send (a later part fails) is SEND_FAILED and is not resent.
+    """
+    retried = False
+    for text, rows in parts:
+        while True:
+            try:
+                send(chat_id, text, rows)
+                break
+            except Exception as e:  # noqa: BLE001 — every error is classified, nothing propagates
+                if _is_blocked(e):
+                    return SEND_BLOCKED
+                wait = _retry_after(e)
+                if wait is not None and not retried:
+                    retried = True
+                    logger.info('Digest send 429: user_id=%s, retry in %ss', chat_id, wait)
+                    _sleep(wait)
+                    continue
+                logger.error('Digest send failed: user_id=%s, %s', chat_id, type(e).__name__)
+                return SEND_FAILED
+    return SEND_OK
+
+
+# =============================================================================
+# Scheduler tick (Decisions 9, 10)
+# =============================================================================
+
+
+def _recipients(owner_id: int) -> list[int]:
+    """Owner + approved users, minus digest disabled (missing setting = enabled)."""
+    ids = [owner_id] + [u['user_id'] for u in database.list_users()
+                        if u.get('status') == 'approved' and u['user_id'] != owner_id]
+    return [uid for uid in ids if habr_store.get_digest_enabled(uid)]
+
+
+def _can_receive(user_id: int, is_allowed) -> bool:
+    try:
+        return bool(is_allowed(user_id)) and habr_store.get_digest_enabled(user_id)
+    except Exception as e:  # noqa: BLE001 — a broken check never sends
+        logger.warning('Recipient check failed: user_id=%s, %s', user_id, type(e).__name__)
+        return False
+
+
+def _housekeeping(now: datetime) -> None:
+    """Once per MSK day: delete ranked lists older than 30 days."""
+    global _cleanup_done_for
+    today = now.date()
+    if _cleanup_done_for == today:
+        return
+    _cleanup_done_for = today
+    try:
+        habr_store.cleanup_ranked_lists(now)
+    except Exception:  # noqa: BLE001
+        logger.exception('Ranked lists cleanup failed')
+
+
+def _skip_run(run_id: str, now: datetime, reason: str, send: Send, owner_id: int) -> None:
+    habr_store.update_run(run_id, status='skipped', finished_at=now)
+    logger.info('Digest run skipped: %s, %s', run_id, reason)
+    _notify_owner(send, owner_id, TEXT_OWNER_SKIPPED.format(
+        date=feed.format_date_ru(date.fromisoformat(run_id)), reason=reason))
+
+
+def _finish_if_done(run_id: str, now: datetime) -> bool:
+    # 'sending' rows count as finished: after a restart they are treated as sent
+    if habr_store.list_deliveries(run_id, status='pending'):
+        return False
+    habr_store.update_run(run_id, status='done', finished_at=now)
+    logger.info('Digest run done: %s', run_id)
+    return True
+
+
+def _deliver_one(run_id: str, user_id: int, articles: list[dict], day: date, describe,
+                 send: Send, is_allowed) -> None:
+    if not _can_receive(user_id, is_allowed):
+        habr_store.set_delivery_status(run_id, user_id, 'failed')
+        logger.info('Digest not delivered, access revoked or digest off: user_id=%s', user_id)
+        return
+    with _BUILD_LOCK:
+        parts = build_user_digest(user_id, articles, day, describe=describe)['parts']
+    if not habr_store.claim_delivery(run_id, user_id):
+        return                                       # no longer pending: never sent twice
+    outcome = _send_parts(send, user_id, parts)
+    if outcome == SEND_OK:
+        habr_store.set_delivery_status(run_id, user_id, 'sent')
+        return
+    habr_store.set_delivery_status(run_id, user_id, 'failed')
+    if outcome == SEND_BLOCKED:
+        habr_store.set_digest_enabled(user_id, False, reason='blocked')
+        logger.warning('Digest disabled, bot blocked or chat not found: user_id=%s', user_id)
+
+
+def _attempt(run: dict, now: datetime, send: Send, is_allowed, describe) -> None:
+    """One delivery attempt: the shared fetch, then every pending recipient. HTTP and LLM
+    calls run between short store calls, never inside an open transaction."""
+    run_id = run['digest_date']
+    if _finish_if_done(run_id, now):
+        return
+    next_at = _parse_ts(run.get('next_attempt_at'))
+    if next_at is not None and now < next_at:
+        return
+    day = digest_day(now)
+    try:
+        # Background call: default wait_timeout=None (never HANDLER_WAIT_TIMEOUT)
+        articles = fetch_day_articles(day)
+        for delivery in habr_store.list_deliveries(run_id, status='pending'):
+            _deliver_one(run_id, delivery['user_id'], articles, day, describe, send, is_allowed)
+            _sleep(RECIPIENT_PAUSE)
+    except Exception as e:  # noqa: BLE001 — any attempt failure is retried in 15 min
+        reason = failure_reason(e)
+        habr_store.update_run(run_id, last_error=reason, next_attempt_at=now + RETRY_DELAY)
+        if isinstance(e, habr_api.HabrUnavailable):
+            logger.info('Digest attempt failed: %s, %s', run_id, reason)
+        else:
+            logger.exception('Digest attempt failed: %s, %s', run_id, reason)
+        return
+    _finish_if_done(run_id, now)
+
+
+def tick(now: datetime, *, send: Send, owner_id: int, is_allowed, describe=_USE_DEFAULT) -> None:
+    """
+    One scheduler step for the aware `now` (converted to MSK).
+
+    send(chat_id, text, rows) -> None: rows are keyboard data (list[list[(text, callback)]])
+        or None, passed through unchanged; raises the Telegram exception on failure.
+    is_allowed(user_id) -> bool: access gate, re-checked at send time.
+    describe: `_USE_DEFAULT` -> `_DEFAULT_DESCRIBE` at call time; None -> lead fallback only.
+    """
+    if describe is _USE_DEFAULT:
+        describe = _DEFAULT_DESCRIBE
+    now = now.astimezone(feed.MSK)
+    today = now.date()
+    _housekeeping(now)
+    start = _at(today, digest_time())
+    skip_at = _at(today, SKIP_TIME)
+    if now < start:
+        return
+    run_id = today.isoformat()
+    run = habr_store.get_run(run_id)
+    if run is None:
+        if now >= skip_at:
+            return                                   # started too late: no run, no instant skip
+        # Snapshot first (INSERT OR IGNORE keeps an owner row already 'sent' by /digest_now
+        # final), then the run row: a crash in between only re-snapshots on the next tick
+        recipients = _recipients(owner_id)
+        habr_store.snapshot_recipients(run_id, recipients)
+        habr_store.create_run(run_id)
+        logger.info('Digest run created: %s, recipients=%d', run_id, len(recipients))
+        run = habr_store.get_run(run_id)
+    if run['status'] in habr_store.RUN_FINISHED_STATUSES:
+        return
+    if now >= skip_at:
+        _skip_run(run_id, now, run.get('last_error') or REASON_INTERNAL, send, owner_id)
+        return
+
+    _attempt(run, now, send, is_allowed, describe)
+
+    run = habr_store.get_run(run_id)
+    if (run['status'] not in habr_store.RUN_FINISHED_STATUSES and not run.get('warned_at')
+            and now >= start + WARN_AFTER):
+        habr_store.update_run(run_id, warned_at=now)
+        _notify_owner(send, owner_id, TEXT_OWNER_WARNING.format(reason=run.get('last_error') or REASON_INTERNAL))
+
+
+# =============================================================================
+# Scheduler loop
+# =============================================================================
+
+
+def close_unfinished_runs(now: datetime, send: Send, owner_id: int) -> int:
+    """Startup: every unfinished run of a previous day is skipped (no catch-up)."""
+    now = now.astimezone(feed.MSK)
+    runs = habr_store.list_unfinished_runs(before_date=now.date().isoformat())
+    for run in runs:
+        _skip_run(run['digest_date'], now, REASON_BOT_DOWN, send, owner_id)
+    return len(runs)
+
+
+def next_run_time(now: datetime) -> datetime:
+    """Next scheduled digest moment (for the startup log)."""
+    now = now.astimezone(feed.MSK)
+    today = now.date()
+    start = _at(today, digest_time())
+    if now < start:
+        return start
+    run = habr_store.get_run(today.isoformat())
+    finished = run is not None and run['status'] in habr_store.RUN_FINISHED_STATUSES
+    if not finished and now < _at(today, SKIP_TIME):
+        return now
+    return _at(today + timedelta(days=1), digest_time())
+
+
+def run_scheduler(send: Send, owner_id: int, is_allowed) -> None:
+    """
+    Daemon-thread body started by bot.main(): closes previous-day runs, then calls
+    tick(_now()) every 60 s forever. Exceptions in a tick are logged; the loop survives.
+    describe is omitted, so `_DEFAULT_DESCRIBE` is resolved at every tick.
+    """
+    try:
+        close_unfinished_runs(_now(), send, owner_id)
+        logger.info('Digest scheduler started, next run at %s',
+                    next_run_time(_now()).strftime('%Y-%m-%d %H:%M MSK'))
+    except Exception:  # noqa: BLE001
+        logger.exception('Digest scheduler startup step failed')
+    while True:
+        try:
+            tick(_now(), send=send, owner_id=owner_id, is_allowed=is_allowed)
+        except Exception:  # noqa: BLE001
+            logger.exception('Digest tick failed')
+        _sleep(TICK_SECONDS)
+
+
+# =============================================================================
+# /digest_now runner (Decision 12)
+# =============================================================================
+
+
+def _digest_now_work(send: Send, owner_id: int, final: bool) -> None:
+    global _digest_now_running
+    try:
+        now = _now().astimezone(feed.MSK)
+        day = digest_day(now)
+        try:
+            articles = fetch_day_articles(day)
+        except Exception as e:  # noqa: BLE001
+            reason = failure_reason(e)
+            logger.info('/digest_now: fetch failed, %s', reason)
+            _notify_owner(send, owner_id, TEXT_DIGEST_NOW_FAILED.format(reason=reason))
+            return
+        with _BUILD_LOCK:
+            parts = build_user_digest(owner_id, articles, day, describe=_DEFAULT_DESCRIBE)['parts']
+        if _send_parts(send, owner_id, parts) != SEND_OK:
+            logger.warning('/digest_now: send to owner failed')
+            return
+        if final:
+            run_id = now.date().isoformat()
+            habr_store.snapshot_recipients(run_id, [owner_id])
+            habr_store.set_delivery_status(run_id, owner_id, 'sent')
+            logger.info('/digest_now final: owner delivery for %s marked sent', run_id)
+    except Exception:  # noqa: BLE001
+        logger.exception('/digest_now failed')
+        _notify_owner(send, owner_id, TEXT_DIGEST_NOW_FAILED.format(reason=REASON_INTERNAL))
+    finally:
+        with _digest_now_lock:
+            _digest_now_running = False
+
+
+def start_digest_now(send: Send, owner_id: int, final: bool) -> bool:
+    """
+    Starts the owner's digest in the background (`_spawn`). Returns False if one is already
+    running (the handler then sends TEXT_BUSY). Touches no run/delivery rows, except that
+    `final` marks the owner's delivery for today as 'sent' after a successful send.
+    """
+    global _digest_now_running
+    with _digest_now_lock:
+        if _digest_now_running:
+            return False
+        _digest_now_running = True
+    try:
+        _spawn(lambda: _digest_now_work(send, owner_id, final))
+    except Exception:
+        with _digest_now_lock:
+            _digest_now_running = False
+        raise
+    return True

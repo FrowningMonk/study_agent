@@ -75,13 +75,16 @@ def _habr_network_guard(monkeypatch):
     monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
 
     # Module state shared across tests: feed fetch cache + REGISTRY, hubs refresh lock
+    import digest
     import feed
     import hubs
     feed._reset_for_tests()
     hubs._reset_for_tests()
+    digest._reset_for_tests()
     yield
     feed._reset_for_tests()
     hubs._reset_for_tests()
+    digest._reset_for_tests()
 
 
 # =============================================================================

@@ -378,7 +378,7 @@ def test_no_describe_function_no_llm(tmp_db, monkeypatch):
     assert 'Короткий анонс статьи про Python' in result['parts'][0][0]
     assert habr_store.get_habr_article(1)['short_description'] is None
     code = ('import sys, digest; '
-            'bad = [m for m in ("summarizer", "bot", "telebot") if m in sys.modules]; '
+            'bad = [m for m in ("bot", "telebot") if m in sys.modules]; '
             'assert not bad, bad')
     proc = subprocess.run([sys.executable, '-c', code], cwd=os.path.dirname(os.path.dirname(__file__)),
                           capture_output=True, text=True, timeout=60)
