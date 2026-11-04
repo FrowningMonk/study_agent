@@ -308,7 +308,7 @@ def test_callback_forged_formats_rejected(tmp_db, monkeypatch):
     monkeypatch.setattr(habr_store, 'get_ranked_list', lambda *a, **k: lookups.append(a))
     forged = ['hl:s:1:', 'hl:x:1:1', 'hl:s:١:1', 'hl:s:1234567890:1', 'hl:s:1:12345', 'hl:s:1:1\n',
               'hl:s:-1:1', 'HL:s:1:1', 'hl:s:1:1:extra', 'hl:s:1:1 ', ' hl:s:1:1', 'hl:s:0:1',
-              'hl:s:1:١', 'hl:m:1:10x', '', None, 12]
+              'hl:s:1:١', 'hl:m:1:10x', 'hl:s:01:1', 'hl:s:1:01', 'hl:m:1:010', 'hl:m:1:00', '', None, 12]
     for data in forged:
         assert feed.decode_list_callback(data, 1) is None, data
     assert lookups == []

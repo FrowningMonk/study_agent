@@ -320,3 +320,78 @@ def parse_hub_callback(data, user_id: int) -> tuple[str, str] | None:
 def _reject(user_id: int, data, reason: str) -> None:
     logger.warning('Stale hub button: user_id=%s, reason=%s, data=%.40r', user_id, reason, data)
     return None
+
+
+# =============================================================================
+# Presentation for the bot: texts and keyboards as data (rows of (text, data))
+# =============================================================================
+
+HUB_BUTTONS_PER_ROW = 2
+HUB_BUTTON_TITLE_MAX_LEN = 30
+SUBSCRIPTIONS_PER_MESSAGE = 50     # ✖ buttons per /subscriptions message
+SUBSCRIBED_PER_PARAGRAPH = 50      # aliases per paragraph of the /subscribe reply
+
+TEXT_TOP_HUBS = 'Выбери хаб для подписки (топ-30 по рейтингу):'
+TEXT_SUBSCRIBED = 'Подписка оформлена: {hubs}'
+TEXT_SUBSCRIPTIONS = 'Твои подписки — нажми ✖, чтобы отписаться:'
+TEXT_SUBSCRIPTIONS_MORE = 'Ещё подписки:'
+TEXT_SUBSCRIPTIONS_EMPTY = 'Подписок пока нет — /subscribe'
+TEXT_UNSUBSCRIBE_BUTTON = '✖ {alias}'
+
+Rows = list[list[tuple[str, str]]]
+
+
+def _in_rows(buttons: list[tuple[str, str]], per_row: int) -> Rows:
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def _hub_button_text(hub: dict) -> str:
+    """Catalog title (plain text, one line, short) or the alias when the title is unusable."""
+    title = ' '.join(strip_control_bidi(hub.get('title') or '').split())
+    if not title:
+        return hub['alias']
+    if len(title) > HUB_BUTTON_TITLE_MAX_LEN:
+        title = title[:HUB_BUTTON_TITLE_MAX_LEN - 1].rstrip() + '…'
+    return title
+
+
+def top_hubs_rows(n: int = TOP_HUBS) -> Rows:
+    """Subscribe buttons for the top-n hubs by rating (unsafe aliases skipped)."""
+    buttons = []
+    for hub in top_hubs(n):
+        try:
+            buttons.append((_hub_button_text(hub), subscribe_callback(hub['alias'])))
+        except ValueError:
+            logger.warning('Hub catalog: unsafe alias skipped in keyboard %.60r', hub.get('alias'))
+    return _in_rows(buttons, HUB_BUTTONS_PER_ROW)
+
+
+def format_subscribed(aliases: list[str]) -> str:
+    """
+    `/subscribe` confirmation ('' for no aliases). Aliases are grouped into paragraphs, so
+    bot.send_long_message can split a huge reply into messages under 4096 chars.
+    """
+    if not aliases:
+        return ''
+    groups = [', '.join(aliases[i:i + SUBSCRIBED_PER_PARAGRAPH])
+              for i in range(0, len(aliases), SUBSCRIBED_PER_PARAGRAPH)]
+    return TEXT_SUBSCRIBED.format(hubs='\n\n'.join(groups))
+
+
+def unsubscribe_rows(aliases: list[str]) -> Rows:
+    buttons = [(TEXT_UNSUBSCRIBE_BUTTON.format(alias=a), unsubscribe_callback(a)) for a in aliases]
+    return _in_rows(buttons, HUB_BUTTONS_PER_ROW)
+
+
+def subscription_pages(aliases: list[str]) -> list[tuple[str, Rows]]:
+    """
+    `/subscriptions` messages: at most SUBSCRIPTIONS_PER_MESSAGE ✖ buttons each
+    (there is no subscription limit). No subscriptions -> one empty-state message.
+    """
+    if not aliases:
+        return [(TEXT_SUBSCRIPTIONS_EMPTY, [])]
+    pages = []
+    for start in range(0, len(aliases), SUBSCRIPTIONS_PER_MESSAGE):
+        text = TEXT_SUBSCRIPTIONS if start == 0 else TEXT_SUBSCRIPTIONS_MORE
+        pages.append((text, unsubscribe_rows(aliases[start:start + SUBSCRIPTIONS_PER_MESSAGE])))
+    return pages

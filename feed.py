@@ -79,8 +79,8 @@ _MONTHS_GENITIVE = (
 
 _VIEW_SOURCES = {'digest_site': 'digest', 'digest_hubs': 'digest', 'feed': 'feed'}
 
-# ASCII digits only and bounded lengths (Decision 5); applied with fullmatch
-_LIST_CALLBACK_RE = re.compile(r'hl:([sm]):([0-9]{1,9}):([0-9]{1,4})')
+# ASCII digits only, no leading zeros, bounded lengths (Decision 5); applied with fullmatch
+_LIST_CALLBACK_RE = re.compile(r'hl:([sm]):([1-9][0-9]{0,8}):(0|[1-9][0-9]{0,3})')
 _MAX_LIST_ID = 10 ** 9 - 1
 _MAX_POS_OR_OFFSET = 10 ** 4 - 1
 
