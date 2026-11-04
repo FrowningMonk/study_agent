@@ -18,11 +18,11 @@ Normalized article item (list and by-id share the shape):
     - url is always the canonical form built from the integer id;
     - hubs carry their type: an alias may exist both as a collective hub and as a
       company (corporative) hub (e.g. `bitrix`), so match on (alias, type).
+    Items with a wrong field type are rejected (the whole attempt fails), never coerced.
 
 Hub catalog item: {alias, title (unescaped), rating: float, hub_type}. The live
 catalog has no per-hub type field and lists collective hubs only, so hub_type is
 'collective' unless the API states a type explicitly.
-    Items with a wrong field type are rejected (the whole attempt fails), never coerced.
 
 Errors:
     - HabrNotFound — 404 with errorCode NOT_FOUND / POST_TYPE_MISMATCH;
