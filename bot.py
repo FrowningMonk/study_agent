@@ -1540,7 +1540,9 @@ def _store_link_metadata(habr_id: int) -> None:
         except Exception as e:
             logger.error('Не удалось отметить статью %s недоступной: %s', habr_id, _error_text(e))
     except (habr_api.HabrUnavailable, habr_api.HabrBusy) as e:
-        logger.warning('Хабы/теги статьи %s не получены: %s', habr_id, e)
+        # Category and status only: the message text is never logged
+        logger.warning('Хабы/теги статьи %s не получены: %s %s %s', habr_id, type(e).__name__,
+                       getattr(e, 'kind', ''), getattr(e, 'status', '') or '')
     except Exception:
         logger.exception('Хабы/теги статьи %s: непредвиденная ошибка', habr_id)
 

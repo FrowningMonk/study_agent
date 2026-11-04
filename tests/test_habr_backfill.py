@@ -101,6 +101,26 @@ def test_list_backfill_candidates(tmp_db):
     assert habr_store.list_backfill_candidates() == [10, 30]
 
 
+@pytest.mark.parametrize('state, expected', [
+    ('no_row', True),
+    ('bare_row', True),
+    ('fetched', False),
+    ('unavailable', False),
+])
+def test_needs_metadata_fetch(tmp_db, state, expected):
+    if state == 'bare_row':
+        conn = sqlite3.connect(tmp_db.DB_PATH)
+        with conn:
+            conn.execute('INSERT INTO habr_articles (habr_id, title) VALUES (7, ?)', ('bare',))
+        conn.close()
+    elif state == 'fetched':
+        habr_store.upsert_habr_article(_item(7))
+    elif state == 'unavailable':
+        habr_store.mark_unavailable(7)
+
+    assert habr_store.needs_metadata_fetch(7) is expected
+
+
 # =============================================================================
 # run_once
 # =============================================================================
@@ -148,10 +168,14 @@ def test_not_found_marks_unavailable_and_not_requested_again(tmp_db, habr, sleep
     assert habr.calls == []
 
 
-def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps):
+@pytest.mark.parametrize('error', [
+    habr_api.HabrUnavailable('http', 503),
+    habr_api.HabrBusy('busy'),
+], ids=['unavailable', 'busy'])
+def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps, error):
     for habr_id in (1, 2, 3):
         _save(tmp_db, habr_id)
-    habr.errors[2] = habr_api.HabrUnavailable('http', 503)
+    habr.errors[2] = error
 
     stats = habr_backfill.run_once()
 
@@ -170,6 +194,70 @@ def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps):
     assert habr_store.get_habr_article(3)['fetched_at'] is not None
 
 
+def test_db_error_on_store_stops_and_resumes_next_run(tmp_db, habr, sleeps, monkeypatch, caplog):
+    for habr_id in (1, 2, 3):
+        _save(tmp_db, habr_id)
+    real_upsert = habr_store.upsert_habr_article
+
+    def locked_on_2(item):
+        if item['habr_id'] == 2:
+            raise sqlite3.OperationalError('database is locked')
+        real_upsert(item)
+    monkeypatch.setattr(habr_store, 'upsert_habr_article', locked_on_2)
+
+    with caplog.at_level(logging.WARNING, logger='habr_backfill'):
+        stats = habr_backfill.run_once()
+
+    assert stats['stopped_on_error'] is True and stats['filled'] == 1
+    assert habr.ids == [1, 2]
+    assert habr_store.get_habr_article(2) is None and habr_store.get_habr_article(3) is None
+    assert any('OperationalError' in r.getMessage() for r in caplog.records)
+
+    monkeypatch.setattr(habr_store, 'upsert_habr_article', real_upsert)
+    habr.calls.clear()
+    stats = habr_backfill.run_once()
+
+    assert habr.ids == [2, 3] and stats['filled'] == 2 and stats['stopped_on_error'] is False
+
+
+def test_db_error_on_mark_unavailable_stops_run(tmp_db, habr, sleeps, monkeypatch):
+    _save(tmp_db, 1)
+    _save(tmp_db, 2)
+    habr.errors[1] = habr_api.HabrNotFound('NOT_FOUND')
+
+    def locked(habr_id):
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(habr_store, 'mark_unavailable', locked)
+
+    stats = habr_backfill.run_once()
+
+    assert stats['stopped_on_error'] is True and stats['unavailable'] == 0
+    assert habr.ids == [1]
+
+
+def test_db_error_on_listing_returns_stats(monkeypatch, habr, sleeps):
+    def locked():
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(habr_store, 'list_backfill_candidates', locked)
+
+    stats = habr_backfill.run_once()
+
+    assert stats['stopped_on_error'] is True and stats['requests'] == 0
+    assert habr.calls == []
+
+
+def test_failure_log_has_category_not_message_text(tmp_db, habr, sleeps, caplog):
+    _save(tmp_db, 1)
+    habr.errors[1] = habr_api.HabrUnavailable('invalid_shape', 200, 'SECRET-BODY-TEXT')
+
+    with caplog.at_level(logging.WARNING, logger='habr_backfill'):
+        habr_backfill.run_once()
+
+    text = ' '.join(r.getMessage() for r in caplog.records)
+    assert 'HabrUnavailable invalid_shape HTTP 200' in text
+    assert 'SECRET-BODY-TEXT' not in text
+
+
 def test_unexpected_exception_logged_thread_ends(monkeypatch, caplog):
     def boom():
         raise RuntimeError('db is gone')
@@ -182,16 +270,24 @@ def test_unexpected_exception_logged_thread_ends(monkeypatch, caplog):
     assert errors and errors[0].exc_info is not None
 
 
-def test_pause_between_articles(tmp_db, habr, sleeps):
+def test_pause_between_articles(tmp_db, habr, monkeypatch):
     for habr_id in (1, 2, 3):
         _save(tmp_db, habr_id)
+    events: list = []
+    monkeypatch.setattr(habr_backfill, '_sleep', lambda s: events.append(('sleep', s)))
+    real_fetch = habr
+
+    def fetch(habr_id, *, wait_timeout=None):
+        events.append(('fetch', habr_id))
+        return real_fetch(habr_id, wait_timeout=wait_timeout)
+    monkeypatch.setattr(habr_api, 'fetch_article', fetch)
 
     habr_backfill.run_once()
 
     assert habr_backfill.PAUSE_BETWEEN_ARTICLES == 2
-    assert sleeps and all(s == habr_backfill.PAUSE_BETWEEN_ARTICLES for s in sleeps)
-    # A pause separates consecutive requests
-    assert len(sleeps) >= 2
+    pause = ('sleep', habr_backfill.PAUSE_BETWEEN_ARTICLES)
+    # A pause between consecutive requests, none before the first or after the last
+    assert events == [('fetch', 1), pause, ('fetch', 2), pause, ('fetch', 3)]
 
 
 def test_duplicate_rows_not_merged(tmp_db, habr, sleeps):

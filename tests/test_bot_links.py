@@ -82,6 +82,36 @@ def fake(monkeypatch):
     return process
 
 
+class FakeKek:
+    """Stand-in for habr_api.fetch_article: records calls and how many bot calls preceded each."""
+
+    def __init__(self, sent, error=None):
+        self.sent = sent
+        self.error = error
+        self.calls: list[tuple[int, object, int]] = []
+
+    def __call__(self, habr_id, *, wait_timeout=None):
+        self.calls.append((habr_id, wait_timeout, len(self.sent)))
+        if self.error is not None:
+            raise self.error
+        return {
+            'habr_id': habr_id, 'title': 'T', 'url': habr_api.canonical_url(habr_id),
+            'published_at': datetime(2026, 1, 1, tzinfo=timezone.utc), 'score': 1, 'comments': 0,
+            'hubs': [('python', 'collective'), ('bitrix', 'corporative')], 'tags': ['tag1'],
+            'lead_text': '', 'post_type': 'article',
+        }
+
+
+@pytest.fixture(autouse=True)
+def kek(request, monkeypatch):
+    """Default kek fake for every test here: handle_url fetches hubs/tags after the summary,
+    so older link tests take the explicit success path instead of the network blocker."""
+    sent = request.getfixturevalue('tg') if 'tg' in request.fixturenames else []
+    fake_kek = FakeKek(sent)
+    monkeypatch.setattr(habr_api, 'fetch_article', fake_kek)
+    return fake_kek
+
+
 def _send(user_id, text, update_id=1):
     bot_module.bot.process_new_updates([_message_update(user_id, text, update_id=update_id)])
 
@@ -552,33 +582,6 @@ def test_is_article_linked_to_other_users_idea(tmp_db):
 # --- hubs/tags for linked articles (Task 14) -----------------------------------
 
 
-class FakeKek:
-    """Stand-in for habr_api.fetch_article: records calls and how many bot calls preceded each."""
-
-    def __init__(self, sent, error=None):
-        self.sent = sent
-        self.error = error
-        self.calls: list[tuple[int, object, int]] = []
-
-    def __call__(self, habr_id, *, wait_timeout=None):
-        self.calls.append((habr_id, wait_timeout, len(self.sent)))
-        if self.error is not None:
-            raise self.error
-        return {
-            'habr_id': habr_id, 'title': 'T', 'url': habr_api.canonical_url(habr_id),
-            'published_at': datetime(2026, 1, 1, tzinfo=timezone.utc), 'score': 1, 'comments': 0,
-            'hubs': [('python', 'collective'), ('bitrix', 'corporative')], 'tags': ['tag1'],
-            'lead_text': '', 'post_type': 'article',
-        }
-
-
-@pytest.fixture
-def kek(tg, monkeypatch):
-    fake_kek = FakeKek(tg)
-    monkeypatch.setattr(habr_api, 'fetch_article', fake_kek)
-    return fake_kek
-
-
 def test_link_flow_stores_hubs_tags_for_new_article(tg, tmp_db, fake, kek):
     _send(FRIEND, 'https://habr.com/ru/companies/x/articles/77/?utm_source=tg')
 
@@ -636,6 +639,13 @@ def test_link_flow_skips_fetch_when_already_fetched(tg, tmp_db, fake, kek, state
         habr_store.mark_unavailable(77)
 
     _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    assert any(t.startswith('Готово!') for t in _texts(tg, FRIEND))
+    assert kek.calls == []
+
+
+def test_link_flow_non_habr_link_makes_no_kek_call(tg, tmp_db, fake, kek):
+    _send(FRIEND, 'https://github.com/a/b')
 
     assert any(t.startswith('Готово!') for t in _texts(tg, FRIEND))
     assert kek.calls == []
