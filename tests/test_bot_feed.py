@@ -892,7 +892,6 @@ def test_commands_menu_and_help_list_new_commands():
         assert all(c in names for c in commands)
     for text in (bot_module.MSG_HELP, bot_module.MSG_HELP_OWNER, bot_module.MSG_START):
         assert all(f'/{c}' in text for c in commands)
-        assert '/digest' not in text
     for is_owner in (False, True):
         keyboard = bot_module.create_main_keyboard(is_owner=is_owner).keyboard
         labels = [b['text'] for row in keyboard for b in row]

@@ -16,6 +16,8 @@ Telegram-бот для агента изучения ИИ.
     /subscribe — Подписка на хабы Хабра
     /subscriptions — Мои подписки (отписка кнопкой ✖)
     /feed — Новые статьи за сутки из подписанных хабов
+    /digest on|off — Ежедневный дайджест Хабра
+    /digest_now [final] — Собрать дайджест сейчас (только владелец)
     /users — Пользователи и заявки на доступ (только владелец)
     <URL>  — Отправить ссылку → получить конспект
 
@@ -30,6 +32,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import telebot
 from telebot import types
@@ -48,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 import pipeline
 from pipeline import ensure_directories, process_article, save_article_to_db
+import digest
 import feed
 import habr_api
 import habr_store
@@ -79,6 +83,7 @@ from database import (
     get_idea_md,
     update_idea_md,
     list_users,
+    get_user,
     count_articles,
     wipe_articles,
 )
@@ -132,6 +137,7 @@ MSG_START: str = """👋 Привет!
 • /subscribe — подписаться на хабы
 • /subscriptions — мои подписки
 • /feed — новые статьи за сутки из моих хабов
+• /digest — каждый день пришлю дайджест Хабра (выключить: /digest off)
 
 📌 Поддерживаемые источники:
 • habr.com — технические статьи
@@ -152,11 +158,13 @@ MSG_HELP = """Команды:
 /subscribe - подписаться на хабы Хабра
 /subscriptions - мои подписки
 /feed - новые статьи за сутки из моих хабов
+/digest on|off - ежедневный дайджест Хабра (включить/выключить)
 
 Поддерживаемые источники: habr.com, github.com, infostart.ru"""
 MSG_HELP_OWNER = MSG_HELP + (
     "\n\nВладельцу:\n/users - пользователи и заявки на доступ"
     "\n/wipe - удалить все статьи (идеи останутся)"
+    "\n/digest_now [final] - собрать дайджест сейчас (final - засчитать как сегодняшний)"
 )
 MSG_PROCESSING = "Обрабатываю..."
 MSG_ERROR = "Ошибка: {error}"
@@ -274,10 +282,12 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ('subscribe', 'подписаться на хабы'),
     ('subscriptions', 'мои подписки'),
     ('feed', 'новое в моих хабах'),
+    ('digest', 'ежедневный дайджест: on/off'),
 ]
 OWNER_COMMANDS: list[tuple[str, str]] = BOT_COMMANDS + [
     ('users', 'пользователи и заявки'),
     ('wipe', 'удалить все статьи'),
+    ('digest_now', 'собрать дайджест сейчас'),
 ]
 
 
@@ -2146,6 +2156,107 @@ def _summarize_habr_click(chat_id: int, user_id: int, habr_id: int, source: str)
     return _summarize_for_user(chat_id, user_id, habr_id, source)
 
 
+# ========================
+# Daily digest (Decision 12): /digest on|off for every allowed user, owner-only
+# /digest_now. Build, delivery and the scheduler live in digest.py; bot.py only injects
+# `digest_send`, OWNER_ID and `is_allowed`.
+# ========================
+
+MSG_DIGEST_ON = 'Дайджест включён'
+MSG_DIGEST_OFF = 'Дайджест выключен'
+MSG_DIGEST_USAGE = ('Дайджест сейчас {state}.\n'
+                    'Включить: /digest on, выключить: /digest off')
+MSG_DIGEST_STATE_ON = 'включён'
+MSG_DIGEST_STATE_OFF = 'выключен'
+MSG_DIGEST_NOW_STARTED = 'Собираю дайджест…'
+MSG_DIGEST_NOW_USAGE = 'Использование: /digest_now или /digest_now final'
+
+
+def is_allowed(user_id: int) -> bool:
+    """Digest recipient check: the owner, or a user whose access is approved now."""
+    if user_id == OWNER_ID:
+        return True
+    record = get_user(user_id)
+    return record is not None and record.get('status') == 'approved'
+
+
+def digest_send(chat_id: int, text: str, rows: list | None) -> None:
+    """
+    `send` injected into digest.py: keyboard rows -> InlineKeyboardMarkup. Telegram
+    exceptions propagate on purpose (digest.py's 403/400/429 policy depends on them).
+    """
+    bot.send_message(chat_id, text, reply_markup=_to_markup(rows) if rows else None)
+
+
+def _command_args(message: telebot.types.Message) -> list[str]:
+    """Whitespace-separated command arguments, lower-cased (`/cmd@bot  a  b` -> ['a', 'b'])."""
+    return (telebot.util.extract_arguments(message.text) or '').lower().split()
+
+
+@bot.message_handler(commands=['digest'])
+def handle_digest(message: telebot.types.Message) -> None:
+    """/digest on|off; anything else shows the current state and the usage hint."""
+    chat_id, user_id = message.chat.id, message.from_user.id
+    args = _command_args(message)
+    # Only the DB work sits in the try: a Telegram send failure is not a settings error
+    try:
+        if args == ['on']:
+            habr_store.set_digest_enabled(user_id, True)
+            reply = MSG_DIGEST_ON
+        elif args == ['off']:
+            habr_store.set_digest_enabled(user_id, False)
+            reply = MSG_DIGEST_OFF
+        else:
+            state = MSG_DIGEST_STATE_ON if habr_store.get_digest_enabled(user_id) else MSG_DIGEST_STATE_OFF
+            reply = MSG_DIGEST_USAGE.format(state=state)
+    except Exception as e:
+        logger.exception('/digest: ошибка настроек для %s', user_id)
+        reply = MSG_ERROR.format(error=_error_text(e))
+    bot.send_message(chat_id, reply)
+
+
+@bot.message_handler(commands=['digest_now'])
+def handle_digest_now(message: telebot.types.Message) -> None:
+    """Owner only: the owner's digest now, in a background thread (digest._spawn)."""
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if user_id != OWNER_ID:
+        # Hidden command: a non-owner gets the same reply as for any unknown text
+        logger.warning('Попытка /digest_now не от владельца: user_id=%s', user_id)
+        bot.reply_to(message, MSG_UNKNOWN)
+        return
+    args = _command_args(message)
+    if args not in ([], ['final']):
+        bot.send_message(chat_id, MSG_DIGEST_NOW_USAGE)
+        return
+    try:
+        started = digest.start_digest_now(digest_send, OWNER_ID, final=bool(args))
+    except Exception:
+        logger.exception('/digest_now: не удалось запустить сборку')
+        bot.send_message(chat_id, digest.TEXT_DIGEST_NOW_FAILED.format(reason=digest.REASON_INTERNAL))
+        return
+    bot.send_message(chat_id, MSG_DIGEST_NOW_STARTED if started else digest.TEXT_BUSY)
+
+
+def _run_digest_scheduler() -> None:
+    """Scheduler thread body; digest._spawn names threads 'digest-now', so rename for logs."""
+    threading.current_thread().name = 'digest-scheduler'
+    digest.run_scheduler(digest_send, OWNER_ID, is_allowed)
+
+
+def _start_digest_scheduler() -> None:
+    """Starts the scheduler daemon thread; any failure is logged and never stops polling."""
+    try:
+        logger.info('Дайджест: DIGEST_TIME=%s МСК, ближайший запуск %s',
+                    digest.digest_time().strftime('%H:%M'),
+                    digest.next_run_time(datetime.now(feed.MSK)).strftime('%Y-%m-%d %H:%M'))
+    except Exception:
+        logger.exception('Дайджест: не удалось вычислить время запуска')
+    try:
+        digest._spawn(_run_digest_scheduler)
+    except Exception:
+        logger.exception('Дайджест: не удалось запустить планировщик')
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message: telebot.types.Message) -> None:
     """Обрабатывает все остальные сообщения - отправляет подсказку."""
@@ -2556,6 +2667,8 @@ def main() -> None:
             logger.info('Модель по умолчанию (%s): %s (%s) — OK', label, model, provider)
         else:
             logger.warning('Модель по умолчанию (%s): %s (%s) — НЕДОСТУПНА: %s', label, model, provider, err)
+
+    _start_digest_scheduler()
 
     try:
         bot.set_my_commands([types.BotCommand(name, desc) for name, desc in BOT_COMMANDS])
