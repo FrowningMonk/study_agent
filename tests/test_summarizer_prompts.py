@@ -152,21 +152,26 @@ def test_github_prompt_marks_missing_metadata_explicitly():
 
 
 def _capture_generate(monkeypatch, result='Автор сравнивает два подхода к кешированию.'):
-    """Replaces _generate with a recorder; check_model_availability must not be called."""
+    """
+    Replaces _generate with a recorder. A check_model_availability call is recorded
+    in the same list (not raised: generate_short_description swallows exceptions),
+    so `len(calls) == 1` also proves it was not called.
+    """
     calls = []
 
-    def fake_generate(system_prompt, user_prompt, model, provider, max_tokens=None):
+    def fake_generate(system_prompt, user_prompt, model, provider, max_tokens=summarizer.MAX_OUTPUT_TOKENS):
         calls.append({
             'system_prompt': system_prompt, 'user_prompt': user_prompt,
             'model': model, 'provider': provider, 'max_tokens': max_tokens,
         })
         return result
 
-    def fail_check(*args, **kwargs):
-        raise AssertionError('check_model_availability must not be called')
+    def record_check(*args, **kwargs):
+        calls.append({'check_model_availability': args})
+        return True, None
 
     monkeypatch.setattr(summarizer, '_generate', fake_generate)
-    monkeypatch.setattr(summarizer, 'check_model_availability', fail_check)
+    monkeypatch.setattr(summarizer, 'check_model_availability', record_check)
     return calls
 
 
@@ -236,6 +241,17 @@ def test_short_description_empty_lead_still_calls_llm(monkeypatch):
     assert _block(calls[0]['user_prompt'], 'article_title') == 'Только заголовок'
 
 
+def test_short_description_tolerates_non_str_input_and_caps_title(monkeypatch):
+    calls = _capture_generate(monkeypatch)
+
+    assert summarizer.generate_short_description(None, None) is not None
+    assert _block(calls[0]['user_prompt'], 'article_title') == ''
+    assert _block(calls[0]['user_prompt'], 'article_lead') == ''
+
+    summarizer.generate_short_description('з' * 1000, '')
+    assert _block(calls[1]['user_prompt'], 'article_title') == 'з' * summarizer.SHORT_DESCRIPTION_TITLE_MAX_CHARS
+
+
 def test_short_description_keeps_plain_title_markup_text(monkeypatch):
     calls = _capture_generate(monkeypatch)
 
@@ -244,7 +260,7 @@ def test_short_description_keeps_plain_title_markup_text(monkeypatch):
     assert _block(calls[0]['user_prompt'], 'article_title') == 'Про тег &lt;script&gt; и &'
 
 
-@pytest.mark.parametrize('char', ['‮', '⁦', '‏', '​', '\x00', '\x1b', ' ', '﻿'])
+@pytest.mark.parametrize('char', ['\u202e', '\u2066', '\u200f', '\u200b', '\x00', '\x1b', '\u2028', '\ufeff'])
 def test_short_description_strips_control_and_bidi_chars(monkeypatch, char):
     calls = _capture_generate(monkeypatch)
 
@@ -271,6 +287,10 @@ def test_short_description_strips_control_and_bidi_chars(monkeypatch, char):
     '- Автор разбирает кеширование.',
     '# Описание',
     'Автор разбирает `Redis`.',
+    # A label copied from the prompt format would be cached and broadcast
+    'Описание: Автор разбирает кеширование.',
+    '  description: Автор разбирает кеширование.',
+    '<output>Автор разбирает кеширование.</output>',
     None,
     123,
     ['Автор разбирает кеширование.'],
@@ -288,6 +308,9 @@ def test_short_description_rejects_bad_output(monkeypatch, output):
     # e-mail and path are not mentions/commands (feed patterns)
     ('Пишет на team@example.com, код в src/app.', 'Пишет на team@example.com, код в src/app.'),
     ('Сравнение C++ и Rust: 2 > 1?', 'Сравнение C++ и Rust: 2 > 1?'),
+    # Dunder names are not markdown; a label word inside the text is not a preamble
+    ('Автор объясняет, когда вызывается __init__.', 'Автор объясняет, когда вызывается __init__.'),
+    ('Автор сравнивает описание: API и SDK.', 'Автор сравнивает описание: API и SDK.'),
 ])
 def test_short_description_accepts_valid_output(monkeypatch, output, expected):
     _capture_generate(monkeypatch, result=output)

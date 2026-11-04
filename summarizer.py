@@ -397,7 +397,10 @@ def create_prompt(article_data: dict) -> tuple[str, str]:
 # =============================================================================
 
 SHORT_DESCRIPTION_MAX_TOKENS: int = 300
+SHORT_DESCRIPTION_TITLE_MAX_CHARS: int = 300
 SHORT_DESCRIPTION_LEAD_MAX_CHARS: int = 2000
+# Validator limits (3 lines, 400 chars) are deliberately looser than the prompt's
+# targets (1-2 sentences, 250 chars): a slightly long but clean answer is still useful.
 SHORT_DESCRIPTION_MAX_CHARS: int = 400
 SHORT_DESCRIPTION_MAX_LINES: int = 3
 
@@ -409,27 +412,36 @@ Input: the title is inside <article_title>, the article's lead (the author's ann
 
 Use only facts from the title and lead. When the lead is empty or says little, write one sentence based on the title and stay general: an invented detail would mislead the reader.
 
+In the examples, <output> holds the whole answer; your reply is that text alone, without the tags.
+
 <example>
+<input>
 <article_title>Как мы перевели CI на свои раннеры</article_title>
 <article_lead>Рассказываю, зачем ушли с облачных раннеров, сколько это стоило и что сломалось по пути.</article_lead>
-Описание: Команда перенесла CI с облачных раннеров на свои серверы; автор объясняет причины, считает затраты и разбирает, что сломалось при переезде.
+</input>
+<output>Команда перенесла CI с облачных раннеров на свои серверы; автор объясняет причины, считает затраты и разбирает, что сломалось при переезде.</output>
 </example>
 
 <example>
-<article_title>Заметки о PostgreSQL 17</article_title>
+<input>
+<article_title>Почему мы отказались от микросервисов</article_title>
 <article_lead></article_lead>
-Описание: Заметки автора о PostgreSQL 17.
-</example>
-
-The examples show the input and, after «Описание:», the expected text; output only the text itself, without the «Описание:» label."""
+</input>
+<output>Автор объясняет, почему команда отказалась от микросервисной архитектуры.</output>
+</example>"""
 
 SHORT_DESCRIPTION_USER_PROMPT_TEMPLATE: str = """<article_title>{title}</article_title>
 <article_lead>{lead}</article_lead>"""
 
-# Markup in model output: HTML tags, bold/italic/code markers, headings, list items, quotes
+# Markup in model output: HTML tags, bold and code markers, headings, list items, quotes.
+# "__" is not markup here: dunder names like __init__ are normal in tech descriptions.
 _SHORT_DESCRIPTION_MARKUP_RE = re.compile(
-    r'<\s*/?\s*[A-Za-z!][^>]*>|\*\*|__|`|^\s*(?:#|[-*+•]\s|\d+[.)]\s|>)',
+    r'<\s*/?\s*[A-Za-z!][^>]*>|\*\*|`|^\s*(?:#|[-*+•]\s|\d+[.)]\s|>)',
     re.MULTILINE,
+)
+# A label before the answer ("Описание: ...") copied from the prompt's format
+_SHORT_DESCRIPTION_LABEL_RE = re.compile(
+    r'^\s*(?:описание|краткое описание|ответ|description|summary|output)\s*:', re.IGNORECASE,
 )
 
 
@@ -451,7 +463,9 @@ def _validate_short_description(text: object) -> str | None:
     result = '\n'.join(lines)
     if len(result) > SHORT_DESCRIPTION_MAX_CHARS:
         return None
-    for pattern in (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE, _SHORT_DESCRIPTION_MARKUP_RE):
+    patterns = (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE,
+                _SHORT_DESCRIPTION_MARKUP_RE, _SHORT_DESCRIPTION_LABEL_RE)
+    for pattern in patterns:
         if pattern.search(result):
             return None
     return result
@@ -772,7 +786,7 @@ def generate_short_description(title: str, lead_text: str) -> str | None:
     title_text = feed.strip_control_bidi(html.unescape(title if isinstance(title, str) else ''))
     lead_plain = feed.strip_control_bidi(feed.html_to_text(lead_text))
     user_prompt = SHORT_DESCRIPTION_USER_PROMPT_TEMPLATE.format(
-        title=_escape_angle_brackets(title_text.strip()),
+        title=_escape_angle_brackets(title_text.strip()[:SHORT_DESCRIPTION_TITLE_MAX_CHARS]),
         lead=_escape_angle_brackets(lead_plain[:SHORT_DESCRIPTION_LEAD_MAX_CHARS]),
     )
 
