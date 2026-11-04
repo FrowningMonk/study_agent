@@ -19,6 +19,7 @@ import digest
 import habr_api
 import habr_backfill
 import habr_store
+from conftest import IN_DRAFTS_ENVELOPE, KekResponse
 
 
 # =============================================================================
@@ -172,8 +173,13 @@ def test_not_found_marks_unavailable_and_not_requested_again(tmp_db, habr, sleep
 
 @pytest.mark.parametrize('error', [
     habr_api.HabrUnavailable('http', 503),
+    habr_api.HabrUnavailable('http', 429),
+    habr_api.HabrUnavailable('http', 408),
+    habr_api.HabrUnavailable('timeout'),
+    habr_api.HabrUnavailable('network', detail='ConnectionError'),
+    habr_api.HabrUnavailable('invalid_shape', 200),
     habr_api.HabrBusy('busy'),
-], ids=['unavailable', 'busy'])
+], ids=['http-503', 'http-429', 'http-408', 'timeout', 'network', 'invalid-shape', 'busy'])
 def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps, error):
     for habr_id in (1, 2, 3):
         _save(tmp_db, habr_id)
@@ -194,6 +200,46 @@ def test_transient_error_stops_and_resumes_next_run(tmp_db, habr, sleeps, error)
     assert habr.ids == [2, 3]
     assert stats['filled'] == 2 and stats['stopped_on_error'] is False
     assert habr_store.get_habr_article(3)['fetched_at'] is not None
+
+
+def test_unknown_403_code_skipped_and_next_id_processed(tmp_db, sleeps, monkeypatch, fixture_text, caplog):
+    """CR-2: a per-article 4xx that habr_api does not map (real parsing: 403 with an unknown
+    errorCode) is skipped, not marked; the run goes on and the id stays a candidate."""
+    article = json.loads(fixture_text('habr_article.json'))          # id 1102920
+    odd, normal = 1102000, int(article['id'])
+    for habr_id in (odd, normal):
+        _save(tmp_db, habr_id)
+
+    def kek(url, params=None, **kw):
+        if f'/articles/{odd}/' in url:
+            return KekResponse(403, {'httpCode': 403, 'message': 'SECRET-TEXT', 'errorCode': 'SOMETHING_NEW'})
+        return KekResponse(200, article)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+    with caplog.at_level(logging.WARNING, logger='habr_backfill'):
+        stats = habr_backfill.run_once()
+
+    assert stats == {'candidates': 2, 'requests': 2, 'filled': 1, 'unavailable': 0, 'skipped': 1,
+                     'stopped_on_error': False}
+    assert habr_store.get_habr_article(odd) is None                      # not marked unavailable
+    assert habr_store.get_habr_article(normal)['fetched_at'] is not None
+    assert habr_store.list_backfill_candidates() == [odd]                # retried on the next start
+    skip_logs = [r.getMessage() for r in caplog.records if 'skipped' in r.getMessage()]
+    assert skip_logs == [f'Backfill: skipped id={odd} (HabrUnavailable http HTTP 403), retried on next start']
+    assert not any('SECRET-TEXT' in r.getMessage() or 'SOMETHING_NEW' in r.getMessage() for r in caplog.records)
+
+
+def test_server_error_still_stops_after_skip(tmp_db, habr, sleeps):
+    for habr_id in (1, 2, 3):
+        _save(tmp_db, habr_id)
+    habr.errors[1] = habr_api.HabrUnavailable('http', 410)
+    habr.errors[2] = habr_api.HabrUnavailable('http', 502)
+
+    stats = habr_backfill.run_once()
+
+    assert habr.ids == [1, 2]
+    assert stats['skipped'] == 1 and stats['stopped_on_error'] is True and stats['filled'] == 0
+    assert habr_store.get_habr_article(3) is None
 
 
 def test_db_error_on_store_stops_and_resumes_next_run(tmp_db, habr, sleeps, monkeypatch, caplog):
@@ -260,19 +306,6 @@ def test_failure_log_has_category_not_message_text(tmp_db, habr, sleeps, caplog)
     assert 'SECRET-BODY-TEXT' not in text
 
 
-class _KekResponse:
-    def __init__(self, status, body):
-        self.status_code = status
-        self.headers = {}
-        self._body = json.dumps(body).encode('utf-8')
-
-    def iter_content(self, chunk_size=1):
-        yield self._body
-
-    def close(self):
-        pass
-
-
 def test_drafted_article_marked_unavailable_and_backfill_continues(tmp_db, sleeps, monkeypatch, fixture_text):
     """QA-1: kek 403 IN_DRAFTS (real habr_api parsing) marks the id unavailable and the run
     goes on to the next id; the next start makes no request."""
@@ -286,14 +319,15 @@ def test_drafted_article_marked_unavailable_and_backfill_continues(tmp_db, sleep
     def kek(url, params=None, **kw):
         log.append(url)
         if f'/articles/{drafted}/' in url:
-            return _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'})
-        return _KekResponse(200, article)
+            return KekResponse(403, IN_DRAFTS_ENVELOPE)
+        return KekResponse(200, article)
 
     monkeypatch.setattr(habr_api.requests, 'get', kek)
 
     stats = habr_backfill.run_once()
 
-    assert stats == {'candidates': 2, 'requests': 2, 'filled': 1, 'unavailable': 1, 'stopped_on_error': False}
+    assert stats == {'candidates': 2, 'requests': 2, 'filled': 1, 'unavailable': 1, 'skipped': 0,
+                     'stopped_on_error': False}
     assert habr_store.get_habr_article(drafted)['unavailable_at'] is not None
     assert habr_store.get_habr_article(normal)['fetched_at'] is not None
     log.clear()

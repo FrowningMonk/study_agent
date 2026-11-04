@@ -256,7 +256,8 @@ def get_viewed_ids(user_id: int) -> set[int]:
 
 def _write_article(conn: sqlite3.Connection, item: dict, fetched_at: str) -> None:
     habr_id = item['habr_id']
-    # short_description and unavailable_at are deliberately not in the UPDATE set
+    # A successful fetch proves the article is available again (e.g. moved back from
+    # drafts): unavailable_at is cleared. short_description is deliberately kept.
     conn.execute(
         """
         INSERT INTO habr_articles (
@@ -269,7 +270,8 @@ def _write_article(conn: sqlite3.Connection, item: dict, fetched_at: str) -> Non
             score = excluded.score,
             comments_count = excluded.comments_count,
             lead_text = excluded.lead_text,
-            fetched_at = excluded.fetched_at
+            fetched_at = excluded.fetched_at,
+            unavailable_at = NULL
         """,
         (
             habr_id,
@@ -298,8 +300,8 @@ def upsert_habr_articles(items: Iterable[dict]) -> None:
     """
     Upserts normalized habr_api items (habr_id, title, url, published_at, score,
     comments, hubs [(alias, type)], tags, lead_text) in one transaction.
-    Hub and tag sets of each habr_id are replaced; short_description and
-    unavailable_at are kept.
+    Hub and tag sets of each habr_id are replaced; short_description is kept and
+    unavailable_at is cleared (the items come from a successful fetch).
     """
     fetched_at = _now()
     conn = database._get_connection()

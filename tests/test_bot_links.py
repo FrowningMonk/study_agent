@@ -7,7 +7,6 @@ Bot tests run through real telebot dispatch (`tg`); `process_article` and
 autouse guard in conftest.
 """
 
-import json
 import logging
 import sqlite3
 import time
@@ -20,7 +19,7 @@ import feed
 import habr_api
 import habr_store
 import pipeline
-from conftest import FRIEND, _buttons, _callback_update, _message_update, _sent_to
+from conftest import IN_DRAFTS_ENVELOPE, KekResponse, FRIEND, _buttons, _callback_update, _message_update, _sent_to
 
 OWNER = bot_module.OWNER_ID
 CANONICAL_123 = 'https://habr.com/ru/articles/123/'
@@ -598,28 +597,22 @@ def test_is_article_linked_to_other_users_idea(tmp_db):
 # --- hubs/tags for linked articles (Task 14) -----------------------------------
 
 
-class _KekResponse:
-    def __init__(self, status, body):
-        self.status_code = status
-        self.headers = {}
-        self._body = json.dumps(body).encode('utf-8')
-
-    def iter_content(self, chunk_size=1):
-        yield self._body
-
-    def close(self):
-        pass
-
-
 def test_link_flow_drafted_article_marked_unavailable(tg, tmp_db, fake, monkeypatch):
     """QA-1 in the link flow: the summary is delivered as usual, then the hubs/tags fetch
     gets 403 IN_DRAFTS (real habr_api) and marks the article unavailable, silently."""
     monkeypatch.setattr(habr_api, 'fetch_article', _REAL_FETCH_ARTICLE)
-    monkeypatch.setattr(habr_api.requests, 'get',
-                        lambda url, **kw: _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'}))
+    kek_urls = []
+
+    def kek(url, **kw):
+        kek_urls.append(url)
+        return KekResponse(403, IN_DRAFTS_ENVELOPE)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
     tmp_db.create_idea('Idea', None, FRIEND)
 
     _send(FRIEND, 'https://habr.com/ru/articles/88/')
+
+    assert kek_urls == ['https://habr.com/kek/v2/articles/88/']     # one canonical request
 
     texts = [s[1][1] for s in _sent_to(tg, FRIEND)]
     assert any('NEW SUMMARY' in t for t in texts)

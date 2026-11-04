@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import sys
 import threading
@@ -18,6 +19,33 @@ sys.path.insert(0, str(ROOT))
 # bot.py fails at import without a token and OWNER_ID; a .env (if any) overrides them
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123456:TEST')
 os.environ.setdefault('OWNER_ID', '1000')
+
+
+class KekResponse:
+    """Streamed kek response as habr_api._request reads it (JSON-encodes dict/list bodies)."""
+
+    def __init__(self, status: int, body=b'', headers: dict | None = None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode('utf-8')
+        elif isinstance(body, str):
+            body = body.encode('utf-8')
+        self.status_code = status
+        self.headers = headers or {}
+        self._body = body
+
+    def iter_content(self, chunk_size=1):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+# Live kek envelope for an article hidden into drafts (id 1103492, probed 2026-11-05;
+# author data trimmed)
+IN_DRAFTS_ENVELOPE = {
+    'httpCode': 403, 'message': 'post drafted',
+    'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS',
+}
 
 
 class SignallingLock:

@@ -489,7 +489,7 @@ def fetch_article(habr_id: int, *, wait_timeout: float | None = None,
         if status in _GONE_BY_STATUS:
             code = _error_code(body)          # the body is already size-capped by _request
             if code in _GONE_BY_STATUS[status]:
-                logger.info('Habr article not found: id=%d, status=%d, code=%s', habr_id, status, code)
+                logger.info('Habr article unavailable: id=%d, status=%d, code=%s', habr_id, status, code)
                 raise HabrNotFound(code, status)
             raise HabrUnavailable('http', status)
         if status != 200:

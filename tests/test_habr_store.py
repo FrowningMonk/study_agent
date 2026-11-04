@@ -327,11 +327,22 @@ def test_upsert_habr_article_replaces_hubs_tags_keeps_description(tmp_db):
     assert got['hubs'] == [{'alias': 'go', 'hub_type': 'collective'}]
     assert got['tags'] == ['c']
     assert got['short_description'] == 'Short text'
-    assert got['unavailable_at'] is not None
+    assert got['unavailable_at'] is None            # a successful fetch: available again (CR-1)
     assert got['published_at'] == '2026-11-03T09:00:00.000000+00:00'
     assert got['fetched_at'] is not None
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_hubs') == [(1,)]
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_tags') == [(1,)]
+
+
+def test_republished_article_recovers_from_unavailable(tmp_db):
+    """Drafted (marked unavailable, no metadata), then republished and fetched again."""
+    habr_store.mark_unavailable(5)
+    assert habr_store.needs_metadata_fetch(5) is False
+    habr_store.upsert_habr_articles([_item(5)])                      # e.g. seen in a list fetch
+    got = habr_store.get_habr_article(5)
+    assert got['unavailable_at'] is None and got['fetched_at'] is not None
+    habr_store.mark_unavailable(5)                                    # hidden again
+    assert habr_store.get_habr_article(5)['unavailable_at'] is not None
 
 
 def test_upsert_rejects_naive_datetime(tmp_db):

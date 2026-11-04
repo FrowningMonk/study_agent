@@ -7,8 +7,13 @@ habr_id in `articles` that has neither `fetched_at` nor `unavailable_at`:
     - success -> metadata, hubs and tags upserted (each article committed alone,
       so a restart mid-run keeps the progress);
     - HabrNotFound -> `unavailable_at` set, the id is never requested again;
-    - HabrUnavailable / HabrBusy -> the run stops, the id stays unfilled and is
-      retried on the next bot start;
+    - a per-article 4xx that habr_api does not map yet (HabrUnavailable kind 'http',
+      400-499 except 408/429, e.g. an unknown 403 errorCode) -> the id is skipped
+      (`skipped` stat, not marked) and the run continues; it stays a candidate, so a
+      later mapping or a recovered article is picked up on the next start. One such
+      id must never stall every later id (QA-1 root cause);
+    - any other HabrUnavailable (5xx, timeout, network, invalid response) / HabrBusy
+      -> the run stops, the id stays unfilled and is retried on the next bot start;
     - sqlite3.Error while listing or storing (e.g. "database is locked" when the
       digest writes longer than the 5 s busy timeout) -> treated as transient too:
       the run stops and resumes on the next start. Skipping the id instead would
@@ -57,16 +62,25 @@ def _describe(error: Exception) -> str:
     return ' '.join(parts)
 
 
+def _per_article_failure(error: Exception) -> bool:
+    """A client error about this one article (skip it), not a Habr-wide problem (stop)."""
+    return (isinstance(error, habr_api.HabrUnavailable) and error.kind == 'http'
+            and isinstance(error.status, int) and 400 <= error.status < 500
+            and error.status not in (408, 429))
+
+
 def _log_summary(stats: dict, started: float) -> None:
     logger.info('Backfill finished: candidates=%d, requests=%d, filled=%d, unavailable=%d, '
-                'stopped_on_error=%s, duration=%.1fs',
+                'skipped=%d, stopped_on_error=%s, duration=%.1fs',
                 stats['candidates'], stats['requests'], stats['filled'], stats['unavailable'],
-                stats['stopped_on_error'], time.monotonic() - started)
+                stats['skipped'], stats['stopped_on_error'], time.monotonic() - started)
 
 
 def run_once() -> dict:
-    """Backfills all current candidates once; returns stats (requests, filled, unavailable, stopped_on_error)."""
-    stats = {'candidates': 0, 'requests': 0, 'filled': 0, 'unavailable': 0, 'stopped_on_error': False}
+    """Backfills all current candidates once; returns stats (candidates, requests, filled,
+    unavailable, skipped, stopped_on_error)."""
+    stats = {'candidates': 0, 'requests': 0, 'filled': 0, 'unavailable': 0, 'skipped': 0,
+             'stopped_on_error': False}
     started = time.monotonic()
     try:
         candidates = habr_store.list_backfill_candidates()
@@ -92,7 +106,14 @@ def run_once() -> dict:
             else:
                 habr_store.upsert_habr_article(item)
                 stats['filled'] += 1
-        except (habr_api.HabrUnavailable, habr_api.HabrBusy, sqlite3.Error) as e:
+        except habr_api.HabrUnavailable as e:
+            if not _per_article_failure(e):
+                logger.warning('Backfill: stopped on id=%d (%s), will resume on next start', habr_id, _describe(e))
+                stats['stopped_on_error'] = True
+                break
+            logger.warning('Backfill: skipped id=%d (%s), retried on next start', habr_id, _describe(e))
+            stats['skipped'] += 1
+        except (habr_api.HabrBusy, sqlite3.Error) as e:
             # Network fetch is done outside any transaction; only the short store call may hit a DB lock
             logger.warning('Backfill: stopped on id=%d (%s), will resume on next start', habr_id, _describe(e))
             stats['stopped_on_error'] = True

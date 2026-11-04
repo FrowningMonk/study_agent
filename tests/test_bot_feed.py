@@ -7,7 +7,6 @@ fetchers (the autouse guard blocks real HTTP); `process_article` and
 worker synchronously, or captures it so waiters can join before it runs.
 """
 
-import json
 import logging
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -21,7 +20,7 @@ import feed
 import habr_api
 import habr_store
 import hubs
-from conftest import FRIEND, STRANGER, _buttons, _callback_update, _message_update, _sent_to
+from conftest import IN_DRAFTS_ENVELOPE, KekResponse, FRIEND, STRANGER, _buttons, _callback_update, _message_update, _sent_to
 
 OWNER = bot_module.OWNER_ID
 OTHER = 4000                     # a second approved non-owner user
@@ -779,19 +778,6 @@ def test_summary_button_unavailable_404(tg, habr, llm, tmp_db, sync_spawn):
     assert len(feed.REGISTRY) == 0
 
 
-class _KekResponse:
-    def __init__(self, status, body):
-        self.status_code = status
-        self.headers = {}
-        self._body = json.dumps(body).encode('utf-8')
-
-    def iter_content(self, chunk_size=1):
-        yield self._body
-
-    def close(self):
-        pass
-
-
 def test_summary_button_drafted_article_shows_gone_without_scrape(tg, habr, llm, tmp_db, sync_spawn, monkeypatch):
     """QA-2, through dispatch and the real habr_api: kek 403 IN_DRAFTS -> the standard
     'article gone' text, unavailable_at set, no page scrape / LLM."""
@@ -800,7 +786,7 @@ def test_summary_button_drafted_article_shows_gone_without_scrape(tg, habr, llm,
 
     def kek(url, params=None, **kw):
         kek_urls.append(url)
-        return _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'})
+        return KekResponse(403, IN_DRAFTS_ENVELOPE)
 
     monkeypatch.setattr(habr_api.requests, 'get', kek)
     list_id = _list_for(FRIEND)
