@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 import requests
@@ -226,13 +227,48 @@ def test_habr_comments_api_failure_returns_empty(monkeypatch, respond):
 
 def test_habr_comments_busy_throttle_returns_empty(monkeypatch):
     calls = _kek_get(monkeypatch, lambda url: pytest.fail('unexpected request'))
+    monkeypatch.setattr(habr_api_module, 'HANDLER_WAIT_TIMEOUT', 30)
     monkeypatch.setattr(habr_api_module, 'HANDLER_DEADLINE', 0.1)
     habr_api_module._lock.acquire()
     try:
+        started = time.monotonic()
         assert scraper._fetch_habr_comments('https://habr.com/ru/articles/1/') == []
+        assert time.monotonic() - started < 2       # the deadline, not the 30 s wait, ended it
     finally:
         habr_api_module._lock.release()
     assert calls == []
+
+
+def test_habr_comments_pass_handler_wait_and_deadline(monkeypatch):
+    seen = []
+
+    def spy(habr_id, *, wait_timeout=None, deadline=None):
+        seen.append((habr_id, wait_timeout, deadline))
+        return {}
+
+    monkeypatch.setattr(habr_api_module, 'fetch_comments', spy)
+    before = time.monotonic()
+    assert scraper._fetch_habr_comments('https://habr.com/ru/articles/42/') == []
+    (habr_id, wait_timeout, deadline), = seen
+    assert habr_id == 42 and wait_timeout == habr_api_module.HANDLER_WAIT_TIMEOUT
+    assert deadline is not None
+    assert before + habr_api_module.HANDLER_DEADLINE <= deadline <= time.monotonic() + habr_api_module.HANDLER_DEADLINE
+
+
+def test_habr_comments_malformed_values_do_not_crash(monkeypatch):
+    data = {'comments': {
+        '1': {'id': '1', 'parentId': None, 'status': 'published', 'message': 'a',
+              'children': ['2', {'x': 1}, None, '9'], 'author': 'not-a-dict'},
+        '2': {'id': '2', 'parentId': '1', 'status': 'published', 'message': 42, 'children': 'zz'},
+        '3': 'garbage',
+        '4': {'id': '4', 'parentId': None, 'status': 'published', 'message': '<p>b</p>',
+              'children': None, 'author': {'alias': 'bob'}},
+    }}
+    _kek_get(monkeypatch, lambda url: StreamedResponse(json.dumps(data)))
+
+    comments = scraper._fetch_habr_comments('https://habr.com/ru/articles/1/')
+
+    assert [(c['number'], c['author'], c['text']) for c in comments] == [(1, 'аноним', 'a'), (3, 'bob', 'b')]
 
 
 def test_habr_comments_url_without_article_id_skips_request(monkeypatch):

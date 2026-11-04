@@ -261,10 +261,8 @@ def _fetch_habr_comments(url: str) -> list[dict]:
     try:
         raw = habr_api.fetch_comments(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
                                       deadline=habr_api.handler_deadline())
-    except (habr_api.HabrUnavailable, habr_api.HabrBusy) as e:
-        # Category only: the message text is never logged
-        logger.warning('Habr comments fetch failed: id=%s, %s %s', habr_id, type(e).__name__,
-                       getattr(e, 'kind', ''))
+    except (habr_api.HabrUnavailable, habr_api.HabrBusy):
+        # Already logged by habr_api (type/kind/status only; INFO for an oversized tree)
         return []
 
     roots = [cid for cid, c in raw.items() if not c.get('parentId')]
@@ -280,19 +278,24 @@ def _fetch_habr_comments(url: str) -> list[dict]:
             continue
         visited.add(cid)
         ordered.append((cid, c))
-        stack.extend(reversed(c.get('children') or []))
+        children = c.get('children')
+        # Only string ids are followed: a malformed children list never breaks the walk
+        if isinstance(children, list):
+            stack.extend(reversed([child for child in children if isinstance(child, str)]))
 
     number_by_id = {cid: i for i, (cid, _) in enumerate(ordered, 1)}
     comments = []
     for cid, c in ordered:
         if c.get('status') != 'published' or c.get('isSuspended'):
             continue
-        text = BeautifulSoup(c.get('message') or '', 'html.parser').get_text(' ', strip=True)
+        message = c.get('message')
+        text = BeautifulSoup(message, 'html.parser').get_text(' ', strip=True) if isinstance(message, str) else ''
         if not text:
             continue
+        author = c.get('author')
         comments.append(_make_comment(
             number=number_by_id[cid],
-            author=(c.get('author') or {}).get('alias') or 'аноним',
+            author=(author.get('alias') if isinstance(author, dict) else None) or 'аноним',
             text=text,
             reply_to=number_by_id.get(c.get('parentId')),
             is_post_author=bool(c.get('isPostAuthor')),

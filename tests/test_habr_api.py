@@ -6,6 +6,7 @@ The network is a fake `requests.get` (FakeHabr); no request reaches habr.com
 
 import copy
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -616,7 +617,7 @@ def test_request_uses_timeout_and_user_agent(fake_habr, article_fixture, hubs_fi
 
     assert len(fake.log) == 3
     for entry in fake.log:
-        assert entry['timeout'] == habr_api.HABR_API_TIMEOUT == 15
+        assert entry['timeout'] == (habr_api.HABR_API_TIMEOUT, habr_api.HABR_API_TIMEOUT) == (15, 15)
         assert entry['headers']['User-Agent'] == scraper.USER_AGENT
         assert entry['allow_redirects'] is False
         assert entry['stream'] is True
@@ -876,7 +877,7 @@ def test_fetch_comments_empty_variants(fake_habr, body):
 
 @pytest.mark.parametrize('response, kind', [
     (FakeResponse(301, '', {'Location': 'http://169.254.169.254/'}), 'redirect'),
-    (FakeResponse(200, b'x' * 10, {'Content-Length': str(2 * 1024 * 1024 + 1)}), 'too_large'),
+    (FakeResponse(200, b'x' * 10, {'Content-Length': str(8 * 1024 * 1024 + 1)}), 'too_large'),
     (FakeResponse(404, {'errorCode': 'NOT_FOUND'}), 'http'),
     (FakeResponse(503, ''), 'http'),
     (FakeResponse(200, 'not json'), 'invalid_json'),
@@ -888,6 +889,45 @@ def test_fetch_comments_failures_raise_unavailable(fake_habr, response, kind):
         habr_api.fetch_comments(1)
     assert excinfo.value.kind == kind
     assert len(fake.log) == 1
+
+
+def test_fetch_comments_own_size_cap(fake_habr, caplog):
+    """Comments get 8 MB (busy discussions exceed the 2 MB article cap); over it: INFO, dropped."""
+    assert habr_api.COMMENTS_MAX_RESPONSE_BYTES == 8 * 1024 * 1024
+    filler = 'x' * (3 * 1024 * 1024)
+    fake_habr(FakeResponse(200, {'comments': {'1': {'id': '1', 'message': filler}}}))
+    assert habr_api.fetch_comments(1)['1']['message'] == filler        # > 2 MB is fine
+    with pytest.raises(habr_api.HabrUnavailable):
+        habr_api.fetch_article(1)                                      # the article cap stays 2 MB
+
+    big = FakeResponse(200, b'{"comments": {"1": {"message": "' + b'x' * (9 * 1024 * 1024) + b'"}}}')
+    fake_habr(big)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger='habr_api'):
+        with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+            habr_api.fetch_comments(7)
+    assert excinfo.value.kind == 'too_large'
+    assert big.bytes_served <= habr_api.COMMENTS_MAX_RESPONSE_BYTES + 64 * 1024
+    assert any(r.levelno == logging.INFO and 'comments dropped' in r.getMessage() and 'id=7' in r.getMessage()
+               for r in caplog.records)
+
+
+def test_fetch_comments_drops_malformed_entries(fake_habr):
+    good = {'id': '1', 'parentId': None, 'message': 'ok'}
+    fake_habr(FakeResponse(200, {'comments': {'1': good, '2': 'oops', '3': None, '4': [1], '5': 7}}))
+    assert habr_api.fetch_comments(1) == {'1': good}
+
+
+def test_fetch_comments_log_has_category_not_detail(monkeypatch, caplog):
+    def broken(*a, **kw):
+        raise habr_api.HabrUnavailable('invalid_shape', 200, 'SECRET-BODY')
+    monkeypatch.setattr(habr_api, '_get_json_object', broken)
+    with caplog.at_level(logging.INFO, logger='habr_api'):
+        with pytest.raises(habr_api.HabrUnavailable):
+            habr_api.fetch_comments(5)
+    text = ' '.join(r.getMessage() for r in caplog.records)
+    assert 'SECRET-BODY' not in text
+    assert 'invalid_shape' in text and '200' in text and 'id=5' in text
 
 
 def test_fetch_comments_rejects_bad_id(fake_habr):
@@ -914,7 +954,7 @@ def test_fetch_comments_waits_on_shared_throttle(fake_habr, monkeypatch):
 
 def test_handler_deadline_constant_and_wait_budget(monkeypatch):
     assert habr_api.HANDLER_DEADLINE == 45
-    monkeypatch.setattr(habr_api.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(habr_api, '_monotonic', lambda: 100.0)      # module seam, not time.monotonic
     assert habr_api.handler_deadline() == 145.0
     assert habr_api.wait_budget(None, None) is None              # background: unbounded
     assert habr_api.wait_budget(30, None) == 30
@@ -951,8 +991,57 @@ def test_deadline_cuts_request_timeout(fake_habr, monkeypatch, article_fixture):
     fake = fake_habr(_ok_article(article_fixture))
     habr_api.fetch_article(1102920, wait_timeout=30, deadline=time.monotonic() + 5)
     habr_api.fetch_article(1102920, wait_timeout=None)
-    assert 0 < fake.log[0]['timeout'] <= 5
-    assert fake.log[1]['timeout'] == habr_api.HABR_API_TIMEOUT
+    connect, read = fake.log[0]['timeout']
+    assert 0 < connect <= 5 and 0 < read <= 5
+    assert fake.log[1]['timeout'] == (habr_api.HABR_API_TIMEOUT, habr_api.HABR_API_TIMEOUT)
+
+
+def test_slow_headers_then_slow_body_end_at_one_deadline(monkeypatch, article_fixture):
+    """Headers that use most of the budget leave the body only the rest: the whole exchange
+    ends at the absolute deadline, not at deadline + a fresh body window (audit CAR-1)."""
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    body = json.dumps(article_fixture).encode()
+
+    class SlowBody(FakeResponse):
+        def iter_content(self, chunk_size=1):
+            for i in range(0, len(body), 64):
+                time.sleep(0.05)
+                yield body[i:i + 64]
+
+    def slow_headers(url, **kwargs):
+        time.sleep(0.3)                         # headers take most of the 0.4 s budget
+        return SlowBody(200, body)
+
+    monkeypatch.setattr(habr_api.requests, 'get', slow_headers)
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_article(1102920, wait_timeout=30, deadline=started + 0.4)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.4 + 0.2                  # one chunk past the deadline at most
+
+
+def test_body_window_is_not_restarted_after_headers(monkeypatch, article_fixture):
+    """Without a deadline the HABR_API_TIMEOUT window also covers headers + body together."""
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    monkeypatch.setattr(habr_api, 'HABR_API_TIMEOUT', 0.4)
+    body = json.dumps(article_fixture).encode()
+
+    class SlowBody(FakeResponse):
+        def iter_content(self, chunk_size=1):
+            for i in range(0, len(body), 64):
+                time.sleep(0.05)
+                yield body[i:i + 64]
+
+    def slow_headers(url, **kwargs):
+        time.sleep(0.3)
+        return SlowBody(200, body)
+
+    monkeypatch.setattr(habr_api.requests, 'get', slow_headers)
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+        habr_api.fetch_article(1102920)
+    assert excinfo.value.kind == 'timeout'
+    assert time.monotonic() - started < 0.4 + 0.2
 
 
 def test_timeout_cut_by_deadline_is_busy_not_unavailable(fake_habr, monkeypatch):

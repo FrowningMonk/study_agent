@@ -84,6 +84,8 @@ MIN_REQUEST_INTERVAL: float = 1.5
 HANDLER_WAIT_TIMEOUT: float = 30
 HANDLER_DEADLINE: float = 45        # end-to-end budget of one handler-mode operation
 MAX_RESPONSE_BYTES: int = 2 * 1024 * 1024
+# Comment trees of the most discussed articles exceed 2 MB (HTML message + author per comment)
+COMMENTS_MAX_RESPONSE_BYTES: int = 8 * 1024 * 1024
 LIST_PER_PAGE: int = 100
 LIST_MAX_ITEMS: int = 1000          # Habr paginator cap (400 PAGINATOR_LIMIT beyond it)
 HUBS_PER_PAGE: int = 100
@@ -109,6 +111,8 @@ _DIGITS_RE = re.compile(r'[0-9]{1,12}')
 # Throttle state: one per process, shared by handlers, digest and backfill threads
 _lock = threading.Lock()
 _last_request_at: float | None = None   # time.monotonic() of the last request end
+# Deadline clock seam (patched in tests instead of the process-wide time.monotonic)
+_monotonic = time.monotonic
 
 
 # =============================================================================
@@ -202,11 +206,11 @@ def canonical_url(habr_id: int) -> str:
 
 def handler_deadline() -> float:
     """A fresh handler-mode deadline: time.monotonic() + HANDLER_DEADLINE."""
-    return time.monotonic() + HANDLER_DEADLINE
+    return _monotonic() + HANDLER_DEADLINE
 
 
 def _time_left(deadline: float) -> float:
-    left = deadline - time.monotonic()
+    left = deadline - _monotonic()
     if left <= 0:
         logger.warning('Habr handler deadline exceeded')
         raise HabrBusy('Habr handler deadline exceeded')
@@ -239,43 +243,53 @@ def _wait_interval() -> None:
         time.sleep(remaining)
 
 
-def _read_capped(response, read_timeout: float) -> bytes:
+def _read_capped(response, end: float, max_bytes: int) -> bytes:
+    """Body up to `max_bytes`, read until the absolute `end` (a _monotonic() value)."""
     length = response.headers.get('Content-Length')
-    if length is not None and length.isdigit() and int(length) > MAX_RESPONSE_BYTES:
+    if length is not None and length.isdigit() and int(length) > max_bytes:
         raise HabrUnavailable('too_large', response.status_code)
-    deadline = time.monotonic() + read_timeout
     body = bytearray()
     for chunk in response.iter_content(chunk_size=_READ_CHUNK):
         body += chunk
-        if len(body) > MAX_RESPONSE_BYTES:
+        if len(body) > max_bytes:
             raise HabrUnavailable('too_large', response.status_code)
-        # requests' timeout is per socket read; bound the whole body read too
-        if time.monotonic() > deadline:
+        # requests' timeout is per socket read; bound the whole exchange too
+        if _monotonic() > end:
             raise HabrUnavailable('timeout', response.status_code, 'body read too slow')
     return bytes(body)
 
 
 def _request(path: str, params: dict, wait_timeout: float | None,
-             deadline: float | None = None) -> tuple[int, bytes]:
+             deadline: float | None = None,
+             max_bytes: int | None = None) -> tuple[int, bytes]:
     """The only place that talks to Habr. Returns (status, body); 3xx is a failure.
 
-    The lock is held only around the HTTP exchange itself. With a `deadline`, the lock
-    wait, the request timeout and the body read are cut to the time left; a timeout
-    caused by that cut is HabrBusy, not HabrUnavailable.
+    The lock is held only around the HTTP exchange itself. One absolute end time per
+    exchange: now + HABR_API_TIMEOUT, or the handler `deadline` if that is earlier. The
+    connect/read timeouts are what is left until it, and the body read stops at it
+    (checked between chunks, so a single stalled socket read can still take up to the
+    read timeout). A timeout caused by the deadline is HabrBusy, not HabrUnavailable.
+    `max_bytes` overrides MAX_RESPONSE_BYTES for one call.
     """
     global _last_request_at
     url = API_BASE + path
+    max_bytes = MAX_RESPONSE_BYTES if max_bytes is None else max_bytes
     _acquire(wait_budget(wait_timeout, deadline))
     try:
         _wait_interval()
-        timeout = HABR_API_TIMEOUT if deadline is None else min(HABR_API_TIMEOUT, _time_left(deadline))
-        cut_by_deadline = timeout < HABR_API_TIMEOUT
+        if deadline is not None:
+            _time_left(deadline)                     # HabrBusy if the interval wait used it up
+        start = _monotonic()
+        own_end = start + HABR_API_TIMEOUT
+        end = own_end if deadline is None else min(own_end, deadline)
+        cut_by_deadline = end < own_end
+        timeout = max(end - start, 0.001)            # connect and per-read socket timeout
         try:
             response = requests.get(
                 url,
                 params=params,
                 headers={'User-Agent': USER_AGENT},
-                timeout=timeout,
+                timeout=(timeout, timeout),
                 allow_redirects=False,
                 stream=True,
             )
@@ -283,7 +297,7 @@ def _request(path: str, params: dict, wait_timeout: float | None,
                 status = response.status_code
                 if 300 <= status < 400:
                     raise HabrUnavailable('redirect', status)
-                body = _read_capped(response, timeout)
+                body = _read_capped(response, end, max_bytes)
             finally:
                 response.close()
         except requests.exceptions.Timeout as e:
@@ -311,9 +325,9 @@ def _decode_json(status: int, body: bytes) -> Any:
 
 
 def _get_json_object(path: str, params: dict, wait_timeout: float | None,
-                     deadline: float | None = None) -> dict:
+                     deadline: float | None = None, max_bytes: int | None = None) -> dict:
     """200 + JSON object, else HabrUnavailable."""
-    status, body = _request(path, params, wait_timeout, deadline)
+    status, body = _request(path, params, wait_timeout, deadline, max_bytes)
     if status != 200:
         raise HabrUnavailable('http', status)
     data = _decode_json(status, body)
@@ -478,21 +492,31 @@ def fetch_comments(habr_id: int, *, wait_timeout: float | None = None,
     """Raw comment tree of one article: the kek `comments` object ({id: comment}), {} if none.
 
     Goes through the same request policy as every other kek call (throttle, no
-    redirects, size cap). The tree walk and formatting stay in scraper. Raises
-    HabrUnavailable on any non-200, invalid JSON or a non-object `comments`; HabrBusy
-    on a lock/deadline timeout.
+    redirects), with its own size cap COMMENTS_MAX_RESPONSE_BYTES. Entries that are not
+    objects are dropped, so callers can treat every value as a dict. The tree walk and
+    formatting stay in scraper. Raises HabrUnavailable on any non-200, invalid JSON or a
+    non-object `comments` (an oversized tree is logged at INFO: comments dropped);
+    HabrBusy on a lock/deadline timeout. Logs carry type/kind/status only.
     """
     habr_id = _check_id(habr_id)
     try:
         data = _get_json_object(f'articles/{habr_id}/comments/', {'fl': 'ru', 'hl': 'ru'},
-                                wait_timeout, deadline)
+                                wait_timeout, deadline, COMMENTS_MAX_RESPONSE_BYTES)
         comments = data.get('comments') or {}
         if not isinstance(comments, dict):
             raise _invalid('comments is not an object')
     except HabrUnavailable as e:
-        logger.warning('Habr comments fetch failed: id=%d, %s', habr_id, e)
+        if e.kind == 'too_large':
+            logger.info('Habr comments dropped, response over %d bytes: id=%d',
+                        COMMENTS_MAX_RESPONSE_BYTES, habr_id)
+        else:
+            logger.warning('Habr comments fetch failed: id=%d, kind=%s, status=%s',
+                           habr_id, e.kind, e.status)
         raise
-    return comments
+    kept = {cid: c for cid, c in comments.items() if isinstance(c, dict)}
+    if len(kept) != len(comments):
+        logger.warning('Habr comments: dropped %d malformed entries, id=%d', len(comments) - len(kept), habr_id)
+    return kept
 
 
 def _normalize_hub(alias: str, ref: Any) -> dict:
