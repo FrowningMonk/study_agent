@@ -40,7 +40,8 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable
 
 import database
@@ -61,7 +62,9 @@ TEXT_EMPTY_DAY = 'За вчера ничего нового'
 TEXT_SUMMARY_BUTTON = 'Саммари {n}'
 TEXT_HABR_UNAVAILABLE = 'Хабр недоступен: {reason}'
 
-DESCRIPTION_LIMIT = 250
+DESCRIPTION_LIMIT = 250          # lead fallback cut
+DESCRIPTION_MAX_LINES = 3        # accepted describe output (Decision 8)
+DESCRIPTION_MAX_CHARS = 400
 SUMMARY_BUTTONS_PER_ROW = 3      # "Саммари N" is long: 3 + 2 keeps labels readable on phones
 DRY_RUN_HUBS = ('python', 'programming', 'machine_learning')
 DRY_RUN_FAKE_OWNER_ID = 1        # used only when OWNER_ID is unset; the temp DB makes it safe
@@ -75,6 +78,11 @@ _DEFAULT_DESCRIBE: Describe | None = None
 # =============================================================================
 # Digest day
 # =============================================================================
+
+
+def _now() -> datetime:
+    """Clock source (aware UTC); `dry_run(now=...)` overrides it in tests."""
+    return datetime.now(timezone.utc)
 
 
 def digest_day(now: datetime) -> date:
@@ -105,12 +113,21 @@ def fetch_day_articles(day: date, wait_timeout: float | None = None) -> list[dic
 
 
 def _clean_description(value) -> str | None:
-    """Accepted describe/stored value -> plain lines without control/bidi chars; else None."""
+    """
+    Accepted describe/stored value -> plain lines without control/bidi chars; else None.
+    Defense in depth (summarizer validates too): a description is broadcast to every
+    recipient, so one with URLs, @mentions, /commands, > 3 lines or > 400 chars is rejected.
+    """
     if not isinstance(value, str):
         return None
     lines = [' '.join(line.split()) for line in feed.strip_control_bidi(value).splitlines()]
-    text = '\n'.join(line for line in lines if line)
-    return text or None
+    lines = [line for line in lines if line]
+    text = '\n'.join(lines)
+    if not text or len(lines) > DESCRIPTION_MAX_LINES or len(text) > DESCRIPTION_MAX_CHARS:
+        return None
+    if any(p.search(text) for p in (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE)):
+        return None
+    return text
 
 
 def _call_describe(describe: Describe, item: dict) -> str | None:
@@ -134,8 +151,9 @@ def _descriptions(items: list[dict], describe: Describe | None) -> dict[int, str
         if text is None and describe is not None:
             # No connection is open here: the LLM call never runs inside a transaction
             text = _call_describe(describe, item)
-            if text is not None:
-                habr_store.set_short_description(habr_id, text)
+            if text is not None and not habr_store.set_short_description(habr_id, text):
+                # Precondition: day_articles were upserted (fetch_day_articles does it)
+                logger.warning('Short description not cached, no metadata row: habr_id=%s', habr_id)
         if text is None:
             text = feed.fallback_description(item.get('lead_text') or '', limit=DESCRIPTION_LIMIT)
         result[habr_id] = text
@@ -171,7 +189,8 @@ def _with_footer(text: str) -> str:
 
 
 def render_empty_day(digest_date: date) -> list[tuple[str, None]]:
-    """Both parts empty: one message without a keyboard."""
+    """Both parts empty: one message without a keyboard. `digest_date` is part of the
+    fixed Task 10 API (the text itself says "вчера" and does not need it)."""
     return [(_with_footer(TEXT_EMPTY_DAY), None)]
 
 
@@ -226,7 +245,8 @@ def _owner_id() -> int:
 
 def _copy_db(source: str, target: str) -> None:
     """Consistent copy of the live DB (read-only open + sqlite backup, WAL-safe)."""
-    src = sqlite3.connect(f'file:{os.path.abspath(source)}?mode=ro', uri=True)
+    # as_uri() percent-encodes the path: '?' or '#' in it cannot change the URI
+    src = sqlite3.connect(Path(source).resolve().as_uri() + '?mode=ro', uri=True)
     try:
         dst = sqlite3.connect(target)
         try:
@@ -267,7 +287,7 @@ def dry_run(describe=_USE_DEFAULT, *, now: datetime | None = None) -> dict | Non
     """
     if describe is _USE_DEFAULT:
         describe = _DEFAULT_DESCRIBE
-    day = digest_day(now or feed._now())
+    day = digest_day(now or _now())
     owner_id = _owner_id()
     saved_path, saved_dir = database.DB_PATH, database.DATA_DIR
     with tempfile.TemporaryDirectory(prefix='digest_dry_run_', ignore_cleanup_errors=True) as tmp:

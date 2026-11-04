@@ -141,6 +141,18 @@ def test_hubs_list_excludes_site_top5_and_dedups(tmp_db):
     assert result['parts'][1][0].startswith('Твои хабы')
 
 
+def test_seen_exclusion_applies_to_hubs_list(tmp_db):
+    for user in (USER, OTHER):
+        habr_store.add_subscription(user, 'python')
+    items = [item(i, score=100 - i, hubs_=(('other', 'collective'),)) for i in range(1, 6)]
+    items += [item(30, score=5), item(31, score=4)]
+    habr_store.record_view(USER, 30, 'digest')
+    mine = build(USER, items)
+    theirs = build(OTHER, items)
+    assert persisted(lists_by_kind(mine)['digest_hubs']) == [31]
+    assert persisted(lists_by_kind(theirs)['digest_hubs']) == [30, 31]
+
+
 def test_corporative_hub_never_matches_subscription(tmp_db):
     habr_store.add_subscription(USER, 'bitrix')
     items = [item(i, score=100) for i in range(1, 6)]
@@ -317,6 +329,32 @@ def test_describe_blank_or_non_string_result_is_rejected(tmp_db):
         assert habr_store.get_habr_article(7)['short_description'] is None
 
 
+def test_describe_result_cleaned_before_store_and_display(tmp_db):
+    describe = Counter(result='Первая\u202e   строка\x07\n\n  вторая  ')
+    result = build(USER, [item(1, score=1)], describe=describe)
+    assert habr_store.get_habr_article(1)['short_description'] == 'Первая строка\nвторая'
+    assert 'Первая строка\nвторая' in result['parts'][0][0]
+
+
+@pytest.mark.parametrize('bad', [
+    'Читай https://evil.example/x', 'Пиши @admin', 'Жми /start', 'a\nb\nc\nd', 'д' * 401,
+])
+def test_unsafe_describe_result_rejected(tmp_db, bad):
+    result = build(USER, [item(1, score=1)], describe=Counter(result=bad))
+    assert 'Короткий анонс статьи про Python' in result['parts'][0][0]
+    assert habr_store.get_habr_article(1)['short_description'] is None
+
+
+def test_unsafe_stored_description_not_shown(tmp_db):
+    habr_store.upsert_habr_articles([item(1, score=1)])
+    habr_store.set_short_description(1, 'Подробности на https://evil.example')
+    describe = Counter()
+    text = build(USER, [item(1, score=1)], describe=describe)['parts'][0][0]
+    assert 'evil' not in text
+    assert describe.result in text              # regenerated and shown instead
+    assert habr_store.get_habr_article(1)['short_description'] == describe.result
+
+
 def test_cached_description_reused_without_describe(tmp_db):
     habr_store.upsert_habr_articles([item(1, score=10)])
     habr_store.set_short_description(1, 'Сохранённое описание.')
@@ -364,12 +402,12 @@ def test_default_resolved_at_call_time(tmp_db, monkeypatch, fake_list_router, ca
 
 
 def test_fallback_cleanup_and_word_boundary(tmp_db):
-    lead = ('<p>Начало‮ текста\x07 <b>жирно</b> https://evil.example/x?a=1 пиши @admin и жми /start '
+    lead = ('<p>Начало\u202e текста\x07 <b>жирно</b> https://evil.example/x?a=1 пиши @admin и жми /start '
             + 'слово ' * 80 + '</p>')
     result = build(USER, [item(1, score=1, lead=lead)])
     desc = result['parts'][0][0].split('\n\n')[1].splitlines()[1]
     assert desc == feed.fallback_description(lead, limit=250)
-    for bad in ('‮', '\x07', '<b>', 'http', '@admin', '/start', 'evil'):
+    for bad in ('\u202e', '\x07', '<b>', 'http', '@admin', '/start', 'evil'):
         assert bad not in desc
     assert desc.startswith('Начало текста жирно')
     assert len(desc) <= 250
@@ -377,14 +415,14 @@ def test_fallback_cleanup_and_word_boundary(tmp_db):
 
 
 def test_titles_sanitized_in_rendered_text(tmp_db):
-    title = 'Tom &amp; Jerry ‮реверс​\x00 ' + 'длинно ' * 60
+    title = 'Tom &amp; Jerry \u202eреверс\u200b\x00 ' + 'длинно ' * 60
     result = build(USER, [item(1, score=1, title=title)])
     line = result['parts'][0][0].split('\n\n')[1].splitlines()[0]
     shown = line[len('1. '):line.index(' — рейтинг')]
     assert shown == feed.sanitize_title(title)
     assert shown.startswith('Tom & Jerry реверс')
     assert len(shown) <= 200
-    for bad in ('‮', '​', '\x00', '&amp;'):
+    for bad in ('\u202e', '\u200b', '\x00', '&amp;'):
         assert bad not in line
 
 
@@ -393,8 +431,8 @@ def test_render_is_plain_text(tmp_db):
     items = [item(i, score=100 - i, hubs_=(('other', 'collective'),)) for i in range(1, 6)]
     items += [item(9, score=1, title='<b>Жирный</b> & *звёзды*')]
     result = build(USER, items)
-    for part in result['parts']:
-        assert len(part) == 2                # (text, rows): nothing like parse_mode
+    # Sending without parse_mode is checked by the sender tests (Tasks 10/11); here the
+    # texts must simply need no escaping
     # Own template texts carry no HTML/Markdown-significant characters
     templates = [digest.TEXT_HEADER_SITE, digest.TEXT_HEADER_HUBS, digest.TEXT_FOOTER, digest.TEXT_EMPTY_DAY]
     assert not any(ch in t for t in templates for ch in '<>&*_`[]')
@@ -449,6 +487,30 @@ def test_paging_page_and_end_text(tmp_db):
     assert all(t != feed.TEXT_MORE_BUTTON for row in rows for t, _ in row)
 
     assert digest.render_page(999999, 0) is None
+
+
+def test_paging_exact_fifteen_is_last_page(tmp_db):
+    result = build(USER, [item(i, score=100 - i) for i in range(1, 16)])
+    text, rows = digest.render_page(result['list_ids'][0], 0)
+    assert [line.split('.')[0] for line in text.splitlines()[:10]] == [str(n) for n in range(6, 16)]
+    assert text.endswith('Это все статьи за 3 ноября')
+    assert all(t != feed.TEXT_MORE_BUTTON for row in rows for t, _ in row)
+
+
+def test_paging_hubs_list_starts_at_position_six(tmp_db):
+    habr_store.add_subscription(USER, 'python')
+    items = [item(i, score=100 - i, hubs_=(('other', 'collective'),)) for i in range(1, 6)]
+    items += [item(40 + i, score=20 - i) for i in range(1, 8)]          # 7 hubs items
+    result = build(USER, items)
+    hubs_id = lists_by_kind(result)['digest_hubs']
+    assert result['parts'][1][1][-1] == [(feed.TEXT_MORE_BUTTON, f'hl:m:{hubs_id}:0')]
+    text, rows = digest.render_page(hubs_id, 0)
+    assert text.splitlines()[:2] == [
+        feed.render_line(6, {'title': 'Статья 46', 'score': 14, 'comments': 0}),
+        feed.render_line(7, {'title': 'Статья 47', 'score': 13, 'comments': 0}),
+    ]
+    assert rows == feed.number_rows(hubs_id, [6, 7])
+    assert text.endswith('Это все статьи за 3 ноября')
 
 
 @pytest.mark.parametrize('day, expected', [(date(2026, 3, 1), '1 марта'), (date(2026, 11, 2), '2 ноября')])
@@ -606,7 +668,7 @@ def test_dry_run_prints_parts_without_llm_or_delivery_rows(tmp_db, monkeypatch, 
     assert 'Лучшее на Хабре' in out and 'Твои хабы' in out
     assert '6. Статья дня' in out                  # first paging page of the site list
     assert FOOTER in out
-    assert [p for _, p in log] and all(u.startswith(habr_api.API_BASE + 'articles/') for u, _ in log)
+    assert log and all(u.startswith(habr_api.API_BASE + 'articles/') for u, _ in log)
     assert _count('digest_runs') == 0 and _count('digest_deliveries') == 0
     assert len(result['parts']) == 2
 
