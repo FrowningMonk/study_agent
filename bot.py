@@ -1531,7 +1531,8 @@ def _store_link_metadata(habr_id: int) -> None:
     try:
         if not habr_store.needs_metadata_fetch(habr_id):
             return
-        item = habr_api.fetch_article(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT)
+        item = habr_api.fetch_article(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                      deadline=habr_api.handler_deadline())
         habr_store.upsert_habr_article(item)
     except habr_api.HabrNotFound:
         logger.warning('Хабы/теги статьи %s: статья не найдена, отмечаю недоступной', habr_id)

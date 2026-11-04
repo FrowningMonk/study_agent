@@ -2,6 +2,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -213,14 +214,14 @@ def test_render_feed_empty_states(tmp_db, monkeypatch):
 
     habr_store.add_subscription(1, 'python')
     monkeypatch.setattr(habr_api, 'fetch_articles_since',
-                        lambda since, *, wait_timeout=None: [item(1, hubs_=[('rust', 'collective')])])
+                        lambda since, *, wait_timeout=None, deadline=None: [item(1, hubs_=[('rust', 'collective')])])
     assert feed.build_feed(1, NOW) == ('За последние сутки в твоих хабах ничего нового', [])
 
 
 def test_build_feed_persists_list_and_renders_first_page(tmp_db, monkeypatch):
     habr_store.add_subscription(1, 'python')
     fetched = [item(i, NOW - timedelta(minutes=i), score=100 - i) for i in range(1, 13)]
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', lambda since, *, wait_timeout=None: fetched)
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', lambda since, *, wait_timeout=None, deadline=None: fetched)
     text, rows = feed.build_feed(1, NOW)
     assert len(text.split('\n')) == 10
     assert rows[-1][0][0] == 'Ещё 10 ▶'
@@ -431,7 +432,7 @@ class FakeList:
     def __init__(self, items=None, error=None):
         self.items, self.error, self.calls = items or [item(1)], error, []
 
-    def __call__(self, since, *, wait_timeout=None):
+    def __call__(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append((since, wait_timeout))
         if self.error is not None:
             raise self.error
@@ -466,7 +467,7 @@ def test_feed_fetch_cache_concurrent_single_fetch(tmp_db, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = []
 
-    def blocking(since, *, wait_timeout=None):
+    def blocking(since, *, wait_timeout=None, deadline=None):
         calls.append(since)
         started.set()
         assert release.wait(5)
@@ -739,3 +740,38 @@ def test_html_to_text_inline_and_script():
     assert feed.html_to_text('<p><b>Py</b>thon and <i>Ru</i>st</p>') == 'Python and Rust'
     assert feed.html_to_text('<p>one</p><p>two</p>line<br>break') == 'one two line break'
     assert feed.html_to_text('<script>alert(1)</script><style>p{}</style><p>text</p>') == 'text'
+
+
+# =============================================================================
+# Handler deadline (audit CA-1): one end-to-end budget per /feed fetch
+# =============================================================================
+
+
+def test_feed_fetch_passes_one_handler_deadline(tmp_db, monkeypatch):
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 45)
+    seen = []
+
+    def fetch(since, *, wait_timeout=None, deadline=None):
+        seen.append((wait_timeout, deadline))
+        return [item(1)]
+
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', fetch)
+    before = time.monotonic()
+    feed.fetch_recent(NOW)
+    (wait_timeout, deadline), = seen
+    assert wait_timeout == habr_api.HANDLER_WAIT_TIMEOUT
+    assert before + 45 <= deadline <= time.monotonic() + 45
+
+
+def test_feed_cache_lock_wait_bounded_by_deadline(tmp_db, monkeypatch):
+    """The single-flight wait counts against the same deadline as the fetch."""
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 0.2)
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList())
+    feed._cache_lock.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(habr_api.HabrBusy):
+            feed.fetch_recent(NOW)
+        assert 0.15 <= time.monotonic() - started < 2       # not HANDLER_WAIT_TIMEOUT (30 s)
+    finally:
+        feed._cache_lock.release()

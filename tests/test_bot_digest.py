@@ -42,17 +42,17 @@ class FakeHabr:
         self.list_error: Exception | None = None
         self.calls: list[tuple] = []
 
-    def fetch_articles_since(self, since, *, wait_timeout=None):
+    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append(('list', since))
         if self.list_error:
             raise self.list_error
         return list(self.items)
 
-    def fetch_article(self, habr_id, *, wait_timeout=None):
+    def fetch_article(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append(('article', habr_id))
         return next(i for i in self.items if i['habr_id'] == habr_id)
 
-    def fetch_hub_catalog(self, *, wait_timeout=None):
+    def fetch_hub_catalog(self, *, wait_timeout=None, deadline=None):
         self.calls.append(('catalog',))
         return []
 

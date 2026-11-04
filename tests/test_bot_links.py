@@ -9,6 +9,7 @@ autouse guard in conftest.
 
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -89,9 +90,11 @@ class FakeKek:
         self.sent = sent
         self.error = error
         self.calls: list[tuple[int, object, int]] = []
+        self.deadlines: list[object] = []
 
-    def __call__(self, habr_id, *, wait_timeout=None):
+    def __call__(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append((habr_id, wait_timeout, len(self.sent)))
+        self.deadlines.append(deadline)
         if self.error is not None:
             raise self.error
         return {
@@ -586,6 +589,8 @@ def test_link_flow_stores_hubs_tags_for_new_article(tg, tmp_db, fake, kek):
     _send(FRIEND, 'https://habr.com/ru/companies/x/articles/77/?utm_source=tg')
 
     assert [(c[0], c[1]) for c in kek.calls] == [(77, habr_api.HANDLER_WAIT_TIMEOUT)]
+    # Handler mode: one end-to-end deadline (audit CA-1)
+    assert kek.deadlines[0] is not None and kek.deadlines[0] <= time.monotonic() + habr_api.HANDLER_DEADLINE
     meta = habr_store.get_habr_article(77)
     assert meta['fetched_at'] is not None
     assert meta['hubs'] == [{'alias': 'bitrix', 'hub_type': 'corporative'},

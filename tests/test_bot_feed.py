@@ -62,19 +62,19 @@ class FakeHabr:
         self.catalog_error = self.list_error = self.article_error = None
         self.calls: list[tuple] = []
 
-    def fetch_hub_catalog(self, *, wait_timeout=None):
+    def fetch_hub_catalog(self, *, wait_timeout=None, deadline=None):
         self.calls.append(('catalog', wait_timeout))
         if self.catalog_error:
             raise self.catalog_error
         return list(self.catalog)
 
-    def fetch_articles_since(self, since, *, wait_timeout=None):
+    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append(('list', wait_timeout))
         if self.list_error:
             raise self.list_error
         return list(self.items)
 
-    def fetch_article(self, habr_id, *, wait_timeout=None):
+    def fetch_article(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append(('article', habr_id, wait_timeout))
         if self.article_error:
             raise self.article_error

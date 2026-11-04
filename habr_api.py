@@ -38,6 +38,13 @@ MAX_RESPONSE_BYTES cap enforced while reading, scraper.USER_AGENT.
 Every public fetch takes `wait_timeout`: None (background callers) waits for the
 lock indefinitely; handlers pass HANDLER_WAIT_TIMEOUT.
 
+Handler mode also takes `deadline` (a time.monotonic() value from handler_deadline(),
+HANDLER_DEADLINE seconds ahead): one end-to-end budget for a whole handler operation,
+covering the caller's own single-flight lock wait (via wait_budget) plus every page's
+lock wait, request timeout and body read. When it runs out the call raises HabrBusy
+(the same "Хабр сейчас отвечает медленно" answer as a lock timeout). Background
+callers (scheduler, backfill, the Саммари worker) pass no deadline.
+
 Example:
     >>> import habr_api
     >>> habr_api.parse_article_id('https://habr.com/ru/companies/x/articles/123/?utm_source=a')
@@ -64,7 +71,9 @@ __all__ = [
     'HabrNotFound', 'HabrUnavailable', 'HabrBusy',
     'parse_article_id', 'canonical_url',
     'fetch_articles_since', 'fetch_article', 'fetch_hub_catalog',
-    'HABR_API_TIMEOUT', 'MIN_REQUEST_INTERVAL', 'HANDLER_WAIT_TIMEOUT', 'MAX_RESPONSE_BYTES',
+    'handler_deadline', 'wait_budget',
+    'HABR_API_TIMEOUT', 'MIN_REQUEST_INTERVAL', 'HANDLER_WAIT_TIMEOUT', 'HANDLER_DEADLINE',
+    'MAX_RESPONSE_BYTES',
 ]
 
 # Constants (patchable in tests)
@@ -72,6 +81,7 @@ API_BASE: str = 'https://habr.com/kek/v2/'
 HABR_API_TIMEOUT: float = 15
 MIN_REQUEST_INTERVAL: float = 1.5
 HANDLER_WAIT_TIMEOUT: float = 30
+HANDLER_DEADLINE: float = 45        # end-to-end budget of one handler-mode operation
 MAX_RESPONSE_BYTES: int = 2 * 1024 * 1024
 LIST_PER_PAGE: int = 100
 LIST_MAX_ITEMS: int = 1000          # Habr paginator cap (400 PAGINATOR_LIMIT beyond it)
@@ -189,6 +199,30 @@ def canonical_url(habr_id: int) -> str:
 # =============================================================================
 
 
+def handler_deadline() -> float:
+    """A fresh handler-mode deadline: time.monotonic() + HANDLER_DEADLINE."""
+    return time.monotonic() + HANDLER_DEADLINE
+
+
+def _time_left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        logger.warning('Habr handler deadline exceeded')
+        raise HabrBusy('Habr handler deadline exceeded')
+    return left
+
+
+def wait_budget(wait_timeout: float | None, deadline: float | None) -> float | None:
+    """Lock wait bounded by `wait_timeout` and by what is left of `deadline` (None = unbounded).
+
+    Raises HabrBusy when the deadline has already passed.
+    """
+    if deadline is None:
+        return wait_timeout
+    left = _time_left(deadline)
+    return left if wait_timeout is None else min(wait_timeout, left)
+
+
 def _acquire(wait_timeout: float | None) -> None:
     acquired = _lock.acquire() if wait_timeout is None else _lock.acquire(timeout=max(0.0, wait_timeout))
     if not acquired:
@@ -204,11 +238,11 @@ def _wait_interval() -> None:
         time.sleep(remaining)
 
 
-def _read_capped(response) -> bytes:
+def _read_capped(response, read_timeout: float) -> bytes:
     length = response.headers.get('Content-Length')
     if length is not None and length.isdigit() and int(length) > MAX_RESPONSE_BYTES:
         raise HabrUnavailable('too_large', response.status_code)
-    deadline = time.monotonic() + HABR_API_TIMEOUT
+    deadline = time.monotonic() + read_timeout
     body = bytearray()
     for chunk in response.iter_content(chunk_size=_READ_CHUNK):
         body += chunk
@@ -220,22 +254,27 @@ def _read_capped(response) -> bytes:
     return bytes(body)
 
 
-def _request(path: str, params: dict, wait_timeout: float | None) -> tuple[int, bytes]:
+def _request(path: str, params: dict, wait_timeout: float | None,
+             deadline: float | None = None) -> tuple[int, bytes]:
     """The only place that talks to Habr. Returns (status, body); 3xx is a failure.
 
-    The lock is held only around the HTTP exchange itself.
+    The lock is held only around the HTTP exchange itself. With a `deadline`, the lock
+    wait, the request timeout and the body read are cut to the time left; a timeout
+    caused by that cut is HabrBusy, not HabrUnavailable.
     """
     global _last_request_at
     url = API_BASE + path
-    _acquire(wait_timeout)
+    _acquire(wait_budget(wait_timeout, deadline))
     try:
         _wait_interval()
+        timeout = HABR_API_TIMEOUT if deadline is None else min(HABR_API_TIMEOUT, _time_left(deadline))
+        cut_by_deadline = timeout < HABR_API_TIMEOUT
         try:
             response = requests.get(
                 url,
                 params=params,
                 headers={'User-Agent': USER_AGENT},
-                timeout=HABR_API_TIMEOUT,
+                timeout=timeout,
                 allow_redirects=False,
                 stream=True,
             )
@@ -243,11 +282,17 @@ def _request(path: str, params: dict, wait_timeout: float | None) -> tuple[int, 
                 status = response.status_code
                 if 300 <= status < 400:
                     raise HabrUnavailable('redirect', status)
-                body = _read_capped(response)
+                body = _read_capped(response, timeout)
             finally:
                 response.close()
         except requests.exceptions.Timeout as e:
+            if cut_by_deadline:
+                raise HabrBusy('Habr handler deadline exceeded during the request') from e
             raise HabrUnavailable('timeout') from e
+        except HabrUnavailable as e:
+            if cut_by_deadline and e.kind == 'timeout':
+                raise HabrBusy('Habr handler deadline exceeded during the body read') from e
+            raise
         except requests.exceptions.RequestException as e:
             raise HabrUnavailable('network', detail=type(e).__name__) from e
         finally:
@@ -264,9 +309,10 @@ def _decode_json(status: int, body: bytes) -> Any:
         raise HabrUnavailable('invalid_json', status) from e
 
 
-def _get_json_object(path: str, params: dict, wait_timeout: float | None) -> dict:
+def _get_json_object(path: str, params: dict, wait_timeout: float | None,
+                     deadline: float | None = None) -> dict:
     """200 + JSON object, else HabrUnavailable."""
-    status, body = _request(path, params, wait_timeout)
+    status, body = _request(path, params, wait_timeout, deadline)
     if status != 200:
         raise HabrUnavailable('http', status)
     data = _decode_json(status, body)
@@ -344,7 +390,8 @@ def _normalize_item(raw: Any, expected_id: int | None = None) -> dict:
 # =============================================================================
 
 
-def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None) -> list[dict]:
+def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None,
+                         deadline: float | None = None) -> list[dict]:
     """Site-wide "Новые" list (newest first) down to `since`, deduplicated by id.
 
     Pages of 100 from page 1 until a page's last item is older than `since`.
@@ -363,7 +410,7 @@ def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None) 
             page += 1
             # sort=rating WITHOUT period is the "Новые" flow; never send news/period
             params = {'sort': 'rating', 'fl': 'ru', 'hl': 'ru', 'perPage': LIST_PER_PAGE, 'page': page}
-            data = _get_json_object('articles/', params, wait_timeout)
+            data = _get_json_object('articles/', params, wait_timeout, deadline)
             pages_count = _field(data, 'pagesCount', int)
             ids = _field(data, 'publicationIds', list)
             refs = _field(data, 'publicationRefs', dict)
@@ -396,7 +443,8 @@ def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None) 
     return items
 
 
-def fetch_article(habr_id: int, *, wait_timeout: float | None = None) -> dict:
+def fetch_article(habr_id: int, *, wait_timeout: float | None = None,
+                  deadline: float | None = None) -> dict:
     """One article by id as a normalized item.
 
     Raises HabrNotFound on 404 NOT_FOUND / POST_TYPE_MISMATCH; HabrUnavailable on
@@ -405,7 +453,7 @@ def fetch_article(habr_id: int, *, wait_timeout: float | None = None) -> dict:
     habr_id = _check_id(habr_id)
     started = time.monotonic()
     try:
-        status, body = _request(f'articles/{habr_id}/', {'fl': 'ru', 'hl': 'ru'}, wait_timeout)
+        status, body = _request(f'articles/{habr_id}/', {'fl': 'ru', 'hl': 'ru'}, wait_timeout, deadline)
         if status == 404:
             error = _decode_json(status, body)
             code = error.get('errorCode') if isinstance(error, dict) else None
@@ -444,7 +492,7 @@ def _normalize_hub(alias: str, ref: Any) -> dict:
     }
 
 
-def fetch_hub_catalog(*, wait_timeout: float | None = None) -> list[dict]:
+def fetch_hub_catalog(*, wait_timeout: float | None = None, deadline: float | None = None) -> list[dict]:
     """Whole hub catalog: [{alias, title, rating, hub_type}] in API order (rating desc).
 
     Not filtered; any failed, short or malformed page raises HabrUnavailable.
@@ -458,7 +506,7 @@ def fetch_hub_catalog(*, wait_timeout: float | None = None) -> list[dict]:
         while page < pages_count:
             page += 1
             params = {'perPage': HUBS_PER_PAGE, 'page': page, 'fl': 'ru', 'hl': 'ru'}
-            data = _get_json_object('hubs/', params, wait_timeout)
+            data = _get_json_object('hubs/', params, wait_timeout, deadline)
             count = _field(data, 'pagesCount', int)
             if page == 1:
                 if not 1 <= count <= HUBS_MAX_PAGES:

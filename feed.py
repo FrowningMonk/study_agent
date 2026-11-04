@@ -263,21 +263,25 @@ def fetch_recent(now: datetime | None = None) -> list[dict]:
     Normalized items of the last 24 h for `/feed`. A fetch younger than
     FETCH_CACHE_TTL is reused; otherwise habr_api.fetch_articles_since is called in
     handler mode and the metadata (with hubs and tags) is upserted.
-    Single-flight: concurrent callers wait for the running fetch (bounded by
-    HANDLER_WAIT_TIMEOUT, then HabrBusy). HabrBusy / HabrUnavailable propagate.
+    Single-flight: concurrent callers wait for the running fetch. One handler deadline
+    (habr_api.HANDLER_DEADLINE) bounds the whole call: this wait (also capped by
+    HANDLER_WAIT_TIMEOUT) plus every page of the fetch; then HabrBusy.
+    HabrBusy / HabrUnavailable propagate.
     """
     global _cache
     now = now or _now()
     cached = _fresh_cache(now)
     if cached is not None:
         return cached
-    if not _cache_lock.acquire(timeout=habr_api.HANDLER_WAIT_TIMEOUT):
+    deadline = habr_api.handler_deadline()
+    if not _cache_lock.acquire(timeout=habr_api.wait_budget(habr_api.HANDLER_WAIT_TIMEOUT, deadline)):
         raise habr_api.HabrBusy('feed fetch is already running')
     try:
         cached = _fresh_cache(now)
         if cached is not None:
             return cached
-        items = habr_api.fetch_articles_since(now - FEED_WINDOW, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT)
+        items = habr_api.fetch_articles_since(now - FEED_WINDOW, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                              deadline=deadline)
         # The network call is finished: only now is a DB transaction opened
         habr_store.upsert_habr_articles(items)
         _cache = (now, items)

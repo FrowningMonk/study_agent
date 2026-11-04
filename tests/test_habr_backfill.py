@@ -39,7 +39,7 @@ class FakeHabr:
         self.calls: list[tuple[int, object]] = []
         self.errors: dict[int, Exception] = {}
 
-    def __call__(self, habr_id, *, wait_timeout=None):
+    def __call__(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append((habr_id, wait_timeout))
         if habr_id in self.errors:
             raise self.errors[habr_id]
@@ -277,7 +277,7 @@ def test_pause_between_articles(tmp_db, habr, monkeypatch):
     monkeypatch.setattr(habr_backfill, '_sleep', lambda s: events.append(('sleep', s)))
     real_fetch = habr
 
-    def fetch(habr_id, *, wait_timeout=None):
+    def fetch(habr_id, *, wait_timeout=None, deadline=None):
         events.append(('fetch', habr_id))
         return real_fetch(habr_id, wait_timeout=wait_timeout)
     monkeypatch.setattr(habr_api, 'fetch_article', fetch)

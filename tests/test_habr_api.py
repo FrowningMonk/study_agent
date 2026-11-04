@@ -838,6 +838,120 @@ def test_handler_wait_timeout_constant(fake_habr, monkeypatch, article_fixture):
         habr_api._lock.release()
 
 
+# =============================================================================
+# Handler deadline (one end-to-end budget per handler operation)
+# =============================================================================
+
+
+def test_handler_deadline_constant_and_wait_budget(monkeypatch):
+    assert habr_api.HANDLER_DEADLINE == 45
+    monkeypatch.setattr(habr_api.time, 'monotonic', lambda: 100.0)
+    assert habr_api.handler_deadline() == 145.0
+    assert habr_api.wait_budget(None, None) is None              # background: unbounded
+    assert habr_api.wait_budget(30, None) == 30
+    assert habr_api.wait_budget(30, 110.0) == 10.0               # deadline is tighter
+    assert habr_api.wait_budget(5, 110.0) == 5                   # wait_timeout is tighter
+    assert habr_api.wait_budget(None, 103.0) == 3.0
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.wait_budget(30, 100.0)
+
+
+def test_expired_deadline_raises_busy_without_request(fake_habr, article_fixture):
+    fake = fake_habr(_ok_article(article_fixture))
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_article(1102920, wait_timeout=30, deadline=time.monotonic() - 1)
+    assert fake.log == []
+    assert not habr_api._lock.locked()
+
+
+def test_deadline_bounds_lock_wait(fake_habr, article_fixture):
+    fake = fake_habr(_ok_article(article_fixture))
+    habr_api._lock.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(habr_api.HabrBusy):
+            habr_api.fetch_article(1102920, wait_timeout=30, deadline=started + 0.2)
+        assert 0.15 <= time.monotonic() - started < 2
+    finally:
+        habr_api._lock.release()
+    assert fake.log == []
+
+
+def test_deadline_cuts_request_timeout(fake_habr, monkeypatch, article_fixture):
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    fake = fake_habr(_ok_article(article_fixture))
+    habr_api.fetch_article(1102920, wait_timeout=30, deadline=time.monotonic() + 5)
+    habr_api.fetch_article(1102920, wait_timeout=None)
+    assert 0 < fake.log[0]['timeout'] <= 5
+    assert fake.log[1]['timeout'] == habr_api.HABR_API_TIMEOUT
+
+
+def test_timeout_cut_by_deadline_is_busy_not_unavailable(fake_habr, monkeypatch):
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    fake_habr(requests.exceptions.ReadTimeout('slow'))
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_article(1102920, wait_timeout=30, deadline=time.monotonic() + 5)
+    # Full-length timeout (no deadline, or a deadline farther than HABR_API_TIMEOUT) stays HabrUnavailable
+    for kwargs in ({}, {'deadline': time.monotonic() + habr_api.HABR_API_TIMEOUT + 60}):
+        with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+            habr_api.fetch_article(1102920, wait_timeout=30, **kwargs)
+        assert excinfo.value.kind == 'timeout'
+
+
+def test_slow_body_cut_by_deadline_is_busy(fake_habr, monkeypatch, article_fixture):
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+
+    class DripResponse(FakeResponse):
+        def iter_content(self, chunk_size=1):
+            for part in (b'{', b'"a"', b':1}'):
+                time.sleep(0.15)
+                yield part
+
+    fake_habr(DripResponse(200))
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_article(1102920, wait_timeout=30, deadline=started + 0.2)
+    assert time.monotonic() - started < 2
+
+
+def test_multi_page_catalog_bounded_by_one_deadline(fake_habr, monkeypatch, hubs_fixture):
+    """Slow-but-answering Habr: a 5-page handler-mode catalog fetch gives up at the deadline."""
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    pages = {n: _hub_page(hubs_fixture, _cloned_hubs(hubs_fixture, 100), 5) for n in range(1, 6)}
+    route = by_page(pages)
+
+    def slow(url, params):
+        time.sleep(0.15)
+        return route(url, params)
+
+    fake = fake_habr(slow)
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_hub_catalog(wait_timeout=30, deadline=started + 0.4)
+    assert time.monotonic() - started < 1.5
+    assert 1 <= len(fake.log) < 5
+    assert not habr_api._lock.locked()
+
+
+def test_multi_page_list_bounded_by_one_deadline(fake_habr, monkeypatch, make_item):
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    newest = datetime(2026, 11, 4, 12, tzinfo=UTC)
+
+    def slow(url, params):
+        time.sleep(0.15)
+        page = int(params['page'])
+        refs = {str(page * 1000 + i): make_item(page * 1000 + i, newest - timedelta(minutes=page))
+                for i in range(100)}
+        return FakeResponse(200, {'pagesCount': 10, 'publicationIds': list(refs), 'publicationRefs': refs})
+
+    fake = fake_habr(slow)
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_articles_since(newest - timedelta(days=1), wait_timeout=30, deadline=started + 0.4)
+    assert time.monotonic() - started < 1.5
+    assert 1 <= len(fake.log) < 10
+
+
 def test_lock_released_after_failure(fake_habr):
     fake_habr(requests.exceptions.ConnectionError('down'))
     with pytest.raises(habr_api.HabrUnavailable):
