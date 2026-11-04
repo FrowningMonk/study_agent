@@ -11,6 +11,7 @@ import feed
 import habr_api
 import habr_store
 import hubs
+from conftest import SignallingLock
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
 DAY = date(2026, 11, 3)          # digest day D (MSK)
@@ -475,12 +476,18 @@ def test_feed_fetch_cache_concurrent_single_fetch(tmp_db, monkeypatch):
         return [item(1)]
 
     monkeypatch.setattr(habr_api, 'fetch_articles_since', blocking)
+    lock = SignallingLock()
+    monkeypatch.setattr(feed, '_cache_lock', lock)
     results = []
     threads = [threading.Thread(target=lambda: results.append(ids(feed.fetch_recent(NOW)))) for _ in range(2)]
     threads[0].start()
     assert started.wait(5)
     threads[1].start()
+    # Thread 2 passed the first cache check while the cache was still empty and is now
+    # waiting on the single-flight lock: only the re-check under the lock saves a fetch
+    assert lock.contended.wait(5)
     threads[1].join(0.2)
+    assert threads[1].is_alive() and len(calls) == 1
     release.set()
     for t in threads:
         t.join(5)

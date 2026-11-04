@@ -10,6 +10,7 @@ import feed
 import habr_api
 import habr_store
 import hubs
+from conftest import SignallingLock
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
 
@@ -262,6 +263,8 @@ def test_catalog_single_flight_reuses_failed_outcome(tmp_db, monkeypatch):
         raise habr_api.HabrUnavailable('network')
 
     monkeypatch.setattr(habr_api, 'fetch_hub_catalog', blocking_fail)
+    lock = SignallingLock()
+    monkeypatch.setattr(hubs, '_refresh_lock', lock)
     errors = []
 
     def worker():
@@ -275,7 +278,10 @@ def test_catalog_single_flight_reuses_failed_outcome(tmp_db, monkeypatch):
     assert started.wait(5)
     threads.append(threading.Thread(target=worker))
     threads[1].start()
+    # Thread 2 read the refresh generation and now waits on the lock held by thread 1
+    assert lock.contended.wait(5)
     threads[1].join(0.2)
+    assert threads[1].is_alive() and len(calls) == 1
     release.set()
     for t in threads:
         t.join(5)

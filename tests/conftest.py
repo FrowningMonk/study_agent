@@ -20,6 +20,35 @@ os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123456:TEST')
 os.environ.setdefault('OWNER_ID', '1000')
 
 
+class SignallingLock:
+    """Lock proxy for deterministic contention tests.
+
+    `contended` is set when acquire() is called while the lock is already held, i.e.
+    right before a second thread blocks on it. Install it with monkeypatch over a
+    module-level lock that the code under test looks up at call time.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self._lock.locked():
+            self.contended.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+
+    def locked(self):
+        return self._lock.locked()
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 @pytest.fixture
 def fixture_text():
     def _read(name: str) -> str:

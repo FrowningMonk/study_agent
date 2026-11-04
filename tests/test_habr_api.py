@@ -15,6 +15,7 @@ import requests
 
 import habr_api
 import scraper
+from conftest import SignallingLock
 
 UTC = timezone.utc
 
@@ -755,6 +756,9 @@ def test_throttle_spaces_requests_across_threads(monkeypatch, article_fixture):
     in_flight = 0
     max_in_flight = 0
     counter_lock = threading.Lock()
+    lock = SignallingLock()
+    monkeypatch.setattr(habr_api, '_lock', lock)
+    barrier = threading.Barrier(2)
 
     def slow_get(url, **kwargs):
         nonlocal in_flight, max_in_flight
@@ -762,6 +766,9 @@ def test_throttle_spaces_requests_across_threads(monkeypatch, article_fixture):
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
         start = time.monotonic()
+        # The first request stays in flight until the other thread blocks on the
+        # throttle lock: contention is guaranteed, not just likely
+        assert lock.contended.wait(5)
         time.sleep(0.05)
         end = time.monotonic()
         with counter_lock:
@@ -774,6 +781,7 @@ def test_throttle_spaces_requests_across_threads(monkeypatch, article_fixture):
 
     def worker():
         try:
+            barrier.wait(5)
             for _ in range(2):
                 habr_api.fetch_article(1102920)
         except BaseException as e:  # surface in the main thread
@@ -784,8 +792,10 @@ def test_throttle_spaces_requests_across_threads(monkeypatch, article_fixture):
         t.start()
     for t in threads:
         t.join(timeout=10)
+        assert not t.is_alive()
 
     assert not errors
+    assert lock.contended.is_set()
     assert len(spans) == 4
     assert max_in_flight == 1
     spans.sort()

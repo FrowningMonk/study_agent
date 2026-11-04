@@ -8,6 +8,7 @@ the patched `habr_backfill._sleep`, so the tests never wait and never hit the ne
 
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -258,16 +259,25 @@ def test_failure_log_has_category_not_message_text(tmp_db, habr, sleeps, caplog)
     assert 'SECRET-BODY-TEXT' not in text
 
 
-def test_unexpected_exception_logged_thread_ends(monkeypatch, caplog):
-    def boom():
-        raise RuntimeError('db is gone')
-    monkeypatch.setattr(habr_backfill, 'run_once', boom)
+def test_unexpected_exception_logged_thread_ends(tmp_db, habr, sleeps, caplog):
+    """Real run_once: fetch_article raises a non-Habr, non-sqlite error inside the backfill
+    thread; run_safely logs it with a traceback and only that thread ends."""
+    for habr_id in (1, 2):
+        _save(tmp_db, habr_id)
+    habr.errors[1] = ValueError('unexpected payload')
 
     with caplog.at_level(logging.ERROR, logger='habr_backfill'):
-        habr_backfill.run_safely()
+        thread = threading.Thread(target=habr_backfill.run_safely, name='habr-backfill', daemon=True)
+        thread.start()
+        thread.join(5)
 
+    assert not thread.is_alive()
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors and errors[0].exc_info is not None
+    assert len(errors) == 1 and errors[0].exc_info is not None
+    assert errors[0].exc_info[0] is ValueError and errors[0].threadName == 'habr-backfill'
+    assert habr.ids == [1]                                 # the run stopped at the failure
+    assert habr_store.get_habr_article(1) is None
+    assert habr_store.list_backfill_candidates() == [1, 2]  # retried on the next start
 
 
 def test_pause_between_articles(tmp_db, habr, monkeypatch):

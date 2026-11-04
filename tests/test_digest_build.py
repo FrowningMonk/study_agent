@@ -554,7 +554,8 @@ def fake_list_router(monkeypatch, fixture_text):
     template = page['publicationRefs'][page['publicationIds'][0]]
     state = {'log': []}
 
-    def install(day_count=12, hubs_=('python',), status=200):
+    def install(day_count=12, hubs_=('python',), status=200, extra=()):
+        """extra: (habr_id, aware datetime) items added at their place in the newest-first order."""
         refs = []
         for n in range(day_count):
             ref = copy.deepcopy(template)
@@ -567,6 +568,12 @@ def fake_list_router(monkeypatch, fixture_text):
             if hubs_ != ('python',):
                 ref['hubs'] = [{'alias': a, 'type': 'collective'} for a in hubs_]
             refs.append(ref)
+        for habr_id, published in extra:
+            ref = copy.deepcopy(template)
+            ref['id'] = str(habr_id)
+            ref['timePublished'] = published.isoformat()
+            refs.append(ref)
+        refs.sort(key=lambda r: datetime.fromisoformat(r['timePublished']), reverse=True)
         old = copy.deepcopy(template)
         old['id'] = '700000'
         old['timePublished'] = '2026-11-02T10:00:00+00:00'
@@ -695,6 +702,23 @@ def test_dry_run_habr_unavailable_prints_category(tmp_db, fake_list_router, caps
     captured = capsys.readouterr()
     assert 'Хабр недоступен' in captured.out and 'HTTP 503' in captured.out
     assert 'Traceback' not in captured.out + captured.err
+
+
+def test_fetch_day_articles_exact_msk_window_edges(tmp_db, fake_list_router):
+    """[D 00:00 MSK, D+1 00:00 MSK): the end is excluded, the start included (audit m1)."""
+    start = datetime(2026, 11, 2, 21, 0, tzinfo=UTC)          # 2026-11-03 00:00 MSK
+    end = datetime(2026, 11, 3, 21, 0, tzinfo=UTC)            # 2026-11-04 00:00 MSK
+    assert digest.day_bounds(DAY) == (start, end)
+    fake_list_router(day_count=1, extra=[
+        (900001, end),                                       # exactly at the end: excluded
+        (900002, start - timedelta(seconds=1)),              # one second before: excluded
+        (900003, start),                                     # exactly at the start: included
+    ])
+
+    items = digest.fetch_day_articles(DAY)
+
+    assert sorted(i['habr_id'] for i in items) == [800000, 900003]
+    assert set(habr_store.get_habr_articles([800000, 900001, 900002, 900003])) == {800000, 900003}
 
 
 def test_fetch_day_articles_filters_window_and_upserts(tmp_db, fake_list_router):
