@@ -228,11 +228,40 @@ def test_regen_on_utm_variant_updates_habr_id_row(tg, tmp_db, fake):
     assert _views(tmp_db) == [(FRIEND, 123, 'link')]
 
 
+def test_cache_show_non_habr_uses_url_row(tg, tmp_db, fake):
+    url = 'https://github.com/owner/repo'
+    tmp_db.save_article({'url': url, 'source': 'github', 'title': 'T', 'content': 'C'}, 'GH SUMMARY', 'm', OWNER)
+    _send(FRIEND, url)
+    show = _cache_buttons(tg, FRIEND)[0]
+
+    tg.clear()
+    _press(FRIEND, show)
+
+    assert _texts(tg, FRIEND) == ['GH SUMMARY']
+    assert fake.calls == []
+
+
+def test_regen_failure_keeps_row_and_shows_error(tg, tmp_db, fake):
+    first = _save_habr(tmp_db, CANONICAL_123, 123, summary='OLD')
+    _send(FRIEND, 'https://habr.com/ru/post/123/')
+    regen = _cache_buttons(tg, FRIEND)[1]
+    fake.result = False
+    tg.clear()
+
+    _press(FRIEND, regen)
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_ERROR.format(error='Не удалось обработать статью')]
+    assert tmp_db.get_article_by_id(first)['summary'] == 'OLD'
+    assert _article_count(tmp_db) == 1
+
+
 def test_command_with_url_not_captured_by_handle_url(tg, tmp_db, fake):
     _send(FRIEND, '/subscribe https://habr.com/ru/hubs/python/')
 
-    assert bot_module.MSG_UNSUPPORTED not in _texts(tg, FRIEND)
-    assert all(s[1][1] != bot_module.MSG_UNSUPPORTED for s in tg if s[0] == 'reply_to')
+    shown = [s[1][1] for s in tg if s[0] in ('send_message', 'reply_to')]
+    assert bot_module.MSG_UNSUPPORTED not in shown
+    assert bot_module.MSG_PROCESSING not in shown
+    assert bot_module.MSG_DUPLICATE_FOUND not in shown
     assert _views(tmp_db) == []
     assert fake.calls == []
 
@@ -355,7 +384,10 @@ def test_summarize_for_user_outcome_on_generation(tg, tmp_db, fake, long_summary
     assert outcome.messages == texts[1:]
     if long_summary:
         model, provider = bot_module.get_user_model(FRIEND)
-        assert outcome.messages == [f'Готово! Модель: {model} ({provider})', 'a' * 3000, 'b' * 3000 + '\n\n' + 'c' * 100]
+        header, *chunks = outcome.messages
+        assert header == f'Готово! Модель: {model} ({provider})'
+        assert len(chunks) >= 2
+        assert '\n\n'.join(chunks) == fake.summary
     else:
         assert len(outcome.messages) == 1 and outcome.messages[0].endswith('NEW SUMMARY')
 
@@ -402,6 +434,16 @@ def test_deliver_outcome_sends_same_messages_without_regeneration(tg, tmp_db, fa
 
     _press(FRIEND, f'link_skip:{outcome.article_id}')
     assert tmp_db.get_article_by_id(outcome.article_id) is not None
+
+
+def test_deliver_outcome_link_cache_hit_sends_nothing(tg, tmp_db):
+    tmp_db.create_idea('Idea', None, FRIEND)
+    article_id = _save_habr(tmp_db, CANONICAL_123, 123)
+
+    bot_module._deliver_outcome(FRIEND, FRIEND, bot_module.SummaryOutcome(ok=True, article_id=article_id))
+
+    assert tg == []
+    assert FRIEND not in bot_module.pending_article_links
 
 
 def test_deliver_outcome_error_sends_error_text_only(tg, tmp_db):

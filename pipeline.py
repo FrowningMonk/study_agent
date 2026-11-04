@@ -89,6 +89,9 @@ def get_source_name(url: str) -> str:
         return 'habr'
     # A URL that mentions habr.com but is not a strict Habr article URL
     # (spoofed host, hub page, /sandbox/, ...) is unsupported, never fetched.
+    # Deliberately fail-closed for any host: scraper.get_article routes on the
+    # 'habr.com' substring first, so e.g. a github.com path mentioning habr.com
+    # would otherwise reach the Habr parser (it was routed as Habr before, too).
     if _HABR_DOMAIN in url.lower():
         return 'unknown'
     for domain, name in SUPPORTED_SOURCES.items():

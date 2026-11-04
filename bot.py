@@ -1282,7 +1282,12 @@ def handle_link_skip(call: telebot.types.CallbackQuery) -> None:
 
 @dataclass
 class SummaryOutcome:
-    """What _summarize_for_user sent to its chat; Task 5 re-sends it to waiters."""
+    """
+    What _summarize_for_user sent to its chat; Task 5 re-sends it to waiters.
+
+    A `link` cache hit has ok=True and messages=[] (only the duplicate keyboard was
+    shown); _deliver_outcome sends nothing for it.
+    """
 
     ok: bool
     messages: list[str] = field(default_factory=list)
@@ -1291,7 +1296,12 @@ class SummaryOutcome:
 
 
 def _fetch_url(url: str) -> str:
-    """URL to scrape: the canonical Habr URL for a recognized id, else the URL itself."""
+    """
+    URL to scrape: the canonical Habr URL for a recognized id, else the URL itself.
+
+    pipeline.process_article canonicalizes again; doing it here too keeps the user
+    URL out of every fetch path even if process_article is replaced.
+    """
     habr_id = habr_api.parse_article_id(url)
     return habr_api.canonical_url(habr_id) if habr_id is not None else url
 
@@ -1349,8 +1359,9 @@ def _summarize_for_user(chat_id: int, user_id: int, target: int | str, source: s
     `target` is a Habr id (int) or a URL (str). Sequence: cache check, model check,
     status message, process_article (canonical URL for Habr), save_article_to_db,
     summary message, idea-link offer. Everything is sent to `chat_id` with
-    send_message. Records no views; callers do. Never raises for scrape or
-    generation errors: they become ok=False with the error text shown to the user.
+    send_message. Records no views; callers do. Scrape, generation and send errors
+    become ok=False with the error text shown to the user; only a wrong `target`
+    type (programmer error) raises TypeError.
     """
     if isinstance(target, bool) or not isinstance(target, (int, str)):
         raise TypeError(f'target must be a habr_id or a URL, got {type(target).__name__}')
@@ -1430,6 +1441,9 @@ def _deliver_outcome(chat_id: int, user_id: int, outcome: SummaryOutcome) -> Non
     if not outcome.ok:
         if outcome.error_text:
             bot.send_message(chat_id, outcome.error_text)
+        return
+    if not outcome.messages:
+        # Nothing was summarized (link-source duplicate keyboard): no offer without a summary
         return
     for text in outcome.messages:
         bot.send_message(chat_id, text)
