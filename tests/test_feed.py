@@ -651,8 +651,52 @@ def test_url_mention_command_patterns():
         assert not feed.COMMAND_RE.search(plain), plain
 
 
+@pytest.mark.parametrize('text, found', [
+    ('Перейдите на evil.ru/login и введите пароль', 'evil.ru/login'),
+    ('Смотрите t.me/scam', 't.me/scam'),
+    ('см. bit.ly/abc', 'bit.ly/abc'),
+    ('Сайт example.com, заходите', 'example.com'),
+    ('Пишите на sub.domain.org.', 'sub.domain.org'),
+    ('ссылка: EVIL.RU/Login', 'EVIL.RU/Login'),
+    ('домен сайт.рф/путь', 'сайт.рф/путь'),
+    ('punycode xn--80ak6aa92e.xn--p1ai тоже', 'xn--80ak6aa92e.xn--p1ai'),
+    # Ambiguous TLDs (also file extensions / tech names) count only with a path or port
+    ('Код на evil.io/x', 'evil.io/x'),
+    ('Скачать: evil.net/payload', 'evil.net/payload'),
+    ('порт evil.dev:8080/x', 'evil.dev:8080/x'),
+])
+def test_domain_pattern_finds_bare_domains(text, found):
+    assert feed.DOMAIN_RE.search(text).group() == found
+
+
+@pytest.mark.parametrize('text', [
+    'Node.js и Vue.js против Next.js',
+    'Правим config.yaml и package.json',
+    'Миграция на ASP.NET Core',
+    'Запусти main.py и setup.py', 'README.md', 'deploy.sh', 'src/main.rs', 'libfoo.so',
+    'Python 3.12 и v1.2.3', 'Spring.io без ссылки', 'кластер на k8s.io',
+    'mail me at user@example.com', 'т.е. и т.д.', 'e.g. i.e.', 'U.S.A.',
+    'файл config.com.yaml',
+    'plain words only',
+])
+def test_domain_pattern_ignores_tech_names(text):
+    assert not feed.DOMAIN_RE.search(text), text
+
+
+def test_unsafe_text_patterns_include_bare_domains():
+    assert feed.DOMAIN_RE in feed.UNSAFE_TEXT_PATTERNS
+    assert {feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE} <= set(feed.UNSAFE_TEXT_PATTERNS)
+
+
+def test_fallback_description_strips_bare_domains():
+    out = feed.fallback_description('<p>Идите на evil.ru/login, t.me/scam и bit.ly/abc. Node.js рулит.</p>')
+    for bad in ('evil.ru', 't.me', 'bit.ly', '/login', '/scam', '/abc'):
+        assert bad not in out
+    assert 'Node.js рулит.' in out
+
+
 def test_strip_control_bidi():
-    text = 'a\x00b\x1fc\x7fd\x85e\x9ff\u202ag\u202eh\u2066i\u2069j\u200ek\u200fl\u061cm'
+    text ='a\x00b\x1fc\x7fd\x85e\x9ff\u202ag\u202eh\u2066i\u2069j\u200ek\u200fl\u061cm'
     assert feed.strip_control_bidi(text) == 'abcdefghijklm'
     assert feed.strip_control_bidi('line1\nline2\tx') == 'line1\nline2\tx'
     assert feed.strip_control_bidi('Привет, мир — ok') == 'Привет, мир — ok'

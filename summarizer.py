@@ -463,8 +463,7 @@ def _validate_short_description(text: object) -> str | None:
     result = '\n'.join(lines)
     if len(result) > SHORT_DESCRIPTION_MAX_CHARS:
         return None
-    patterns = (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE,
-                _SHORT_DESCRIPTION_MARKUP_RE, _SHORT_DESCRIPTION_LABEL_RE)
+    patterns = (*feed.UNSAFE_TEXT_PATTERNS, _SHORT_DESCRIPTION_MARKUP_RE, _SHORT_DESCRIPTION_LABEL_RE)
     for pattern in patterns:
         if pattern.search(result):
             return None

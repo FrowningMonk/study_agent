@@ -338,6 +338,7 @@ def test_describe_result_cleaned_before_store_and_display(tmp_db):
 
 @pytest.mark.parametrize('bad', [
     'Читай https://evil.example/x', 'Пиши @admin', 'Жми /start', 'a\nb\nc\nd', 'д' * 401,
+    'Перейдите на evil.ru/login', 'Смотрите t.me/scam', 'см. bit.ly/abc',
 ])
 def test_unsafe_describe_result_rejected(tmp_db, bad):
     result = build(USER, [item(1, score=1)], describe=Counter(result=bad))
@@ -352,6 +353,13 @@ def test_unsafe_stored_description_not_shown(tmp_db):
     text = build(USER, [item(1, score=1)], describe=describe)['parts'][0][0]
     assert 'evil' not in text
     assert describe.result in text              # regenerated and shown instead
+    assert habr_store.get_habr_article(1)['short_description'] == describe.result
+
+
+def test_tech_names_in_description_accepted(tmp_db):
+    describe = Counter(result='Автор переносит Node.js и ASP.NET на Vue.js.')
+    text = build(USER, [item(1, score=1)], describe=describe)['parts'][0][0]
+    assert 'Автор переносит Node.js и ASP.NET на Vue.js.' in text
     assert habr_store.get_habr_article(1)['short_description'] == describe.result
 
 

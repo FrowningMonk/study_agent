@@ -132,7 +132,7 @@ def _clean_description(value) -> str | None:
     """
     Accepted describe/stored value -> plain lines without control/bidi chars; else None.
     Defense in depth (summarizer validates too): a description is broadcast to every
-    recipient, so one with URLs, @mentions, /commands, > 3 lines or > 400 chars is rejected.
+    recipient, so one with URLs (also bare domains), @mentions, /commands, > 3 lines or > 400 chars is rejected.
     """
     if not isinstance(value, str):
         return None
@@ -141,7 +141,7 @@ def _clean_description(value) -> str | None:
     text = '\n'.join(lines)
     if not text or len(lines) > DESCRIPTION_MAX_LINES or len(text) > DESCRIPTION_MAX_CHARS:
         return None
-    if any(p.search(text) for p in (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE)):
+    if any(p.search(text) for p in feed.UNSAFE_TEXT_PATTERNS):
         return None
     return text
 

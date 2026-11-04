@@ -2,8 +2,8 @@
 Feed logic shared by `/feed` (bot) and the daily digest (`digest.py`): no Telegram code.
 
 Contents:
-    - text cleaning: URL_RE, MENTION_RE, COMMAND_RE, strip_control_bidi, html_to_text,
-      fallback_description, sanitize_title;
+    - text cleaning: URL_RE, DOMAIN_RE, MENTION_RE, COMMAND_RE, UNSAFE_TEXT_PATTERNS,
+      strip_control_bidi, html_to_text, fallback_description, sanitize_title;
     - MSK time: MSK, msk_day_bounds, msk_date, format_date_ru;
     - 24 h fetch cache: fetch_recent (5-minute reuse, handler wait mode);
     - ranking (Decision 6): select_feed, select_digest_site, select_digest_hubs;
@@ -100,6 +100,37 @@ MENTION_RE = re.compile(r'(?<![\w.@])@\w+')
 # Not preceded by a word char or slash: path parts like "a/b" are not commands
 COMMAND_RE = re.compile(r'(?<![\w/])/[A-Za-z]\w*(?:@\w+)?')
 
+# Bare domains ("evil.ru/login", "t.me/x", "bit.ly/abc"): Telegram auto-links them
+# even in plain text. TLD-aware so tech names with dots ("Node.js", "config.yaml",
+# "package.json") never match:
+#   - _LINK_TLDS are real TLDs that are not common file extensions / tech suffixes:
+#     a bare "name.tld" matches;
+#   - _AMBIGUOUS_TLDS are real TLDs that double as extensions or product names
+#     ("ASP.NET", "main.py", "README.md", "Spring.io"): they match only with a path
+#     or a port right after ("evil.io/x", "evil.net:8080").
+# Other TLDs are not listed: a link with them still needs a scheme or "www." (URL_RE).
+_LINK_TLDS = (
+    'ru', 'su', 'рф', 'com', 'org', 'me', 'ly', 'ua', 'by', 'kz', 'uz', 'info', 'biz',
+    'xyz', 'top', 'site', 'online', 'club', 'shop', 'store', 'live', 'link', 'click',
+    'win', 'tk', 'ml', 'ga', 'cf', 'gq', 'pw', 'ws', 'gl', 'gd', 'gg', 'cx', 'tv',
+    'fm', 'uk', 'de', 'fr', 'cn', 'us', 'eu', 'pro', 'xn--[a-z0-9-]{1,59}',
+)
+_AMBIGUOUS_TLDS = (
+    'net', 'io', 'co', 'cc', 'ai', 'app', 'dev', 'py', 'md', 'sh', 'rs', 'so', 'pl',
+    'to', 'in', 'it', 'is', 'at', 'am', 'im', 'la', 'li', 'sk', 'cz', 'nl', 'tech',
+)
+_DOMAIN_LABEL = r'[^\W_](?:[\w-]{0,61}[^\W_])?'
+_DOMAIN_TAIL = r'(?:[/:][^\s]*)?'
+DOMAIN_RE = re.compile(
+    rf'(?<![\w@.\-])(?:{_DOMAIN_LABEL}\.)+'
+    rf'(?:(?:{"|".join(_LINK_TLDS)})(?![\w\-]|\.\w){_DOMAIN_TAIL}'
+    rf'|(?:{"|".join(_AMBIGUOUS_TLDS)})(?=/|:\d){_DOMAIN_TAIL})',
+    re.IGNORECASE,
+)
+
+# Everything a broadcast description / fallback lead must not contain
+UNSAFE_TEXT_PATTERNS = (URL_RE, DOMAIN_RE, MENTION_RE, COMMAND_RE)
+
 # Bidi controls: LRM, RLM, ALM, embeddings/overrides, isolates
 _BIDI_CHARS = frozenset(
     ['\u200e', '\u200f', '\u061c']
@@ -168,11 +199,11 @@ def _cut_on_word(text: str, limit: int) -> str:
 def fallback_description(lead_html: str, limit: int = 250) -> str:
     """
     Short plain-text description from the raw lead HTML: control/bidi characters,
-    URLs, @mentions and /commands removed, cut to <= `limit` chars on a word boundary.
+    URLs (also bare domains), @mentions and /commands removed, cut to <= `limit` chars on a word boundary.
     Empty lead -> ''.
     """
     text = strip_control_bidi(html_to_text(lead_html))
-    for pattern in (URL_RE, MENTION_RE, COMMAND_RE):
+    for pattern in UNSAFE_TEXT_PATTERNS:
         text = pattern.sub(' ', text)
     # Removed fragments leave "word , next": glue punctuation back
     return _cut_on_word(_SPACE_BEFORE_PUNCT_RE.sub(lambda m: m.group(1), _collapse_ws(text)), limit)
