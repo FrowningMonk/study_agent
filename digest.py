@@ -141,7 +141,7 @@ def _clean_description(value) -> str | None:
     text = '\n'.join(lines)
     if not text or len(lines) > DESCRIPTION_MAX_LINES or len(text) > DESCRIPTION_MAX_CHARS:
         return None
-    if any(p.search(text) for p in feed.UNSAFE_TEXT_PATTERNS):
+    if feed.is_unsafe_description(text):
         return None
     return text
 

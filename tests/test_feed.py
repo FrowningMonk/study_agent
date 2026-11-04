@@ -669,10 +669,14 @@ def test_url_mention_command_patterns():
     ('ссылка: EVIL.RU/Login', 'EVIL.RU/Login'),
     ('домен сайт.рф/путь', 'сайт.рф/путь'),
     ('punycode xn--80ak6aa92e.xn--p1ai тоже', 'xn--80ak6aa92e.xn--p1ai'),
-    # Ambiguous TLDs (also file extensions / tech names) count only with a path or port
+    # Any TLD-looking suffix counts when a path or a port follows
     ('Код на evil.io/x', 'evil.io/x'),
     ('Скачать: evil.net/payload', 'evil.net/payload'),
     ('порт evil.dev:8080/x', 'evil.dev:8080/x'),
+    ('Войти: evil.icu/login', 'evil.icu/login'),
+    ('см. evil.vip/x', 'evil.vip/x'),
+    ('см. evil.space/x', 'evil.space/x'),
+    ('см. evil.page/x', 'evil.page/x'),
 ])
 def test_domain_pattern_finds_bare_domains(text, found):
     assert feed.DOMAIN_RE.search(text).group() == found
@@ -692,6 +696,43 @@ def test_domain_pattern_ignores_tech_names(text):
     assert not feed.DOMAIN_RE.search(text), text
 
 
+@pytest.mark.parametrize('text', [
+    'tg://resolve?domain=x', 'открой ton://x', 'ftp://host/file', 'https://x.y/a', 'www.example.com',
+])
+def test_url_pattern_any_scheme(text):
+    assert feed.URL_RE.search(text)
+    assert feed.is_unsafe_description(text)
+
+
+@pytest.mark.parametrize('text', [
+    'evil.tg', 'evil.cloud', 'evil.io', 'evil.ai', 'evil.dev', 'evil.app', 'evil.net', 'evil.co',
+    'evil.md', 'evil.zip', 'evil.website', 'Заходи на evil.lol сегодня', 'sub.evil.asia.',
+])
+def test_strict_description_check_rejects_any_bare_domain(text):
+    assert feed.has_bare_domain(text), text
+    assert feed.is_unsafe_description(text), text
+
+
+@pytest.mark.parametrize('text', [
+    'Автор переводит Node.js и ASP.NET на config.yaml.',
+    'Сравнение Vue.js, package.json, main.py и socket.io.',
+    'ADO.NET, tsconfig.json, App.tsx, Main.java, settings.toml',
+    'Python 3.12, v1.2.3, т.е., e.g. и U.S.A.',
+    'Пишет на team@example.com, код в src/app.',
+])
+def test_strict_description_check_keeps_tech_names(text):
+    assert not feed.has_bare_domain(text), text
+    assert not feed.is_unsafe_description(text), text
+
+
+def test_lead_fallback_keeps_bare_tech_names_but_cuts_paths():
+    out = feed.fallback_description(
+        '<p>Node.js, README.md и main.py; ссылка evil.icu/login и tg://resolve?domain=x.</p>')
+    assert 'Node.js' in out and 'README.md' in out and 'main.py' in out
+    for bad in ('evil.icu', '/login', 'tg://', 'resolve'):
+        assert bad not in out
+
+
 def test_unsafe_text_patterns_include_bare_domains():
     assert feed.DOMAIN_RE in feed.UNSAFE_TEXT_PATTERNS
     assert {feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE} <= set(feed.UNSAFE_TEXT_PATTERNS)
@@ -705,7 +746,7 @@ def test_fallback_description_strips_bare_domains():
 
 
 def test_strip_control_bidi():
-    text ='a\x00b\x1fc\x7fd\x85e\x9ff\u202ag\u202eh\u2066i\u2069j\u200ek\u200fl\u061cm'
+    text = 'a\x00b\x1fc\x7fd\x85e\x9ff\u202ag\u202eh\u2066i\u2069j\u200ek\u200fl\u061cm'
     assert feed.strip_control_bidi(text) == 'abcdefghijklm'
     assert feed.strip_control_bidi('line1\nline2\tx') == 'line1\nline2\tx'
     assert feed.strip_control_bidi('Привет, мир — ok') == 'Привет, мир — ok'

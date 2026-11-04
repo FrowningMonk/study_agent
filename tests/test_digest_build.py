@@ -339,6 +339,7 @@ def test_describe_result_cleaned_before_store_and_display(tmp_db):
 @pytest.mark.parametrize('bad', [
     'Читай https://evil.example/x', 'Пиши @admin', 'Жми /start', 'a\nb\nc\nd', 'д' * 401,
     'Перейдите на evil.ru/login', 'Смотрите t.me/scam', 'см. bit.ly/abc',
+    'Войти: evil.icu/login', 'Пишите в evil.ai', 'tg://resolve?domain=x',
 ])
 def test_unsafe_describe_result_rejected(tmp_db, bad):
     result = build(USER, [item(1, score=1)], describe=Counter(result=bad))

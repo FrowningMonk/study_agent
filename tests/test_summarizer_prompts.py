@@ -284,6 +284,10 @@ def test_short_description_strips_control_and_bidi_chars(monkeypatch, char):
     'Перейдите на evil.ru/login и введите пароль',
     'Смотрите t.me/scam',
     'см. bit.ly/abc',
+    'Подробнее на evil.icu/login',
+    'Пишите в evil.tg или evil.cloud',
+    'Код лежит на evil.io',
+    'Откройте tg://resolve?domain=x',
     'Пишите @someone, он расскажет больше.',
     'Нажмите /start, чтобы узнать больше.',
     'Первая строка.\nВторая строка.\nТретья строка.\nЧетвёртая строка.',
@@ -319,6 +323,7 @@ def test_short_description_rejects_bad_output(monkeypatch, output):
     # Tech names with dots are not domains
     ('Автор переводит Node.js и ASP.NET на config.yaml.', 'Автор переводит Node.js и ASP.NET на config.yaml.'),
     ('Сравнение Vue.js и package.json в монорепо.', 'Сравнение Vue.js и package.json в монорепо.'),
+    ('Автор запускает main.py и socket.io.', 'Автор запускает main.py и socket.io.'),
     # Dunder names are not markdown; a label word inside the text is not a preamble
     ('Автор объясняет, когда вызывается __init__.', 'Автор объясняет, когда вызывается __init__.'),
     ('Автор сравнивает описание: API и SDK.', 'Автор сравнивает описание: API и SDK.'),
