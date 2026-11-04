@@ -336,6 +336,7 @@ TEXT_SUBSCRIBED = 'Подписка оформлена: {hubs}'
 TEXT_SUBSCRIPTIONS = 'Твои подписки — нажми ✖, чтобы отписаться:'
 TEXT_SUBSCRIPTIONS_MORE = 'Ещё подписки:'
 TEXT_SUBSCRIPTIONS_EMPTY = 'Подписок пока нет — /subscribe'
+TEXT_SUBSCRIPTIONS_REFRESHED = 'Список подписок обновлён — /subscriptions'
 TEXT_UNSUBSCRIBE_BUTTON = '✖ {alias}'
 
 Rows = list[list[tuple[str, str]]]

@@ -1955,7 +1955,12 @@ def handle_subscribe(message: telebot.types.Message) -> None:
     if not resolution.found and not resolution.not_found:
         bot.send_message(chat_id, hubs.TEXT_TOP_HUBS, reply_markup=_to_markup(hubs.top_hubs_rows()))
         return
-    hubs.subscribe(user_id, resolution.found)
+    try:
+        hubs.subscribe(user_id, resolution.found)
+    except Exception as e:
+        logger.exception('Ошибка подписки для %s', user_id)
+        bot.send_message(chat_id, MSG_ERROR.format(error=_error_text(e)))
+        return
     parts = [p for p in (hubs.format_subscribed(resolution.found),
                          hubs.format_not_found(resolution.not_found)) if p]
     send_long_message(chat_id, '\n\n'.join(parts))
@@ -1968,31 +1973,31 @@ def handle_subscriptions(message: telebot.types.Message) -> None:
         bot.send_message(message.chat.id, text, reply_markup=_to_markup(rows) if rows else None)
 
 
-def _refresh_subscriptions_message(call: telebot.types.CallbackQuery, removed_alias: str) -> None:
+def _refresh_subscriptions_message(call: telebot.types.CallbackQuery) -> None:
     """
-    After ✖: drops the pressed button from this message. If the message had no other
-    buttons (or its keyboard is unknown), it is redrawn from the current subscriptions.
+    After a ✖ press (valid or stale): drops that button from this message. A message
+    left without buttons, or one whose keyboard is unknown (InaccessibleMessage, older
+    than 48 h), gets a short text: the empty state, or a pointer to /subscriptions. It
+    is never redrawn with page 1, which would duplicate the buttons of other messages.
     "Message is not modified" and similar Telegram errors are logged only.
     """
     if call.message is None:
         return
     chat_id, user_id, message_id = _call_chat_id(call), call.from_user.id, call.message.message_id
-    pressed = hubs.unsubscribe_callback(removed_alias)
     rows = []
-    # An InaccessibleMessage (older than 48 h) has no keyboard: the message is redrawn
     markup = getattr(call.message, 'reply_markup', None)
     if markup is not None:
         for row in markup.keyboard:
-            kept = [(b.text, b.callback_data) for b in row if b.callback_data and b.callback_data != pressed]
+            kept = [(b.text, b.callback_data) for b in row if b.callback_data and b.callback_data != call.data]
             if kept:
                 rows.append(kept)
     try:
         if rows:
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=_to_markup(rows))
             return
-        text, page_rows = hubs.subscription_pages(hubs.list_subscriptions(user_id))[0]
-        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
-                              reply_markup=_to_markup(page_rows) if page_rows else None)
+        text = hubs.TEXT_SUBSCRIPTIONS_REFRESHED if hubs.list_subscriptions(user_id) \
+            else hubs.TEXT_SUBSCRIPTIONS_EMPTY
+        bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
     except Exception as e:
         logger.info('Не удалось обновить список подписок для %s: %s', user_id, _error_text(e))
 
@@ -2005,6 +2010,9 @@ def handle_hub_callback(call: telebot.types.CallbackQuery) -> None:
         parsed = hubs.parse_hub_callback(call.data, user_id)
         if parsed is None:
             _answer(call, feed.TEXT_STALE_BUTTON)
+            if call.data.startswith('hs:d:'):
+                # Double press / another device: the dead ✖ disappears too
+                _refresh_subscriptions_message(call)
             return
         action, alias = parsed
         if action == 'a':
@@ -2017,7 +2025,7 @@ def handle_hub_callback(call: telebot.types.CallbackQuery) -> None:
         _answer(call, MSG_ERROR.format(error=_error_text(e)))
         return
     _answer(call, MSG_HUB_UNSUBSCRIBED.format(alias=alias))
-    _refresh_subscriptions_message(call, alias)
+    _refresh_subscriptions_message(call)
 
 
 @bot.message_handler(commands=['feed'])

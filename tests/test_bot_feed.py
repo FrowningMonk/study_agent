@@ -174,6 +174,15 @@ def _query(db, sql, params=()):
         conn.close()
 
 
+def _execute(db, sql, params=()):
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        with conn:
+            conn.execute(sql, params)
+    finally:
+        conn.close()
+
+
 def _views(db, user_id):
     return _query(db, 'SELECT habr_id, source FROM article_views WHERE user_id = ? ORDER BY habr_id',
                   (user_id,))
@@ -189,7 +198,7 @@ def _rows_of(message_call):
     return [[b.callback_data for b in row] for row in markup.keyboard] if markup else []
 
 
-def _with_catalog(tmp_db):
+def _with_catalog():
     habr_store.replace_hub_catalog(CATALOG)
 
 
@@ -262,6 +271,54 @@ def test_subscribe_long_reply_split_under_limit(tg, habr):
     assert all(a in joined for a in aliases)
 
 
+def test_subscribe_only_unknown_tokens(tg, habr):
+    _send(FRIEND, '/subscribe xyz123 abc')
+
+    assert hubs.list_subscriptions(FRIEND) == []
+    assert _texts(tg, FRIEND) == ['Не найдены: xyz123, abc']
+
+
+def test_subscribe_button_already_subscribed(tg, habr):
+    _with_catalog()
+    habr_store.add_subscription(FRIEND, 'python')
+
+    _press(FRIEND, 'hs:a:python')
+
+    assert _answers(tg) == ['Ты уже подписан на python']
+    assert hubs.list_subscriptions(FRIEND) == ['python']
+
+
+def test_subscribe_db_error_reported(tg, habr, monkeypatch):
+    def broken(*a, **k):
+        raise sqlite3.OperationalError('database is locked')
+    monkeypatch.setattr(habr_store, 'add_subscription', broken)
+
+    _send(FRIEND, '/subscribe python')
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_ERROR.format(error='OperationalError')]
+
+
+def test_subscribe_unexpected_catalog_error_friendly(tg, habr, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError('secret detail')
+    monkeypatch.setattr(hubs, 'ensure_catalog', broken)
+
+    _send(FRIEND, '/subscribe python')
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_CATALOG_UNAVAILABLE]
+
+
+def test_subscribe_stale_catalog_used_when_habr_busy(tg, habr, monkeypatch):
+    _with_catalog()
+    monkeypatch.setattr(hubs, 'CATALOG_MAX_AGE', timedelta(0))
+    habr.catalog_error = habr_api.HabrBusy('busy')
+
+    _send(FRIEND, '/subscribe rust')
+
+    assert hubs.list_subscriptions(FRIEND) == ['rust']
+    assert habr.count('catalog') == 1
+
+
 def test_subscribe_catalog_unavailable_message(tg, habr):
     habr.catalog_error = habr_api.HabrUnavailable('http', 503)
 
@@ -273,7 +330,7 @@ def test_subscribe_catalog_unavailable_message(tg, habr):
 
 
 def test_subscribe_stale_catalog_used_silently(tg, habr, tmp_db, monkeypatch):
-    _with_catalog(tmp_db)
+    _with_catalog()
     monkeypatch.setattr(hubs, 'CATALOG_MAX_AGE', timedelta(0))
     habr.catalog_error = habr_api.HabrUnavailable('http', 503)
 
@@ -302,7 +359,7 @@ def test_subscribe_throttle_timeout_message(tg, habr):
 @pytest.mark.parametrize('data', ['hs:a:nosuchhub', 'hs:a:bad alias', 'hs:a:py/thon', 'hs:a:' + 'x' * 51,
                                   'hs:a:', 'hs:x:python', 'hs:a:python\n'])
 def test_hub_callback_unknown_alias_rejected(tg, habr, tmp_db, data, caplog):
-    _with_catalog(tmp_db)
+    _with_catalog()
 
     with caplog.at_level(logging.WARNING, logger='hubs'):
         _press(FRIEND, data)
@@ -342,6 +399,39 @@ def test_subscriptions_list_and_unsubscribe(tg, habr, tmp_db):
     assert habr.calls == []
 
 
+def test_stale_unsubscribe_button_is_removed(tg, habr):
+    habr_store.add_subscription(FRIEND, 'rust')
+
+    _press_with_markup(FRIEND, 'hs:d:python', [[('✖ python', 'hs:d:python'), ('✖ rust', 'hs:d:rust')]])
+
+    assert _answers(tg) == ['Кнопка устарела']
+    edits = [c for c in tg if c[0] == 'edit_message_reply_markup']
+    assert len(edits) == 1 and _buttons(edits[0][2]['reply_markup']) == ['hs:d:rust']
+    assert hubs.list_subscriptions(FRIEND) == ['rust']
+
+
+def test_emptied_later_page_not_redrawn_with_first_page(tg, habr):
+    for alias in ('python', 'rust'):
+        habr_store.add_subscription(FRIEND, alias)
+
+    # The last button of a 2nd /subscriptions message; other subscriptions remain
+    _press_with_markup(FRIEND, 'hs:d:rust', [[('✖ rust', 'hs:d:rust')]])
+
+    edits = [c for c in tg if c[0] == 'edit_message_text']
+    assert len(edits) == 1
+    assert edits[0][1][0] == hubs.TEXT_SUBSCRIPTIONS_REFRESHED and edits[0][2].get('reply_markup') is None
+    assert hubs.list_subscriptions(FRIEND) == ['python']
+
+
+def test_unsubscribe_from_inaccessible_message(tg, habr):
+    habr_store.add_subscription(FRIEND, 'python')
+
+    _press(FRIEND, 'hs:d:python')          # date 0 -> InaccessibleMessage without a keyboard
+
+    edits = [c for c in tg if c[0] == 'edit_message_text']
+    assert [e[1][0] for e in edits] == ['Подписок пока нет — /subscribe']
+
+
 def test_subscriptions_many_hubs_split_messages(tg, habr):
     aliases = [f'hub_{i:03d}_{"x" * 40}' for i in range(160)]
     for alias in aliases:
@@ -362,7 +452,7 @@ def test_subscriptions_many_hubs_split_messages(tg, habr):
 
 
 def test_unsubscribe_validates_against_own_subscriptions(tg, habr, tmp_db):
-    _with_catalog(tmp_db)
+    _with_catalog()
     habr_store.add_subscription(OWNER, 'rust')
     habr_store.add_subscription(FRIEND, 'gonehub')        # left the catalog since
 
@@ -419,6 +509,7 @@ def test_feed_with_data_first_page(tg, habr, llm, tmp_db):
     assert rows[0][0] == f'hl:s:{list_id}:1' and rows[2] == [f'hl:m:{list_id}:10']
     assert llm.calls == [] and llm.model_checks == []
     assert _views(tmp_db, FRIEND) == []
+    assert habr.calls == [('list', habr_api.HANDLER_WAIT_TIMEOUT)]     # handler throttle mode
 
 
 def test_feed_more_10_to_the_end(tg, habr):
@@ -459,6 +550,15 @@ def test_feed_cached_fetch_and_summarized_article_excluded(tg, habr, llm, sync_s
     assert habr.count('list') == 1
 
 
+def test_feed_unexpected_error_friendly(tg, habr):
+    habr_store.add_subscription(FRIEND, 'python')
+    habr.list_error = RuntimeError('secret detail')
+
+    _send(FRIEND, '/feed')
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_FEED_UNAVAILABLE]
+
+
 def test_feed_habr_failure_friendly_message(tg, habr):
     habr_store.add_subscription(FRIEND, 'python')
     habr.list_error = habr_api.HabrUnavailable('http', 503, detail='boom-detail')
@@ -480,10 +580,7 @@ def test_forged_callback_rejected_without_io(tg, habr, llm, tmp_db, caplog, sync
     foreign = _list_for(OWNER, (1,))
     expired = _list_for(FRIEND, (1,))
     old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(timespec='microseconds')
-    _query_update = sqlite3.connect(tmp_db.DB_PATH)
-    _query_update.execute('UPDATE ranked_lists SET created_at = ? WHERE id = ?', (old, expired))
-    _query_update.commit()
-    _query_update.close()
+    _execute(tmp_db, 'UPDATE ranked_lists SET created_at = ? WHERE id = ?', (old, expired))
 
     forged = [
         'hl:s:abc:1', 'hl:s:99999999999999999999:1', f'hl:s:{own}:99999999999', f'hl:s:0{own}:1',
@@ -501,38 +598,63 @@ def test_forged_callback_rejected_without_io(tg, habr, llm, tmp_db, caplog, sync
     assert _views(tmp_db, FRIEND) == []
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING and f'user_id={FRIEND}' in r.message]
     assert len(warnings) == len(forged)
-    assert not any(data in str(s) for s in tg for data in ('abc', '99999999999'))
+
+    # Positive control: the same harness accepts the valid button of the same list
+    tg.clear()
+    _press(FRIEND, f'hl:s:{own}:1', update_id=99)
+    assert _answers(tg) == [None] and llm.calls == [habr_api.canonical_url(1)]
 
 
-def test_callback_answered_exactly_once(tg, habr, llm, tmp_db, captured_spawn, monkeypatch):
+def _answer_count(sent):
+    return len([s for s in sent if s[0] == 'answer_callback_query'])
+
+
+@pytest.mark.parametrize('path, expected', [
+    ('more', None), ('forged', 'Кнопка устарела'), ('started', None), ('already', 'Саммари уже готовится'),
+    ('hub_add', 'Подписка на python оформлена'), ('hub_stale', 'Кнопка устарела'),
+])
+def test_callback_answered_exactly_once(tg, habr, llm, captured_spawn, path, expected):
+    _with_catalog()
     list_id = _list_for(FRIEND, tuple(range(1, 16)))
-    paths = [f'hl:m:{list_id}:10', 'hl:s:x:1', f'hl:s:{list_id}:1', f'hl:s:{list_id}:1']
-    for n, data in enumerate(paths):
-        tg.clear()
-        _press(FRIEND, data, update_id=20 + n)
-        assert len([s for s in tg if s[0] == 'answer_callback_query']) == 1, data
-    assert _answers(tg) == ['Саммари уже готовится']
+    if path == 'already':
+        feed.REGISTRY.click(1, FRIEND)
+    data = {'more': f'hl:m:{list_id}:10', 'forged': 'hl:s:x:1', 'started': f'hl:s:{list_id}:1',
+            'already': f'hl:s:{list_id}:1', 'hub_add': 'hs:a:python', 'hub_stale': 'hs:d:python'}[path]
+
+    _press(FRIEND, data)
+
+    assert _answer_count(tg) == 1
+    assert _answers(tg) == [expected]
+
+
+def test_stale_answer_error_does_not_crash(tg, habr, llm, monkeypatch):
+    list_id = _list_for(FRIEND, tuple(range(1, 16)))
 
     def stale(*a, **k):
         tg.append(('answer_callback_query', a, k))
         raise telebot.apihelper.ApiTelegramException(
             'answerCallbackQuery', '', {'error_code': 400, 'description': 'query is too old'})
     monkeypatch.setattr(bot_module.bot, 'answer_callback_query', stale)
-    tg.clear()
-    _press(FRIEND, f'hl:m:{list_id}:10', update_id=30)
-    assert len([s for s in tg if s[0] == 'answer_callback_query']) == 1
+
+    _press(FRIEND, f'hl:m:{list_id}:10')
+
+    assert _answer_count(tg) == 1
     assert len(_sent_to(tg, FRIEND)) == 1              # the page is still sent
 
+
+def test_not_modified_edit_error_does_not_crash(tg, habr, monkeypatch):
     def not_modified(*a, **k):
+        tg.append(('edit_message_reply_markup', a, k))
         raise telebot.apihelper.ApiTelegramException(
             'editMessageReplyMarkup', '', {'error_code': 400, 'description': 'message is not modified'})
     monkeypatch.setattr(bot_module.bot, 'edit_message_reply_markup', not_modified)
     habr_store.add_subscription(FRIEND, 'python')
     habr_store.add_subscription(FRIEND, 'rust')
-    tg.clear()
-    _press_with_markup(FRIEND, 'hs:d:python', [[('✖ python', 'hs:d:python'), ('✖ rust', 'hs:d:rust')]],
-                       update_id=31)
-    assert len([s for s in tg if s[0] == 'answer_callback_query']) == 1
+
+    _press_with_markup(FRIEND, 'hs:d:python', [[('✖ python', 'hs:d:python'), ('✖ rust', 'hs:d:rust')]])
+
+    assert _answers(tg) == ['Отписка от python']
+    assert len([s for s in tg if s[0] == 'edit_message_reply_markup']) == 1
     assert hubs.list_subscriptions(FRIEND) == ['rust']
 
 
@@ -684,8 +806,9 @@ def test_summary_generation_failure_notifies_all_and_clears_registry(tg, habr, l
     captured_spawn[0]()
 
     expected = bot_module.MSG_ERROR.format(error='RuntimeError')
-    assert expected in _texts(tg, FRIEND) or any(
-        s[0] == 'edit_message_text' and s[1][0] == expected for s in tg)
+    # The clicker sees the error in place of its "Обрабатываю..." status message (link-flow behaviour)
+    edits = [(c[1][0], c[2]['chat_id']) for c in tg if c[0] == 'edit_message_text']
+    assert edits == [(expected, FRIEND)]
     assert _texts(tg, OWNER)[-1] == expected
     assert len(feed.REGISTRY) == 0
 
@@ -787,7 +910,7 @@ def test_new_handlers_respect_access_gate(tg, habr, text):
 
 @pytest.mark.parametrize('data', ['hl:s:1:1', 'hl:m:1:10', 'hs:a:python', 'hs:d:python'])
 def test_new_handlers_respect_access_gate_callbacks(tg, habr, tmp_db, data):
-    _with_catalog(tmp_db)
+    _with_catalog()
     _list_for(STRANGER)
     habr_store.add_subscription(STRANGER, 'python')
 
