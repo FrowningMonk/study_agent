@@ -109,19 +109,30 @@ _BIDI_CHARS = frozenset(
 _KEEP_CONTROLS = frozenset('\n\t')
 _WS_RE = re.compile(r'\s+')
 _SPACE_BEFORE_PUNCT_RE = re.compile(r'\s+([,.;:!?])')
+_BLOCK_TAGS = (
+    'p', 'div', 'br', 'li', 'ul', 'ol', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'blockquote', 'pre', 'table', 'tr', 'td', 'th', 'figure', 'figcaption', 'hr', 'section',
+)
+
+
+# Cc = C0/C1 controls; Cf = format chars (zero-width, soft hyphen, BOM, bidi marks);
+# Zl/Zp = line/paragraph separators
+_STRIP_CATEGORIES = frozenset({'Cc', 'Cf', 'Zl', 'Zp'})
 
 
 def strip_control_bidi(text: str) -> str:
     """
-    Removes C0/C1 control characters (Unicode category Cc) and bidi controls.
-    Newline and tab are kept; callers that need one line collapse whitespace themselves.
-    Non-strings give ''.
+    Removes control characters (Cc), format characters (Cf: zero-width chars, soft
+    hyphen, BOM; also ZWJ, so joined emoji fall apart into their parts), line and
+    paragraph separators (Zl/Zp) and bidi controls. Newline and tab are kept; callers
+    that need one line collapse whitespace themselves. Non-strings give ''.
     """
     if not isinstance(text, str):
         return ''
     return ''.join(
         ch for ch in text
-        if ch in _KEEP_CONTROLS or (ch not in _BIDI_CHARS and unicodedata.category(ch) != 'Cc')
+        if ch in _KEEP_CONTROLS
+        or (ch not in _BIDI_CHARS and unicodedata.category(ch) not in _STRIP_CATEGORIES)
     )
 
 
@@ -133,8 +144,14 @@ def html_to_text(html_text: str) -> str:
     """HTML -> plain text: entities unescaped, tags stripped, whitespace collapsed."""
     if not isinstance(html_text, str) or not html_text:
         return ''
-    text = BeautifulSoup(html.unescape(html_text), 'html.parser').get_text(' ')
-    return _collapse_ws(text)
+    soup = BeautifulSoup(html.unescape(html_text), 'html.parser')
+    for tag in soup.find_all(('script', 'style')):
+        tag.decompose()
+    # Separate block elements only: inline markup like <b>Py</b>thon stays one word
+    for tag in soup.find_all(_BLOCK_TAGS):
+        tag.insert_before(' ')
+        tag.insert_after(' ')
+    return _collapse_ws(soup.get_text())
 
 
 def _cut_on_word(text: str, limit: int) -> str:
@@ -308,9 +325,10 @@ def select_feed(items, subscriptions, seen, now: datetime) -> list[dict]:
     return sorted(selected, key=lambda i: (_score(i), _published(i)), reverse=True)
 
 
-def _in_day(item: dict, day: date) -> bool:
+def _day_filter(day: date) -> Callable[[dict], bool]:
+    """Predicate 'published within the MSK day D' with the bounds computed once."""
     start, end = msk_day_bounds(day)
-    return start <= _published(item) < end
+    return lambda item: start <= _published(item) < end
 
 
 def _digest_order(items: list[dict]) -> list[dict]:
@@ -319,7 +337,7 @@ def _digest_order(items: list[dict]) -> list[dict]:
 
 def select_digest_site(items, seen, day: date) -> list[dict]:
     """Digest site list: items of the MSK day D minus seen; score, comments, published DESC."""
-    return _digest_order(_unique_unseen(items, set(seen), lambda i: _in_day(i, day)))
+    return _digest_order(_unique_unseen(items, set(seen), _day_filter(day)))
 
 
 def select_digest_hubs(items, subscriptions, seen, day: date, site_top) -> list[dict]:
@@ -329,8 +347,9 @@ def select_digest_hubs(items, subscriptions, seen, day: date, site_top) -> list[
     """
     subs = _lower_set(subscriptions)
     excluded = set(seen) | {t['habr_id'] if isinstance(t, dict) else t for t in site_top}
+    in_day = _day_filter(day)
     return _digest_order(
-        _unique_unseen(items, excluded, lambda i: _in_day(i, day) and _subscribed(i, subs)),
+        _unique_unseen(items, excluded, lambda i: in_day(i) and _subscribed(i, subs)),
     )
 
 

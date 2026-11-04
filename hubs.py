@@ -33,6 +33,11 @@ from habr_store import HUB_ALIAS_RE
 logger = logging.getLogger(__name__)
 
 CATALOG_MAX_AGE = timedelta(days=7)
+# After a failed refresh with a stale copy, handlers use the copy without retrying
+# Habr for this long (each retry could hold a handler worker for the throttle wait)
+REFRESH_RETRY_AFTER = timedelta(minutes=10)
+# Upper bound of what habr_api.fetch_hub_catalog can return (pages x per page)
+_CATALOG_LOAD_LIMIT = habr_api.HUBS_MAX_PAGES * habr_api.HUBS_PER_PAGE
 TOP_HUBS = 30
 NOT_FOUND_MAX_TOKENS = 10
 NOT_FOUND_TOKEN_MAX_LEN = 40
@@ -63,6 +68,7 @@ def _now() -> datetime:
 _refresh_lock = threading.Lock()
 _refresh_generation = 0                    # incremented after every refresh attempt
 _last_refresh_error: Exception | None = None
+_last_failure_at: datetime | None = None   # last failed refresh while a stale copy existed
 
 
 def _catalog_state(now: datetime) -> tuple[bool, bool]:
@@ -99,10 +105,13 @@ def ensure_catalog(now: datetime | None = None) -> None:
     outcome (one Habr request). Raises habr_api.HabrBusy or CatalogUnavailable only
     when there is no stored copy.
     """
-    global _refresh_generation, _last_refresh_error
+    global _refresh_generation, _last_refresh_error, _last_failure_at
     now = now or _now()
     has_copy, fresh = _catalog_state(now)
     if fresh:
+        return
+    failed_at = _last_failure_at
+    if has_copy and failed_at is not None and timedelta(0) <= now - failed_at < REFRESH_RETRY_AFTER:
         return
     generation = _refresh_generation
     if not _refresh_lock.acquire(timeout=habr_api.HANDLER_WAIT_TIMEOUT):
@@ -130,8 +139,10 @@ def ensure_catalog(now: datetime | None = None) -> None:
         _last_refresh_error = error
         _refresh_generation += 1
         if error is None:
+            _last_failure_at = None
             return
         if has_copy:
+            _last_failure_at = now
             logger.warning('Hub catalog refresh failed, stale copy used: %s', error)
             return
         _raise_no_copy(error)
@@ -147,10 +158,11 @@ def _raise_no_copy(error: Exception | None) -> None:
 
 def _reset_for_tests() -> None:
     """Resets the refresh lock and the shared refresh outcome."""
-    global _refresh_lock, _refresh_generation, _last_refresh_error
+    global _refresh_lock, _refresh_generation, _last_refresh_error, _last_failure_at
     _refresh_lock = threading.Lock()
     _refresh_generation = 0
     _last_refresh_error = None
+    _last_failure_at = None
 
 
 # =============================================================================
@@ -192,19 +204,34 @@ def resolve(args: str) -> Resolution:
     """
     Splits `/subscribe` arguments on whitespace/commas and resolves each token
     (hub URL or bare alias) case-insensitively against the stored catalog.
-    The caller runs ensure_catalog() first. No network access.
+    The caller runs ensure_catalog() first. One catalog read, matching in memory,
+    so the cost does not grow with DB round-trips per token. No network access.
     """
     found: list[str] = []
     not_found: list[str] = []
     tokens = [t for t in _TOKEN_SPLIT_RE.split(args or '') if t]
+    if not tokens:
+        return Resolution(found, not_found)
+    catalog = _catalog_by_lower()
     for token in dict.fromkeys(tokens):
         alias = _alias_from_url(token) if _looks_like_url(token) else token
-        hub = habr_store.find_hub(alias) if alias and HUB_ALIAS_RE.fullmatch(alias) else None
-        if hub is None:
+        canonical = catalog.get(alias.lower()) if alias and HUB_ALIAS_RE.fullmatch(alias) else None
+        if canonical is None:
             not_found.append(token)
-        elif hub['alias'] not in found:
-            found.append(hub['alias'])
+        elif canonical not in found:
+            found.append(canonical)
     return Resolution(found, not_found)
+
+
+def _catalog_by_lower() -> dict[str, str]:
+    """lower(alias) -> canonical alias; on a case-only clash the smallest alias wins (as find_hub)."""
+    result: dict[str, str] = {}
+    for hub in habr_store.top_hubs(_CATALOG_LOAD_LIMIT):
+        alias = hub['alias']
+        key = alias.lower()
+        if key not in result or alias < result[key]:
+            result[key] = alias
+    return result
 
 
 def format_not_found(tokens: list[str]) -> str:

@@ -356,3 +356,42 @@ def test_reset_for_tests_replaces_refresh_lock():
     hubs._reset_for_tests()
     assert hubs._refresh_lock.acquire(timeout=0.1)
     hubs._refresh_lock.release()
+
+
+def test_resolve_reads_catalog_once_for_many_tokens(catalog, monkeypatch):
+    calls = []
+    real_top = habr_store.top_hubs
+    monkeypatch.setattr(habr_store, 'top_hubs', lambda n: calls.append(n) or real_top(n))
+    monkeypatch.setattr(habr_store, 'find_hub', lambda alias: pytest.fail('per-token lookup'))
+    tokens = ' '.join([f'unknown{i}' for i in range(500)] + ['PYTHON', '1c'])
+    result = hubs.resolve(tokens)
+    assert result.found == ['python', '1C']
+    assert len(result.not_found) == 500
+    assert len(calls) == 1 and calls[0] >= habr_api.HUBS_MAX_PAGES * habr_api.HUBS_PER_PAGE
+    assert hubs.resolve('') == hubs.Resolution([], [])
+    assert len(calls) == 1                              # empty input reads nothing
+
+
+def test_catalog_failure_with_stale_copy_retries_after_cooldown(tmp_db, monkeypatch):
+    _set_catalog_age(monkeypatch, timedelta(days=8))
+    fake = FakeCatalog(error=habr_api.HabrUnavailable('network'))
+    monkeypatch.setattr(habr_api, 'fetch_hub_catalog', fake)
+    hubs.ensure_catalog(NOW)
+    hubs.ensure_catalog(NOW + timedelta(minutes=9))
+    assert len(fake.calls) == 1                         # stale copy used, Habr not retried
+    hubs.ensure_catalog(NOW + timedelta(minutes=10))
+    assert len(fake.calls) == 2
+    fake.error = None
+    hubs.ensure_catalog(NOW + timedelta(minutes=30))
+    assert len(fake.calls) == 3
+    assert habr_store.find_hub('python') is not None
+
+
+def test_reset_for_tests_clears_failure_cooldown(tmp_db, monkeypatch):
+    _set_catalog_age(monkeypatch, timedelta(days=8))
+    fake = FakeCatalog(error=habr_api.HabrUnavailable('network'))
+    monkeypatch.setattr(habr_api, 'fetch_hub_catalog', fake)
+    hubs.ensure_catalog(NOW)
+    hubs._reset_for_tests()
+    hubs.ensure_catalog(NOW + timedelta(minutes=1))
+    assert len(fake.calls) == 2

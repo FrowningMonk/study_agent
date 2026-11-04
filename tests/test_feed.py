@@ -409,6 +409,8 @@ def test_callback_never_calls_habr_or_llm(tmp_db, monkeypatch):
 
     for name in ('fetch_articles_since', 'fetch_article', 'fetch_hub_catalog', '_request'):
         monkeypatch.setattr(habr_api, name, boom)
+    # the single LLM entry point used by every generator, patched explicitly
+    monkeypatch.setattr(summarizer, '_generate', boom)
     for name in dir(summarizer):
         if name.startswith(('generate', '_generate', 'summarize')) and callable(getattr(summarizer, name)):
             monkeypatch.setattr(summarizer, name, boom)
@@ -679,3 +681,17 @@ def test_fallback_description_cleaned_and_cut():
     assert feed.fallback_description('') == ''
     assert feed.fallback_description(None) == ''
     assert len(feed.fallback_description('<p>' + 'abc ' * 30 + '</p>', limit=50)) <= 50
+
+
+def test_strip_control_bidi_removes_format_and_separator_chars():
+    # zero-width space/joiner, word joiner, BOM, soft hyphen, line/paragraph separators
+    invisible = [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD, 0x2028, 0x2029]
+    text = 'a' + ''.join(chr(c) for c in invisible) + 'b'
+    assert feed.strip_control_bidi(text) == 'ab'
+    assert feed.sanitize_title('/st' + chr(0x200B) + 'art') == '/start'
+
+
+def test_html_to_text_inline_and_script():
+    assert feed.html_to_text('<p><b>Py</b>thon and <i>Ru</i>st</p>') == 'Python and Rust'
+    assert feed.html_to_text('<p>one</p><p>two</p>line<br>break') == 'one two line break'
+    assert feed.html_to_text('<script>alert(1)</script><style>p{}</style><p>text</p>') == 'text'
