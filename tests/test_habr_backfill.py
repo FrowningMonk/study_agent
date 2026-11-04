@@ -6,6 +6,7 @@ Habr is faked at `habr_api.fetch_article`; the pause between articles goes throu
 the patched `habr_backfill._sleep`, so the tests never wait and never hit the network.
 """
 
+import json
 import logging
 import sqlite3
 import threading
@@ -257,6 +258,46 @@ def test_failure_log_has_category_not_message_text(tmp_db, habr, sleeps, caplog)
     text = ' '.join(r.getMessage() for r in caplog.records)
     assert 'HabrUnavailable invalid_shape HTTP 200' in text
     assert 'SECRET-BODY-TEXT' not in text
+
+
+class _KekResponse:
+    def __init__(self, status, body):
+        self.status_code = status
+        self.headers = {}
+        self._body = json.dumps(body).encode('utf-8')
+
+    def iter_content(self, chunk_size=1):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+def test_drafted_article_marked_unavailable_and_backfill_continues(tmp_db, sleeps, monkeypatch, fixture_text):
+    """QA-1: kek 403 IN_DRAFTS (real habr_api parsing) marks the id unavailable and the run
+    goes on to the next id; the next start makes no request."""
+    article = json.loads(fixture_text('habr_article.json'))          # id 1102920
+    drafted, normal = 1102000, int(article['id'])
+    assert drafted < normal                                           # processed first
+    for habr_id in (drafted, normal):
+        _save(tmp_db, habr_id)
+    log = []
+
+    def kek(url, params=None, **kw):
+        log.append(url)
+        if f'/articles/{drafted}/' in url:
+            return _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'})
+        return _KekResponse(200, article)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+
+    stats = habr_backfill.run_once()
+
+    assert stats == {'candidates': 2, 'requests': 2, 'filled': 1, 'unavailable': 1, 'stopped_on_error': False}
+    assert habr_store.get_habr_article(drafted)['unavailable_at'] is not None
+    assert habr_store.get_habr_article(normal)['fetched_at'] is not None
+    log.clear()
+    assert habr_backfill.run_once()['requests'] == 0 and log == []
 
 
 def test_unexpected_exception_logged_thread_ends(tmp_db, habr, sleeps, caplog):

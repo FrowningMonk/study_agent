@@ -494,7 +494,12 @@ def test_partial_response_conditions_raise_unavailable(fake_habr, make_item, cas
      habr_api.HabrNotFound),
     (FakeResponse(404, '<html>Not Found</html>'), habr_api.HabrUnavailable),
     (FakeResponse(404, _error_envelope(404, 'SOMETHING_ELSE')), habr_api.HabrUnavailable),
+    # A drafted (hidden) article is permanently unavailable, like a 404 (QA-1)
+    (FakeResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'}), habr_api.HabrNotFound),
     (FakeResponse(403, _error_envelope(403, 'FORBIDDEN')), habr_api.HabrUnavailable),
+    (FakeResponse(403, '<html>Forbidden</html>'), habr_api.HabrUnavailable),
+    (FakeResponse(403, {'httpCode': 403, 'errorCode': ['IN_DRAFTS']}), habr_api.HabrUnavailable),
+    (FakeResponse(404, _error_envelope(404, 'IN_DRAFTS')), habr_api.HabrUnavailable),
     (FakeResponse(503, 'Service Unavailable'), habr_api.HabrUnavailable),
     (FakeResponse(200, 'not json'), habr_api.HabrUnavailable),
     (FakeResponse(200, '"a string"'), habr_api.HabrUnavailable),
@@ -511,6 +516,13 @@ def test_fetch_article_not_found(fake_habr, response, expected):
         assert not isinstance(excinfo.value, habr_api.HabrUnavailable)
     if isinstance(response, FakeResponse) and response.status_code != 200:
         assert excinfo.value.status == response.status_code
+
+
+def test_fetch_article_in_drafts_is_not_found_with_status(fake_habr):
+    fake_habr(FakeResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'}))
+    with pytest.raises(habr_api.HabrNotFound) as excinfo:
+        habr_api.fetch_article(1103492)
+    assert excinfo.value.error_code == 'IN_DRAFTS' and excinfo.value.status == 403
 
 
 def test_fetch_article_normalizes_fixture(fake_habr, article_fixture):

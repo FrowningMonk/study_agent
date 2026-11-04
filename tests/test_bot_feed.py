@@ -7,6 +7,7 @@ fetchers (the autouse guard blocks real HTTP); `process_article` and
 worker synchronously, or captures it so waiters can join before it runs.
 """
 
+import json
 import logging
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -27,6 +28,7 @@ OTHER = 4000                     # a second approved non-owner user
 HABR_ID = 123
 CANONICAL = habr_api.canonical_url(HABR_ID)
 TODAY = date(2026, 11, 4)
+_REAL_FETCH_ARTICLE = habr_api.fetch_article     # saved before the `habr` fixture patches it
 RLO, RLM = chr(0x202E), chr(0x200F)          # bidi override / right-to-left mark
 
 
@@ -772,6 +774,41 @@ def test_summary_button_unavailable_404(tg, habr, llm, tmp_db, sync_spawn):
     _press(FRIEND, f'hl:s:{list_id}:1')
 
     assert _texts(tg, FRIEND) == ['Статья недоступна на Хабре — возможно, её удалили или скрыли']
+    assert habr_store.get_habr_article(HABR_ID)['unavailable_at'] is not None
+    assert llm.calls == [] and llm.model_checks == []
+    assert len(feed.REGISTRY) == 0
+
+
+class _KekResponse:
+    def __init__(self, status, body):
+        self.status_code = status
+        self.headers = {}
+        self._body = json.dumps(body).encode('utf-8')
+
+    def iter_content(self, chunk_size=1):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+def test_summary_button_drafted_article_shows_gone_without_scrape(tg, habr, llm, tmp_db, sync_spawn, monkeypatch):
+    """QA-2, through dispatch and the real habr_api: kek 403 IN_DRAFTS -> the standard
+    'article gone' text, unavailable_at set, no page scrape / LLM."""
+    monkeypatch.setattr(habr_api, 'fetch_article', _REAL_FETCH_ARTICLE)
+    kek_urls = []
+
+    def kek(url, params=None, **kw):
+        kek_urls.append(url)
+        return _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'})
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_HABR_ARTICLE_GONE]
+    assert kek_urls == [f'https://habr.com/kek/v2/articles/{HABR_ID}/']
     assert habr_store.get_habr_article(HABR_ID)['unavailable_at'] is not None
     assert llm.calls == [] and llm.model_checks == []
     assert len(feed.REGISTRY) == 0

@@ -7,6 +7,7 @@ Bot tests run through real telebot dispatch (`tg`); `process_article` and
 autouse guard in conftest.
 """
 
+import json
 import logging
 import sqlite3
 import time
@@ -23,6 +24,7 @@ from conftest import FRIEND, _buttons, _callback_update, _message_update, _sent_
 
 OWNER = bot_module.OWNER_ID
 CANONICAL_123 = 'https://habr.com/ru/articles/123/'
+_REAL_FETCH_ARTICLE = habr_api.fetch_article     # saved before the autouse `kek` fixture patches it
 
 
 def _query(db, sql, params=()):
@@ -594,6 +596,36 @@ def test_is_article_linked_to_other_users_idea(tmp_db):
 
 
 # --- hubs/tags for linked articles (Task 14) -----------------------------------
+
+
+class _KekResponse:
+    def __init__(self, status, body):
+        self.status_code = status
+        self.headers = {}
+        self._body = json.dumps(body).encode('utf-8')
+
+    def iter_content(self, chunk_size=1):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+def test_link_flow_drafted_article_marked_unavailable(tg, tmp_db, fake, monkeypatch):
+    """QA-1 in the link flow: the summary is delivered as usual, then the hubs/tags fetch
+    gets 403 IN_DRAFTS (real habr_api) and marks the article unavailable, silently."""
+    monkeypatch.setattr(habr_api, 'fetch_article', _REAL_FETCH_ARTICLE)
+    monkeypatch.setattr(habr_api.requests, 'get',
+                        lambda url, **kw: _KekResponse(403, {'httpCode': 403, 'message': 'post drafted', 'data': {'author': {'id': '3172623', 'alias': 'sokolovps'}}, 'errorCode': 'IN_DRAFTS'}))
+    tmp_db.create_idea('Idea', None, FRIEND)
+
+    _send(FRIEND, 'https://habr.com/ru/articles/88/')
+
+    texts = [s[1][1] for s in _sent_to(tg, FRIEND)]
+    assert any('NEW SUMMARY' in t for t in texts)
+    assert bot_module.MSG_HABR_ARTICLE_GONE not in texts
+    assert habr_store.get_habr_article(88)['unavailable_at'] is not None
+    assert habr_store.needs_metadata_fetch(88) is False      # never requested again
 
 
 def test_link_flow_stores_hubs_tags_for_new_article(tg, tmp_db, fake, kek):

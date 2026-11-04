@@ -26,7 +26,10 @@ catalog has no per-hub type field and lists collective hubs only, so hub_type is
 'collective' unless the API states a type explicitly.
 
 Errors:
-    - HabrNotFound — 404 with errorCode NOT_FOUND / POST_TYPE_MISMATCH;
+    - HabrNotFound — the article is permanently unavailable: 404 with errorCode
+      NOT_FOUND / POST_TYPE_MISMATCH, or 403 IN_DRAFTS (hidden by the author into drafts;
+      live envelope 2026-11-05: {"httpCode":403,"message":"post drafted",...,
+      "errorCode":"IN_DRAFTS"}). Any other 403/404 stays HabrUnavailable;
     - HabrUnavailable — transient / partial / invalid response (`kind`, `status`
       attributes give a short failure category; never show raw bodies to users);
     - HabrBusy — the throttle lock was not acquired within `wait_timeout`.
@@ -95,6 +98,8 @@ HUBS_MAX_PAGES: int = 20            # ~5 pages live; a sanity bound against a ru
 _READ_CHUNK: int = 8 * 1024
 
 NOT_FOUND_CODES = frozenset({'NOT_FOUND', 'POST_TYPE_MISMATCH'})
+# (status, errorCode) pairs of fetch_article that mean "this article is not available"
+_GONE_BY_STATUS = {404: NOT_FOUND_CODES, 403: frozenset({'IN_DRAFTS'})}
 HUB_TYPES = frozenset({'collective', 'corporative'})
 
 _ALLOWED_HOSTS = frozenset({'habr.com', 'www.habr.com', 'm.habr.com'})
@@ -121,12 +126,13 @@ _monotonic = time.monotonic
 
 
 class HabrNotFound(Exception):
-    """The article does not exist / is not available (kek 404 NOT_FOUND, POST_TYPE_MISMATCH)."""
+    """The article does not exist / is not available: kek 404 NOT_FOUND, POST_TYPE_MISMATCH,
+    or 403 IN_DRAFTS (hidden by the author)."""
 
-    def __init__(self, error_code: str):
+    def __init__(self, error_code: str, status: int = 404):
         super().__init__(f'Habr article not found ({error_code})')
         self.error_code = error_code
-        self.status = 404
+        self.status = status
 
 
 class HabrUnavailable(Exception):
@@ -458,23 +464,33 @@ def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None,
     return items
 
 
+def _error_code(body: bytes) -> str | None:
+    """errorCode of a kek error envelope; None for a non-JSON body (e.g. an HTML 403/404 page)."""
+    try:
+        error = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    code = error.get('errorCode') if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def fetch_article(habr_id: int, *, wait_timeout: float | None = None,
                   deadline: float | None = None) -> dict:
     """One article by id as a normalized item.
 
-    Raises HabrNotFound on 404 NOT_FOUND / POST_TYPE_MISMATCH; HabrUnavailable on
-    everything else (5xx, timeout, non-JSON, invalid shape, other statuses).
+    Raises HabrNotFound on 404 NOT_FOUND / POST_TYPE_MISMATCH and 403 IN_DRAFTS;
+    HabrUnavailable on everything else (5xx, timeout, non-JSON, invalid shape, other
+    statuses and error codes).
     """
     habr_id = _check_id(habr_id)
     started = time.monotonic()
     try:
         status, body = _request(f'articles/{habr_id}/', {'fl': 'ru', 'hl': 'ru'}, wait_timeout, deadline)
-        if status == 404:
-            error = _decode_json(status, body)
-            code = error.get('errorCode') if isinstance(error, dict) else None
-            if code in NOT_FOUND_CODES:
-                logger.info('Habr article not found: id=%d, code=%s', habr_id, code)
-                raise HabrNotFound(code)
+        if status in _GONE_BY_STATUS:
+            code = _error_code(body)          # the body is already size-capped by _request
+            if code in _GONE_BY_STATUS[status]:
+                logger.info('Habr article not found: id=%d, status=%d, code=%s', habr_id, status, code)
+                raise HabrNotFound(code, status)
             raise HabrUnavailable('http', status)
         if status != 200:
             raise HabrUnavailable('http', status)

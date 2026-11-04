@@ -2166,7 +2166,7 @@ def _deliver_to_all(clicker_chat: int | None, waiters, outcome: SummaryOutcome) 
 
 def _summarize_habr_click(chat_id: int, user_id: int, habr_id: int, source: str) -> SummaryOutcome:
     """
-    kek pre-check (Decision 13, before the cache): 404 -> "article gone" and marked
+    kek pre-check (Decision 13, before the cache): 404 or 403 IN_DRAFTS -> "article gone" and marked
     unavailable; Habr unavailable -> the normal scrape/cache path. A successful result
     refreshes the stored metadata with hubs/tags (no second request). Background mode
     (wait_timeout=None): the callback has already been answered.
