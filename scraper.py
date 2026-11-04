@@ -240,35 +240,33 @@ def _extract_habr_content(soup: BeautifulSoup) -> str:
     return _truncate_content(content)
 
 
-_HABR_ARTICLE_ID_RE = re.compile(r'/(?:articles|news|post)/(\d+)')
-HABR_COMMENTS_API: str = 'https://habr.com/kek/v2/articles/{article_id}/comments/?fl=ru&hl=ru'
-
-
 def _fetch_habr_comments(url: str) -> list[dict]:
     """
     Загружает комментарии статьи через JSON API Хабра (тот же, что использует сайт).
+    Запрос идёт через habr_api.fetch_comments: общий троттлинг, без редиректов,
+    лимит размера ответа. Ожидание ограничено handler-дедлайном: скрапер вызывается
+    и из обработчиков, а комментарии необязательны.
 
     Returns:
         Комментарии в порядке дерева обсуждения (формат — см. _make_comment).
         Пустой список, если комментариев нет или API недоступен.
     """
-    match = _HABR_ARTICLE_ID_RE.search(url)
-    if not match:
+    # Lazy import: habr_api imports USER_AGENT from this module
+    import habr_api
+
+    habr_id = habr_api.parse_article_id(url)
+    if habr_id is None:
         return []
 
     try:
-        response = requests.get(
-            HABR_COMMENTS_API.format(article_id=match.group(1)),
-            headers={'User-Agent': USER_AGENT},
-            timeout=TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        logger.warning('Habr comments fetch failed: url=%s, error=%s', url, e)
+        raw = habr_api.fetch_comments(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                      deadline=habr_api.handler_deadline())
+    except (habr_api.HabrUnavailable, habr_api.HabrBusy) as e:
+        # Category only: the message text is never logged
+        logger.warning('Habr comments fetch failed: id=%s, %s %s', habr_id, type(e).__name__,
+                       getattr(e, 'kind', ''))
         return []
 
-    raw = data.get('comments') or {}
     roots = [cid for cid, c in raw.items() if not c.get('parentId')]
 
     # Обход дерева в глубину: порядок как на странице

@@ -839,6 +839,65 @@ def test_handler_wait_timeout_constant(fake_habr, monkeypatch, article_fixture):
 
 
 # =============================================================================
+# Comments (audit CA-2: scraper comments go through the same request policy)
+# =============================================================================
+
+
+def test_fetch_comments_through_request_policy(fake_habr, fixture_text):
+    body = json.loads(fixture_text('habr_comments.json'))
+    fake = fake_habr(lambda url, params: FakeResponse(200, body))
+
+    comments = habr_api.fetch_comments(846432)
+
+    assert comments == body['comments']
+    entry, = fake.log
+    assert entry['url'] == 'https://habr.com/kek/v2/articles/846432/comments/'
+    assert entry['params'] == {'fl': 'ru', 'hl': 'ru'}
+    assert entry['allow_redirects'] is False and entry['stream'] is True
+    assert entry['headers']['User-Agent'] == scraper.USER_AGENT
+    assert habr_api._last_request_at is not None        # throttle state updated
+
+
+@pytest.mark.parametrize('body', [{}, {'comments': None}, {'comments': []}])
+def test_fetch_comments_empty_variants(fake_habr, body):
+    fake_habr(FakeResponse(200, body))
+    assert habr_api.fetch_comments(1) == {}
+
+
+@pytest.mark.parametrize('response, kind', [
+    (FakeResponse(301, '', {'Location': 'http://169.254.169.254/'}), 'redirect'),
+    (FakeResponse(200, b'x' * 10, {'Content-Length': str(2 * 1024 * 1024 + 1)}), 'too_large'),
+    (FakeResponse(404, {'errorCode': 'NOT_FOUND'}), 'http'),
+    (FakeResponse(503, ''), 'http'),
+    (FakeResponse(200, 'not json'), 'invalid_json'),
+    (FakeResponse(200, {'comments': 'bad'}), 'invalid_shape'),
+])
+def test_fetch_comments_failures_raise_unavailable(fake_habr, response, kind):
+    fake = fake_habr(response)
+    with pytest.raises(habr_api.HabrUnavailable) as excinfo:
+        habr_api.fetch_comments(1)
+    assert excinfo.value.kind == kind
+    assert len(fake.log) == 1
+
+
+def test_fetch_comments_rejects_bad_id(fake_habr):
+    fake = fake_habr(FakeResponse(200, {}))
+    for bad in (0, -1, '1', True):
+        with pytest.raises((TypeError, ValueError)):
+            habr_api.fetch_comments(bad)
+    assert fake.log == []
+
+
+def test_fetch_comments_waits_on_shared_throttle(fake_habr, monkeypatch):
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0.2)
+    fake_habr(FakeResponse(200, {'comments': {}}))
+    habr_api.fetch_comments(1)
+    started = time.monotonic()
+    habr_api.fetch_comments(1)
+    assert time.monotonic() - started >= 0.15
+
+
+# =============================================================================
 # Handler deadline (one end-to-end budget per handler operation)
 # =============================================================================
 

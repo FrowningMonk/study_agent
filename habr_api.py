@@ -5,7 +5,8 @@ The single source of Habr data and Habr article identity for the bot:
     - parse_article_id(url) / canonical_url(habr_id) — strict URL <-> id mapping;
     - fetch_articles_since(since) — site-wide "Новые" list down to a time boundary;
     - fetch_article(habr_id) — one article by id;
-    - fetch_hub_catalog() — the whole hub catalog.
+    - fetch_hub_catalog() — the whole hub catalog;
+    - fetch_comments(habr_id) — the raw comment tree of one article (used by scraper).
 
 Normalized article item (list and by-id share the shape):
     {habr_id: int, title: str, url: str, published_at: datetime (aware, UTC),
@@ -71,7 +72,7 @@ __all__ = [
     'HabrNotFound', 'HabrUnavailable', 'HabrBusy',
     'parse_article_id', 'canonical_url',
     'fetch_articles_since', 'fetch_article', 'fetch_hub_catalog',
-    'handler_deadline', 'wait_budget',
+    'fetch_comments', 'handler_deadline', 'wait_budget',
     'HABR_API_TIMEOUT', 'MIN_REQUEST_INTERVAL', 'HANDLER_WAIT_TIMEOUT', 'HANDLER_DEADLINE',
     'MAX_RESPONSE_BYTES',
 ]
@@ -470,6 +471,28 @@ def fetch_article(habr_id: int, *, wait_timeout: float | None = None,
         raise
     logger.info('Habr article fetched: id=%d, duration=%.1fs', habr_id, time.monotonic() - started)
     return item
+
+
+def fetch_comments(habr_id: int, *, wait_timeout: float | None = None,
+                   deadline: float | None = None) -> dict:
+    """Raw comment tree of one article: the kek `comments` object ({id: comment}), {} if none.
+
+    Goes through the same request policy as every other kek call (throttle, no
+    redirects, size cap). The tree walk and formatting stay in scraper. Raises
+    HabrUnavailable on any non-200, invalid JSON or a non-object `comments`; HabrBusy
+    on a lock/deadline timeout.
+    """
+    habr_id = _check_id(habr_id)
+    try:
+        data = _get_json_object(f'articles/{habr_id}/comments/', {'fl': 'ru', 'hl': 'ru'},
+                                wait_timeout, deadline)
+        comments = data.get('comments') or {}
+        if not isinstance(comments, dict):
+            raise _invalid('comments is not an object')
+    except HabrUnavailable as e:
+        logger.warning('Habr comments fetch failed: id=%d, %s', habr_id, e)
+        raise
+    return comments
 
 
 def _normalize_hub(alias: str, ref: Any) -> dict:
