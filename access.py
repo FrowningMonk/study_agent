@@ -25,6 +25,7 @@ __all__ = [
     'parse_decision_callback',
     'decision_callback',
     'gate',
+    'is_allowed',
     'request_access',
     'decide',
     'describe_user',
@@ -92,6 +93,19 @@ def parse_decision_callback(data: str) -> tuple[bool, int] | None:
     return match.group(1) == 'approve', int(match.group(2))
 
 
+def is_allowed(user_id: int, owner_id: int) -> bool:
+    """
+    Единственное правило доступа: владелец или пользователь со статусом approved.
+
+    Используют gate (до диспетчеризации), bot.is_allowed и рассылка дайджеста
+    (снимок получателей и повторная проверка перед отправкой).
+    """
+    if user_id == owner_id:
+        return True
+    record = database.get_user(user_id)
+    return record is not None and record.get('status') == 'approved'
+
+
 def gate(user_id: int | None, chat_type: str | None, callback_data: str | None, owner_id: int) -> Gate:
     """
     Единая проверка доступа для любого апдейта.
@@ -107,13 +121,11 @@ def gate(user_id: int | None, chat_type: str | None, callback_data: str | None, 
     """
     if user_id is None or chat_type != 'private':
         return Gate.IGNORE
-    if user_id == owner_id:
+    if is_allowed(user_id, owner_id):
         return Gate.PASS
 
     record = database.get_user(user_id)
     status = record['status'] if record else None
-    if status == 'approved':
-        return Gate.PASS
     if status == 'rejected':
         return Gate.IGNORE
 

@@ -510,11 +510,11 @@ def _send_parts(send: Send, chat_id: int, parts: list) -> str:
 # =============================================================================
 
 
-def _recipients(owner_id: int) -> list[int]:
-    """Owner + approved users, minus digest disabled (missing setting = enabled)."""
-    ids = [owner_id] + [u['user_id'] for u in database.list_users()
-                        if u.get('status') == 'approved' and u['user_id'] != owner_id]
-    return [uid for uid in ids if habr_store.get_digest_enabled(uid)]
+def _recipients(owner_id: int, is_allowed) -> list[int]:
+    """Owner + every known user that passes the injected access rule (`is_allowed`, the same
+    check re-run at send time), minus digest disabled (missing setting = enabled)."""
+    ids = [owner_id] + [u['user_id'] for u in database.list_users() if u['user_id'] != owner_id]
+    return [uid for uid in ids if _can_receive(uid, is_allowed)]
 
 
 def _can_receive(user_id: int, is_allowed) -> bool:
@@ -640,7 +640,7 @@ def tick(now: datetime, *, send: Send, owner_id: int, is_allowed, describe=_USE_
             return                                   # started too late: no run, no instant skip
         # Snapshot first (INSERT OR IGNORE keeps an owner row already 'sent' by /digest_now
         # final), then the run row: a crash in between only re-snapshots on the next tick
-        recipients = _recipients(owner_id)
+        recipients = _recipients(owner_id, is_allowed)
         habr_store.snapshot_recipients(run_id, recipients)
         habr_store.create_run(run_id)
         logger.info('Digest run created: %s, recipients=%d', run_id, len(recipients))

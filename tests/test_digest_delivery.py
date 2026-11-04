@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from telebot.apihelper import ApiTelegramException
 
+import access
 import database
 import digest
 import feed
@@ -186,8 +187,7 @@ def approve(uid):
 
 
 def allowed(uid):
-    user = database.get_user(uid)
-    return uid == OWNER or (user is not None and user['status'] == 'approved')
+    return access.is_allowed(uid, OWNER)        # the production rule (bot.is_allowed delegates)
 
 
 def tick(now, send, describe=None):
@@ -285,6 +285,31 @@ def test_tick_at_digest_time_creates_run_and_snapshots_recipients(tmp_db, habr, 
     run = habr_store.get_run(TODAY.isoformat())
     assert run['status'] == 'pending'
     assert statuses() == {OWNER: 'pending', USER: 'pending'}
+
+
+def test_recipients_follow_the_injected_access_rule(tmp_db):
+    """The snapshot uses the same is_allowed as the send-time re-check (CA-3), not its own copy."""
+    approve(USER)
+    approve(OTHER)
+    database.create_access_request(601, 'p', 'P')       # pending
+    assert digest._recipients(OWNER, allowed) == [OWNER, USER, OTHER]
+    # A different rule changes the snapshot: nothing in digest re-implements the status check
+    assert digest._recipients(OWNER, lambda uid: uid in (OWNER, 601)) == [OWNER, 601]
+    habr_store.set_digest_enabled(OTHER, False)
+    assert digest._recipients(OWNER, allowed) == [OWNER, USER]
+
+
+def test_recipients_match_access_rule_for_every_status(tmp_db):
+    """Ties digest recipients to access.is_allowed / gate for each user status."""
+    ids = {'approved': 701, 'pending': 702, 'rejected': 703}
+    for status, uid in ids.items():
+        database.create_access_request(uid, f'u{uid}', 'U')
+        if status != 'pending':
+            database.set_user_status(uid, status)
+    recipients = set(digest._recipients(OWNER, allowed))
+    for uid in [OWNER, *ids.values()]:
+        passes_gate = access.gate(uid, 'private', None, OWNER) == access.Gate.PASS
+        assert (uid in recipients) is access.is_allowed(uid, OWNER) is passes_gate, uid
 
 
 def test_failed_attempt_schedules_retry_in_15_minutes(tmp_db, habr, send, sleeps):

@@ -16,6 +16,7 @@ import pytest
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
+import access
 import bot as bot_module
 import digest
 import feed
@@ -460,7 +461,7 @@ def test_digest_now_after_revoked_user_settings_inert(tg, tmp_db, habr, sync_spa
 
     assert _settings(tmp_db, FRIEND) == (0, None)
     assert bot_module.is_allowed(FRIEND) is False
-    assert FRIEND not in digest._recipients(OWNER)
+    assert FRIEND not in digest._recipients(OWNER, bot_module.is_allowed)
     assert _replies(tg, FRIEND) == []
     assert [d['user_id'] for d in habr_store.list_deliveries(now.date().isoformat())] == [OWNER]
 
@@ -698,3 +699,17 @@ def test_owner_menu_includes_digest_now(tg, monkeypatch):
     ((name, args, kwargs),) = [s for s in tg if s[0] == 'set_my_commands']
     assert 'digest_now' in [c.command for c in args[0]]
     assert isinstance(kwargs['scope'], types.BotCommandScopeChat)
+
+
+def test_bot_is_allowed_delegates_to_access_rule(tmp_db, monkeypatch):
+    """bot.is_allowed is a one-line delegate of access.is_allowed (audit CA-3)."""
+    calls = []
+
+    def rule(user_id, owner_id):
+        calls.append((user_id, owner_id))
+        return user_id == 42
+
+    monkeypatch.setattr(access, 'is_allowed', rule)
+    assert bot_module.is_allowed(42) is True
+    assert bot_module.is_allowed(OWNER) is False
+    assert calls == [(42, OWNER), (OWNER, OWNER)]

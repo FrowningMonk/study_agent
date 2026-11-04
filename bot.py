@@ -84,7 +84,6 @@ from database import (
     get_idea_md,
     update_idea_md,
     list_users,
-    get_user,
     count_articles,
     wipe_articles,
 )
@@ -2205,11 +2204,8 @@ MSG_DIGEST_NOW_USAGE = 'Использование: /digest_now или /digest_n
 
 
 def is_allowed(user_id: int) -> bool:
-    """Digest recipient check: the owner, or a user whose access is approved now."""
-    if user_id == OWNER_ID:
-        return True
-    record = get_user(user_id)
-    return record is not None and record.get('status') == 'approved'
+    """Digest recipient check: the single access rule (owner or approved now)."""
+    return access.is_allowed(user_id, OWNER_ID)
 
 
 def digest_send(chat_id: int, text: str, rows: list | None) -> None:
