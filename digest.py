@@ -513,12 +513,18 @@ def _send_parts(send: Send, chat_id: int, parts: list) -> str:
 
 def _recipients(owner_id: int, is_allowed) -> list[int]:
     """Owner + every known user that passes the injected access rule (`is_allowed`, the same
-    check re-run at send time), minus digest disabled (missing setting = enabled)."""
+    check re-run at send time), minus digest disabled (missing setting = enabled).
+
+    Errors propagate on purpose: a DB error (e.g. 'database is locked') aborts the tick
+    before the snapshot and the run row exist, so the next tick retries instead of
+    silently leaving the user out of today's run.
+    """
     ids = [owner_id] + [u['user_id'] for u in database.list_users() if u['user_id'] != owner_id]
-    return [uid for uid in ids if _can_receive(uid, is_allowed)]
+    return [uid for uid in ids if is_allowed(uid) and habr_store.get_digest_enabled(uid)]
 
 
 def _can_receive(user_id: int, is_allowed) -> bool:
+    """Send-time re-check: a broken check never sends (fail closed)."""
     try:
         return bool(is_allowed(user_id)) and habr_store.get_digest_enabled(user_id)
     except Exception as e:  # noqa: BLE001 — a broken check never sends
@@ -561,12 +567,19 @@ def _deliver_one(run_id: str, user_id: int, articles: list[dict], day: date, des
         habr_store.set_delivery_status(run_id, user_id, 'failed')
         logger.info('Digest not delivered, access revoked or digest off: user_id=%s', user_id)
         return
-    # Claim first: a row that stopped being pending (e.g. /digest_now final) costs no
-    # build/LLM work. A build error after the claim is marked 'failed' by _attempt.
-    if not habr_store.claim_delivery(run_id, user_id):
-        return                                       # no longer pending: never sent twice
+    # Cheap pre-check: a row that stopped being pending (e.g. /digest_now final) costs
+    # no build/LLM work
+    if not habr_store.is_delivery_pending(run_id, user_id):
+        return
+    # The build (LLM calls, tens of seconds) runs while the row is still 'pending': a crash
+    # or restart here leaves it pending, so it is retried; a build error is marked 'failed'
+    # by _attempt
     with _BUILD_LOCK:
         parts = build_user_digest(user_id, articles, day, describe=describe)['parts']
+    # Atomic claim right before sending (pending -> sending): never sent twice
+    if not habr_store.claim_delivery(run_id, user_id):
+        logger.info('Digest delivery taken while building, not sent: user_id=%s', user_id)
+        return
     outcome = _send_parts(send, user_id, parts)
     if outcome == SEND_OK:
         habr_store.set_delivery_status(run_id, user_id, 'sent')

@@ -730,3 +730,15 @@ def test_functions_use_patched_db_path(tmp_db, tmp_path, monkeypatch):
     assert habr_store.get_viewed_ids(1) == {5}
     # Every connection habr_store opened went to the patched file, none to data/study_agent.db
     assert opened and set(opened) == {str(tmp_path / 'test.db')}
+
+
+def test_is_delivery_pending_reads_without_claiming(tmp_db):
+    habr_store.snapshot_recipients('2026-11-03', [1, 2])
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is True
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is True        # a read, not a claim
+    assert habr_store.claim_delivery('2026-11-03', 1) is True
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is False       # 'sending'
+    habr_store.set_delivery_status('2026-11-03', 2, 'sent')
+    assert habr_store.is_delivery_pending('2026-11-03', 2) is False
+    assert habr_store.is_delivery_pending('2026-11-03', 99) is False      # no row
+    assert habr_store.is_delivery_pending('2026-11-04', 1) is False

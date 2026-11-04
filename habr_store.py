@@ -738,6 +738,19 @@ def list_deliveries(run_id: str, status: str | None = None) -> list[dict]:
         conn.close()
 
 
+def is_delivery_pending(digest_date: str, user_id: int) -> bool:
+    """Cheap read: is the delivery row still 'pending'? (Not a claim: see claim_delivery.)"""
+    conn = database._get_connection()
+    try:
+        row = conn.execute(
+            'SELECT 1 FROM digest_deliveries WHERE digest_date = ? AND user_id = ? AND status = ?',
+            (digest_date, user_id, 'pending'),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def claim_delivery(digest_date: str, user_id: int) -> bool:
     """Atomic pending -> sending; True only for the single caller that won."""
     conn = database._get_connection()

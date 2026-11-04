@@ -299,6 +299,33 @@ def test_recipients_follow_the_injected_access_rule(tmp_db):
     assert digest._recipients(OWNER, allowed) == [OWNER, USER]
 
 
+@pytest.mark.parametrize('broken', ['is_allowed', 'digest_setting'])
+def test_snapshot_db_error_aborts_tick_and_is_retried(tmp_db, habr, send, sleeps, monkeypatch, broken):
+    """A DB error while building the recipient list never silently drops a user (CAR-3):
+    no run is created, and the next tick snapshots everybody."""
+    approve(USER)
+    fill_day(habr)
+    real_enabled = habr_store.get_digest_enabled
+
+    def locked(uid):
+        if uid == USER:
+            raise sqlite3.OperationalError('database is locked')
+        return allowed(uid) if broken == 'is_allowed' else real_enabled(uid)
+
+    if broken == 'is_allowed':
+        with pytest.raises(sqlite3.OperationalError):
+            digest.tick(at(18, 0), send=send, owner_id=OWNER, is_allowed=locked, describe=None)
+    else:
+        monkeypatch.setattr(habr_store, 'get_digest_enabled', locked)
+        with pytest.raises(sqlite3.OperationalError):
+            tick(at(18, 0), send)
+        monkeypatch.setattr(habr_store, 'get_digest_enabled', real_enabled)
+    assert habr_store.get_run(TODAY.isoformat()) is None and statuses() == {}
+
+    tick(at(18, 1), send)
+    assert statuses() == {OWNER: 'sent', USER: 'sent'}
+
+
 def test_recipients_match_access_rule_for_every_status(tmp_db):
     """Ties digest recipients to access.is_allowed / gate for each user status."""
     ids = {'approved': 701, 'pending': 702, 'rejected': 703}
@@ -649,36 +676,76 @@ def test_one_recipient_build_error_does_not_block_others(tmp_db, habr, send, sle
     assert any(str(USER) in r.getMessage() for r in caplog.records)
 
 
-def test_delivery_claimed_before_build(tmp_db, habr, send, sleeps, monkeypatch):
-    """A row that stops being pending (e.g. /digest_now final) costs no build/LLM work (CA-5)."""
+def test_no_build_for_delivery_no_longer_pending(tmp_db, habr, send, sleeps, monkeypatch):
+    """A row that stopped being pending (e.g. /digest_now final) costs no build/LLM work (CA-5)."""
     approve(USER)
     fill_day(habr)
     built = []
     real_build = digest.build_user_digest
-    real_claim = habr_store.claim_delivery
+    real_can_receive = digest._can_receive
 
     def build(user_id, *a, **kw):
-        built.append((user_id, habr_store.list_deliveries(TODAY.isoformat(), status='sending')))
+        built.append(user_id)
         return real_build(user_id, *a, **kw)
 
-    def claim(run_id, user_id):
-        if user_id == OWNER:          # /digest_now final won the race for the owner's row
-            habr_store.set_delivery_status(run_id, OWNER, 'sent')
-        return real_claim(run_id, user_id)
+    def can_receive(user_id, is_allowed):
+        if user_id == OWNER:          # /digest_now final took the owner's row after the listing
+            habr_store.set_delivery_status(TODAY.isoformat(), OWNER, 'sent')
+        return real_can_receive(user_id, is_allowed)
 
     monkeypatch.setattr(digest, 'build_user_digest', build)
-    monkeypatch.setattr(habr_store, 'claim_delivery', claim)
-    describe = Describe()
-    tick(at(18, 0), send, describe=describe)
+    monkeypatch.setattr(digest, '_can_receive', can_receive)
+    tick(at(18, 0), send, describe=Describe())
 
-    assert [user_id for user_id, _ in built] == [USER]            # owner: no build at all
-    assert [d['user_id'] for d in built[0][1]] == [USER]          # claimed before building
+    assert built == [USER]                                       # owner: no build at all
     assert send.to(OWNER) == [] and len(send.to(USER)) == 1
     assert statuses() == {OWNER: 'sent', USER: 'sent'}
 
 
-def test_build_error_after_claim_marks_failed(tmp_db, habr, send, sleeps, monkeypatch):
-    """The claim moved the row to 'sending'; a build failure must still end as 'failed'."""
+def test_crash_during_build_leaves_delivery_pending_and_retried(tmp_db, habr, send, sleeps, monkeypatch):
+    """The row is claimed only after the build: a crash/restart mid-build (CAR-2) never
+    leaves it 'sending' (= treated as sent), so the user still gets today's digest."""
+    fill_day(habr)
+    seen = []
+    real_build = digest.build_user_digest
+
+    def crashing_build(user_id, *a, **kw):
+        seen.append(statuses()[user_id])
+        raise KeyboardInterrupt                  # process dies mid-build (not an Exception)
+
+    monkeypatch.setattr(digest, 'build_user_digest', crashing_build)
+    with pytest.raises(KeyboardInterrupt):
+        tick(at(18, 0), send)
+    assert seen == ['pending']
+    assert statuses() == {OWNER: 'pending'} and send.attempts == []
+
+    monkeypatch.setattr(digest, 'build_user_digest', real_build)     # "restart"
+    tick(at(18, 1), send)
+    assert statuses() == {OWNER: 'sent'} and len(send.to(OWNER)) == 1
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
+
+
+def test_claim_lost_after_build_sends_nothing(tmp_db, habr, send, sleeps, monkeypatch, caplog):
+    """/digest_now final finishes while the scheduled build runs: the late claim fails and the
+    built digest is dropped, never sent twice."""
+    fill_day(habr)
+    real_build = digest.build_user_digest
+
+    def build(user_id, *a, **kw):
+        result = real_build(user_id, *a, **kw)
+        habr_store.set_delivery_status(TODAY.isoformat(), user_id, 'sent')
+        return result
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    with caplog.at_level(logging.INFO, logger='digest'):
+        tick(at(18, 0), send)
+    assert send.attempts == []
+    assert statuses() == {OWNER: 'sent'}
+    assert any('taken while building' in r.getMessage() for r in caplog.records)
+
+
+def test_build_error_marks_failed(tmp_db, habr, send, sleeps, monkeypatch):
+    """A build failure (row still pending) ends as 'failed', not stuck."""
     fill_day(habr)
     seen = []
 
@@ -688,7 +755,7 @@ def test_build_error_after_claim_marks_failed(tmp_db, habr, send, sleeps, monkey
 
     monkeypatch.setattr(digest, 'build_user_digest', build)
     tick(at(18, 0), send)
-    assert seen == ['sending']
+    assert seen == ['pending']
     assert statuses() == {OWNER: 'failed'}
     assert send.attempts == []
     assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
