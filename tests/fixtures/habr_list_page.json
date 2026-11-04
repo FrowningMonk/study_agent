@@ -1,0 +1,670 @@
+{
+ "pagesCount": 10,
+ "publicationIds": [
+  "1073184",
+  "1103386",
+  "1103352",
+  "1101618",
+  "1103242",
+  "1100664",
+  "1102920"
+ ],
+ "publicationRefs": {
+  "1073184": {
+   "id": "1073184",
+   "timePublished": "2026-11-04T05:30:37+00:00",
+   "isCorporative": false,
+   "lang": "ru",
+   "titleHtml": "Как доказать руководству, что VM работает: MTTR, лестница зрелости и проверка боем",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [],
+   "statistics": {
+    "commentsCount": 0,
+    "favoritesCount": 0,
+    "readingCount": 38,
+    "score": 0,
+    "votesCount": 0,
+    "votesCountPlus": 0,
+    "votesCountMinus": 0,
+    "reach": 346,
+    "readers": 23
+   },
+   "hubs": [
+    {
+     "id": "50",
+     "alias": "infosecurity",
+     "type": "collective",
+     "title": "Информационная безопасность",
+     "titleHtml": "Информационная безопасность",
+     "isProfiled": true
+    },
+    {
+     "id": "6398",
+     "alias": "it-infrastructure",
+     "type": "collective",
+     "title": "IT-инфраструктура",
+     "titleHtml": "IT-инфраструктура",
+     "isProfiled": true
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>Мы вложили в безопасность кучу денег. Стало лучше?\" Без метрик ответа нет. Разбираем главную метрику современного VM - MTTR, сравниваем себя с отраслью (спойлер: отрасль медленнее, чем вам кажется), поднимаемся по лестнице зрелости от хаоса до CTEM и заканчиваем единственной метрикой, которую невозможно накрутить.</p>",
+    "imageUrl": "https://habrastorage.org/r/w780/getpro/habr/upload_files/98d/695/821/98d6958214d2cd1cf9b0cfd130b4b9f7.jpg",
+    "buttonTextHtml": "Читать далее",
+    "image": {
+     "url": "https://habrastorage.org/r/w780/getpro/habr/upload_files/98d/695/821/98d6958214d2cd1cf9b0cfd130b4b9f7.jpg",
+     "fit": "cover",
+     "positionY": 0,
+     "positionX": 0
+    }
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": "tutorial",
+   "readingTime": 7,
+   "complexity": "medium",
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "10",
+    "title": "Информационная безопасность",
+    "alias": "information_security"
+   },
+   "tags": [
+    {
+     "titleHtml": "it"
+    },
+    {
+     "titleHtml": "метрики"
+    },
+    {
+     "titleHtml": "уязвимости"
+    },
+    {
+     "titleHtml": "иб"
+    },
+    {
+     "titleHtml": "patch"
+    },
+    {
+     "titleHtml": "фстэк"
+    },
+    {
+     "titleHtml": "процессы"
+    },
+    {
+     "titleHtml": "vm"
+    },
+    {
+     "titleHtml": "импортозамещение"
+    },
+    {
+     "titleHtml": "сканеры уязвимостей"
+    }
+   ]
+  },
+  "1103386": {
+   "id": "1103386",
+   "timePublished": "2026-11-04T03:31:24+00:00",
+   "isCorporative": false,
+   "lang": "ru",
+   "titleHtml": "ПЛК на микроконтроллере. Визуализация цепей в реальном времени ч.2",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [],
+   "statistics": {
+    "commentsCount": 2,
+    "favoritesCount": 2,
+    "readingCount": 157,
+    "score": 0,
+    "votesCount": 0,
+    "votesCountPlus": 0,
+    "votesCountMinus": 0,
+    "reach": 1893,
+    "readers": 119
+   },
+   "hubs": [
+    {
+     "id": "19737",
+     "alias": "controllers",
+     "type": "collective",
+     "title": "Программирование микроконтроллеров",
+     "titleHtml": "Программирование микроконтроллеров",
+     "isProfiled": true
+    },
+    {
+     "id": "18816",
+     "alias": "industrial_control_system",
+     "type": "collective",
+     "title": "Промышленное программирование",
+     "titleHtml": "Промышленное программирование",
+     "isProfiled": true
+    },
+    {
+     "id": "375",
+     "alias": "java",
+     "type": "collective",
+     "title": "Java",
+     "titleHtml": "Java",
+     "isProfiled": true
+    },
+    {
+     "id": "21976",
+     "alias": "DIY",
+     "type": "collective",
+     "title": "DIY или Сделай сам",
+     "titleHtml": "DIY или Сделай сам",
+     "isProfiled": false
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>В прошлой статье я рассказал о своем подходе к разработке среды программирования промышленного контроллера — а именно о части, касающейся визуализации данных из цепей лестничных диаграмм и функциональных блоков, которые выполняются на стороне микроконтроллера. В этот раз подробнее остановлюсь на цепочке событий.</p><p>Как я уже упоминал, вся модель среды ПЛК (которую я разрабатываю) содержится в XML-файле. Этот файл включает в себя список функциональных блоков:</p>",
+    "imageUrl": "https://habrastorage.org/extt/79/41/a3/7941a379c15f8051d97b497be4234199.gif",
+    "buttonTextHtml": "Читать далее",
+    "image": {
+     "url": "https://habrastorage.org/extt/79/41/a3/7941a379c15f8051d97b497be4234199.gif",
+     "fit": "cover",
+     "positionY": 0,
+     "positionX": 0
+    }
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": null,
+   "readingTime": 2,
+   "complexity": null,
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "42",
+    "title": "Железо и гаджеты",
+    "alias": "hardware_and_gadgets"
+   },
+   "tags": [
+    {
+     "titleHtml": "микроконтроллеры"
+    },
+    {
+     "titleHtml": "асу тп"
+    },
+    {
+     "titleHtml": "разработка электроники"
+    },
+    {
+     "titleHtml": "плк"
+    }
+   ]
+  },
+  "1103352": {
+   "id": "1103352",
+   "timePublished": "2026-11-03T20:03:03+00:00",
+   "isCorporative": false,
+   "lang": "ru",
+   "titleHtml": "Запуск ИТ‑проекта: от первой идеи до утверждения бюджета",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [
+    {
+     "type": "sandbox",
+     "typeOf": "system",
+     "title": "Из песочницы",
+     "data": {
+      "url": null
+     }
+    }
+   ],
+   "statistics": {
+    "commentsCount": 2,
+    "favoritesCount": 2,
+    "readingCount": 193,
+    "score": 0,
+    "votesCount": 0,
+    "votesCountPlus": 0,
+    "votesCountMinus": 0,
+    "reach": 4774,
+    "readers": 139
+   },
+   "hubs": [
+    {
+     "id": "20682",
+     "alias": "pm",
+     "type": "collective",
+     "title": "Управление проектами",
+     "titleHtml": "Управление проектами",
+     "isProfiled": true
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>Привет! Меня зовут Константин Замков, я главный менеджер в&nbsp;компании «СИБИНТЕК». Я занимаюсь управлением проектами и портфелями проектов и являюсь сертифицированным профессионалом (PMI PMP, PMI PfMP, PSM‑I). За&nbsp;годы работы с&nbsp;корпоративными ИТ‑инициативами я заметил, что&nbsp;успех проекта во&nbsp;многом определяется еще до&nbsp;того, как&nbsp;разработчик пишет первую строчку кода.</p><p>На&nbsp;старте проекта часто отсутствует практически все, что&nbsp;впоследствии кажется очевидным. Нет детальных требований и плана работ, нет оценки стоимости и утвержденного бюджета. Есть только идея или&nbsp;общая проблема, которую необходимо решить с&nbsp;помощью ИТ.</p><p>В&nbsp;этой статье я хочу поделиться своим опытом применения последовательного подхода к&nbsp;подготовке и запуску корпоративного ИТ‑проекта от&nbsp;первого обращения бизнеса до&nbsp;получения финансирования и перехода непосредственно к&nbsp;реализации.</p>",
+    "imageUrl": "https://habrastorage.org/r/w1560/extt/00/05/cd/0005cd08a1f6c65400cff6613626b123.png",
+    "buttonTextHtml": "Читать далее",
+    "image": {
+     "url": "https://habrastorage.org/r/w1560/extt/00/05/cd/0005cd08a1f6c65400cff6613626b123.png",
+     "fit": "cover",
+     "positionY": 0,
+     "positionX": 0
+    }
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": "tutorial",
+   "readingTime": 9,
+   "complexity": "low",
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "26",
+    "title": "Менеджмент",
+    "alias": "management"
+   },
+   "tags": [
+    {
+     "titleHtml": "коммуникации"
+    },
+    {
+     "titleHtml": "управление проектами"
+    },
+    {
+     "titleHtml": "бюджетирование"
+    },
+    {
+     "titleHtml": "планирование проектов"
+    },
+    {
+     "titleHtml": "запуск проекта"
+    }
+   ]
+  },
+  "1101618": {
+   "id": "1101618",
+   "timePublished": "2026-11-03T19:32:57+00:00",
+   "isCorporative": false,
+   "lang": "ru",
+   "titleHtml": "Подтверждения через Digital Credentials API",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [
+    {
+     "type": "translation",
+     "typeOf": "system",
+     "title": "Перевод",
+     "data": {
+      "originalAuthorName": "Natalia Markoborodova",
+      "originalUrl": "https://developer.chrome.com/blog/digital-credentials-api-issuance?hl=en"
+     }
+    }
+   ],
+   "statistics": {
+    "commentsCount": 0,
+    "favoritesCount": 2,
+    "readingCount": 125,
+    "score": 0,
+    "votesCount": 0,
+    "votesCountPlus": 0,
+    "votesCountMinus": 0,
+    "reach": 4939,
+    "readers": 91
+   },
+   "hubs": [
+    {
+     "id": "357",
+     "alias": "javascript",
+     "type": "collective",
+     "title": "JavaScript",
+     "titleHtml": "JavaScript",
+     "isProfiled": true
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>В Chrome 155 выпуск цифровых документов через Digital Credentials API включён по умолчанию. Разбираем сценарии работы с кошельками, пример интеграции и изменения после origin trial.</p>",
+    "imageUrl": null,
+    "buttonTextHtml": "Читать далее",
+    "image": null
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": "review",
+   "readingTime": 9,
+   "complexity": "medium",
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "4",
+    "title": "Фронтенд",
+    "alias": "frontend"
+   },
+   "tags": [
+    {
+     "titleHtml": "javascript"
+    },
+    {
+     "titleHtml": "chrome"
+    },
+    {
+     "titleHtml": "digital credentials api"
+    },
+    {
+     "titleHtml": "цифровая идентификация"
+    },
+    {
+     "titleHtml": "openid4vci"
+    }
+   ]
+  },
+  "1103242": {
+   "id": "1103242",
+   "timePublished": "2026-11-03T14:09:15+00:00",
+   "isCorporative": true,
+   "lang": "ru",
+   "titleHtml": "1С через OData: от первого запроса до корпоративной интеграции – гайд для архитекторов и разработчиков",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [],
+   "statistics": {
+    "commentsCount": 0,
+    "favoritesCount": 7,
+    "readingCount": 194,
+    "score": 0,
+    "votesCount": 0,
+    "votesCountPlus": 0,
+    "votesCountMinus": 0,
+    "reach": 4939,
+    "readers": 151
+   },
+   "hubs": [
+    {
+     "id": "23810",
+     "alias": "diasoft_company",
+     "type": "corporative",
+     "title": "Блог компании Диасофт",
+     "titleHtml": "Блог компании Диасофт",
+     "isProfiled": false
+    },
+    {
+     "id": "4",
+     "alias": "hi",
+     "type": "collective",
+     "title": "Высоконагруженные системы",
+     "titleHtml": "Высоконагруженные системы",
+     "isProfiled": true
+    },
+    {
+     "id": "22624",
+     "alias": "1C",
+     "type": "collective",
+     "title": "1С",
+     "titleHtml": "1С",
+     "isProfiled": true
+    },
+    {
+     "id": "397",
+     "alias": "analysis_design",
+     "type": "collective",
+     "title": "Анализ и проектирование систем",
+     "titleHtml": "Анализ и проектирование систем",
+     "isProfiled": true
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>В крупной компании учетная система обменивается данными с CRM-, ERP-, ECM- и BPM-системами, интернет-магазином, мобильными приложениями, BI и внешними сервисами. Быстро связать ее с этим ландшафтом без доработки конфигурации можно через OData. </p><p>В этой статье разберем подключение 1С через OData: публикацию, первые обращения, параметры выборки, запись, нагрузку, синхронизацию, ошибки и защиту. Текст пригодится архитекторам, аналитикам и разработчикам интеграций.</p><p>Отдельно покажем, когда прямых вызовов уже не хватает. В этот момент появляется <a href=\"https://q.diasoft.ru/products/tekhnologicheskie-platformy/digital-q-integration/?utm_source=habr\">корпоративная интеграционная платформа</a>: она принимает протокол как один из каналов и централизованно управляет маршрутизацией, преобразованием сообщений, мониторингом и контролем обмена.   </p>",
+    "imageUrl": null,
+    "buttonTextHtml": "Читать далее",
+    "image": null
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": null,
+   "readingTime": 19,
+   "complexity": null,
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "2",
+    "title": "Бэкенд",
+    "alias": "backend"
+   },
+   "tags": [
+    {
+     "titleHtml": "интеграция"
+    },
+    {
+     "titleHtml": "odata"
+    },
+    {
+     "titleHtml": "обмен данными"
+    },
+    {
+     "titleHtml": "интеграция с 1с"
+    },
+    {
+     "titleHtml": "коннектор"
+    },
+    {
+     "titleHtml": "шины данных"
+    },
+    {
+     "titleHtml": "digital q"
+    },
+    {
+     "titleHtml": "digital q.integration"
+    }
+   ]
+  },
+  "1100664": {
+   "id": "1100664",
+   "timePublished": "2026-11-03T10:02:26+00:00",
+   "isCorporative": true,
+   "lang": "ru",
+   "titleHtml": "«Финансовый защитник»: как новый сервис ПСБ помогает оберегать близких от мошенников",
+   "editorVersion": "2.0",
+   "postType": "megaproject",
+   "publicationType": "megaproject",
+   "postLabels": [],
+   "statistics": {
+    "commentsCount": 4,
+    "favoritesCount": 0,
+    "readingCount": 717,
+    "score": 15,
+    "votesCount": 10,
+    "votesCountPlus": 8,
+    "votesCountMinus": 2,
+    "reach": 6936,
+    "readers": 460
+   },
+   "hubs": [
+    {
+     "id": "21292",
+     "alias": "psb",
+     "type": "corporative",
+     "title": "Блог компании ПСБ",
+     "titleHtml": "Блог компании ПСБ",
+     "isProfiled": false
+    },
+    {
+     "id": "50",
+     "alias": "infosecurity",
+     "type": "collective",
+     "title": "Информационная безопасность",
+     "titleHtml": "Информационная безопасность",
+     "isProfiled": true
+    },
+    {
+     "id": "21928",
+     "alias": "finance",
+     "type": "collective",
+     "title": "Финансы в IT",
+     "titleHtml": "Финансы в IT",
+     "isProfiled": false
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>В&nbsp;современном мире от&nbsp;махинаций с&nbsp;денежными переводами чаще всего страдают подростки и пожилые люди, но&nbsp;в&nbsp;подобной ситуации может оказаться любой, даже самый уверенный в&nbsp;своей рациональности человек.</p><p>Чтобы уберечь деньги от&nbsp;мошенников, нужна поддержка. Поэтому команда проекта СБП в&nbsp;банке ПСБ создала сервис «Финансовый защитник»: он разработан в&nbsp;соответствии с&nbsp;требованиями ЦБ по&nbsp;противодействию мошенничеству. А&nbsp;чтобы «Защитник» работал, необходим настоящий герой&nbsp;— друг или&nbsp;родственник, которому клиент доверяет. Эта история о&nbsp;том, как&nbsp;стать таким героем для&nbsp;близких.</p>",
+    "imageUrl": "https://habrastorage.org/r/w780/extt/c6/3a/7e/c63a7e4b07ed2a57cf8576bfacb70769.jpg",
+    "buttonTextHtml": "Узнать больше",
+    "image": {
+     "url": "https://habrastorage.org/r/w780/extt/c6/3a/7e/c63a7e4b07ed2a57cf8576bfacb70769.jpg",
+     "fit": "cover",
+     "positionY": 0,
+     "positionX": 0
+    }
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": "review",
+   "readingTime": 4,
+   "complexity": null,
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "10",
+    "title": "Информационная безопасность",
+    "alias": "information_security"
+   },
+   "tags": [
+    {
+     "titleHtml": "банки"
+    },
+    {
+     "titleHtml": "информационная безопасность"
+    },
+    {
+     "titleHtml": "денежные переводы"
+    },
+    {
+     "titleHtml": "защита данных"
+    },
+    {
+     "titleHtml": "защита данных пользователей"
+    }
+   ]
+  },
+  "1102920": {
+   "id": "1102920",
+   "timePublished": "2026-11-03T08:06:04+00:00",
+   "isCorporative": true,
+   "lang": "ru",
+   "titleHtml": "GLOBIT TMS&amp;YMS: Как мы решили проблему с «зоопарком» систем на складе крупного ретейлера «Глобус»",
+   "editorVersion": "2.0",
+   "postType": "article",
+   "publicationType": "article",
+   "postLabels": [],
+   "statistics": {
+    "commentsCount": 0,
+    "favoritesCount": 6,
+    "readingCount": 372,
+    "score": 10,
+    "votesCount": 8,
+    "votesCountPlus": 8,
+    "votesCountMinus": 0,
+    "reach": 6064,
+    "readers": 235
+   },
+   "hubs": [
+    {
+     "id": "23940",
+     "alias": "globit",
+     "type": "corporative",
+     "title": "Блог компании ГЛОБИТ",
+     "titleHtml": "Блог компании ГЛОБИТ",
+     "isProfiled": false
+    },
+    {
+     "id": "22004",
+     "alias": "transport",
+     "type": "collective",
+     "title": "Транспорт",
+     "titleHtml": "Транспорт",
+     "isProfiled": false
+    },
+    {
+     "id": "397",
+     "alias": "analysis_design",
+     "type": "collective",
+     "title": "Анализ и проектирование систем",
+     "titleHtml": "Анализ и проектирование систем",
+     "isProfiled": true
+    }
+   ],
+   "flows": null,
+   "leadData": {
+    "textHtml": "<p>Всем привет! Хотим поделиться опытом реализации логистического решения для крупного ретейлера.</p><p>Статья будет полезна тем, кто ищет решение для управления транспортной логистикой (<abbr class=\"habraabbr\" title=\"Transport Management System\" data-title=\"&lt;p&gt;Transport Management System&lt;/p&gt;&lt;p&gt;&lt;/p&gt;\" data-abbr=\"TMS\">TMS</abbr>) и грузовым двором (<abbr class=\"habraabbr\" title=\"Yard Management System\" data-title=\"&lt;p&gt;Yard Management System&lt;/p&gt;&lt;p&gt;&lt;/p&gt;\" data-abbr=\"YMS\">YMS</abbr>) в одной системе.</p>",
+    "imageUrl": "https://habrastorage.org/r/w780/extt/29/44/dd/2944dd2f4fa657f252346f777b1ce631.jpg",
+    "buttonTextHtml": "Читать далее",
+    "image": {
+     "url": "https://habrastorage.org/r/w780/extt/29/44/dd/2944dd2f4fa657f252346f777b1ce631.jpg",
+     "fit": "cover",
+     "positionY": 0,
+     "positionX": 0
+    }
+   },
+   "status": "published",
+   "plannedPublishTime": null,
+   "isSeo": false,
+   "mode": "standard",
+   "checked": null,
+   "moderation": null,
+   "format": "case",
+   "readingTime": 4,
+   "complexity": "low",
+   "isInBlacklist": null,
+   "flowNew": {
+    "id": "26",
+    "title": "Менеджмент",
+    "alias": "management"
+   },
+   "tags": [
+    {
+     "titleHtml": "1с"
+    },
+    {
+     "titleHtml": "логистика"
+    },
+    {
+     "titleHtml": "tms"
+    },
+    {
+     "titleHtml": "автоматизация склада"
+    },
+    {
+     "titleHtml": "интеграция систем"
+    },
+    {
+     "titleHtml": "yms"
+    },
+    {
+     "titleHtml": "управление двором"
+    }
+   ]
+  }
+ }
+}

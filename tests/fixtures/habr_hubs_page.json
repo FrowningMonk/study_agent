@@ -1,0 +1,139 @@
+{
+ "pagesCount": 5,
+ "hubIds": [
+  "artificial_intelligence",
+  "infosecurity",
+  "popular_science",
+  "DIY",
+  "1C",
+  "tensorflow"
+ ],
+ "hubRefs": {
+  "artificial_intelligence": {
+   "id": "21922",
+   "alias": "artificial_intelligence",
+   "titleHtml": "Искусственный интеллект",
+   "imageUrl": "//habrastorage.org/getpro/habr/hub/f01/3a4/009/f013a40094ae05299b2b05ef05e7f981.png",
+   "descriptionHtml": "AI, ANN и иные формы искусственного разума",
+   "statistics": {
+    "subscribersCount": 136966,
+    "rating": 2253.2,
+    "authorsCount": 798,
+    "postsCount": 30834,
+    "reach": "1024K+"
+   },
+   "commonTags": [
+    "llm",
+    "искусственный интеллект",
+    "ии-агенты"
+   ],
+   "isProfiled": false,
+   "isOfftop": false
+  },
+  "infosecurity": {
+   "id": "50",
+   "alias": "infosecurity",
+   "titleHtml": "Информационная безопасность",
+   "imageUrl": "//habrastorage.org/getpro/habr/hub/135/2db/187/1352db18765addaa6e0b2ac013d386d8.png",
+   "descriptionHtml": "Защита данных",
+   "statistics": {
+    "subscribersCount": 621304,
+    "rating": 1229.66,
+    "authorsCount": 0,
+    "postsCount": 31013,
+    "reach": "1024K+"
+   },
+   "commonTags": [
+    "информационная безопасность",
+    "ии-агенты",
+    "иб"
+   ],
+   "isProfiled": true,
+   "isOfftop": false
+  },
+  "popular_science": {
+   "id": "21910",
+   "alias": "popular_science",
+   "titleHtml": "Научно-популярное",
+   "imageUrl": "//habrastorage.org/getpro/geektimes/hub/02f/206/0b9/02f2060b99e6f4d9403eee0420d7d5b8.png",
+   "descriptionHtml": "IT в науке и наука в IT",
+   "statistics": {
+    "subscribersCount": 212698,
+    "rating": 1088.7,
+    "authorsCount": 205,
+    "postsCount": 24418,
+    "reach": "512K+"
+   },
+   "commonTags": [
+    "нейросети",
+    "llm",
+    "спросите итана"
+   ],
+   "isProfiled": false,
+   "isOfftop": false
+  },
+  "DIY": {
+   "id": "21976",
+   "alias": "DIY",
+   "titleHtml": "DIY или Сделай сам",
+   "imageUrl": "//habrastorage.org/getpro/geektimes/hub/0ac/9b4/828/0ac9b48281cd7ba7401b4a4f5d9cd8d8.png",
+   "descriptionHtml": "Для тех, у кого руки растут из нужного места",
+   "statistics": {
+    "subscribersCount": 432460,
+    "rating": 567.56,
+    "authorsCount": 116,
+    "postsCount": 8752,
+    "reach": "256K+"
+   },
+   "commonTags": [
+    "ruvds_статьи",
+    "stm32",
+    "реверс-инжиниринг"
+   ],
+   "isProfiled": false,
+   "isOfftop": false
+  },
+  "1C": {
+   "id": "22624",
+   "alias": "1C",
+   "titleHtml": "1С",
+   "imageUrl": "//habrastorage.org/getpro/habr/hub/7f4/845/5fc/7f48455fc5cac3578d8fdd52a5bca9f9.png",
+   "descriptionHtml": "Разработка и администрирование 1С",
+   "statistics": {
+    "subscribersCount": 2058,
+    "rating": 105.02,
+    "authorsCount": 33,
+    "postsCount": 1322,
+    "reach": "64K+"
+   },
+   "commonTags": [
+    "1с",
+    "ии-агенты",
+    "esb"
+   ],
+   "isProfiled": true,
+   "isOfftop": false
+  },
+  "tensorflow": {
+   "id": "22392",
+   "alias": "tensorflow",
+   "titleHtml": "TensorFlow",
+   "imageUrl": "//habrastorage.org/getpro/habr/hub/e97/7d9/635/e977d9635a20dc032502de4f3cb10345.png",
+   "descriptionHtml": "открытая библиотека для машинного обучения",
+   "statistics": {
+    "subscribersCount": 2865,
+    "rating": 0,
+    "authorsCount": 0,
+    "postsCount": 210,
+    "reach": "2K+"
+   },
+   "commonTags": [
+    "tensorflow",
+    "machinelearning",
+    "ml"
+   ],
+   "isProfiled": true,
+   "isOfftop": false
+  }
+ }
+}
