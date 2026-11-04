@@ -355,23 +355,25 @@ def main_env(tg, tmp_db, monkeypatch):
 
 
 def test_main_starts_backfill_thread(main_env, monkeypatch):
-    monkeypatch.setattr(bot_module, '_spawn', main_env['bot_spawn'].append)
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: main_env['bot_spawn'].append((fn, name)))
 
     bot_module.main()
 
-    assert main_env['bot_spawn'] == [habr_backfill.run_safely]
+    assert (habr_backfill.run_safely, 'habr-backfill') in main_env['bot_spawn']
     assert main_env['polling'] == 1
 
 
 def test_main_backfill_start_failure_does_not_block_polling(main_env, monkeypatch, caplog):
-    def broken(fn):
-        raise RuntimeError('no threads')
-    monkeypatch.setattr(bot_module, '_spawn', broken)
+    def broken_for_backfill(fn, name):
+        if name == 'habr-backfill':
+            raise RuntimeError('no threads')
+        main_env['bot_spawn'].append(name)
+    monkeypatch.setattr(bot_module, '_spawn', broken_for_backfill)
 
     with caplog.at_level(logging.ERROR, logger='bot'):
         bot_module.main()
 
     assert main_env['polling'] == 1
-    assert len(main_env['digest_spawn']) == 1
+    assert main_env['bot_spawn'] == ['digest-scheduler']      # the scheduler still starts
     assert any(r.levelno >= logging.ERROR and 'no threads' in r.getMessage() + str(r.exc_info)
                for r in caplog.records)

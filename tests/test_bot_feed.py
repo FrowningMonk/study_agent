@@ -123,13 +123,13 @@ def llm(tg, tmp_db, monkeypatch):
 
 @pytest.fixture
 def sync_spawn(monkeypatch):
-    monkeypatch.setattr(bot_module, '_spawn', lambda fn: fn())
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())
 
 
 @pytest.fixture
 def captured_spawn(monkeypatch):
     jobs = []
-    monkeypatch.setattr(bot_module, '_spawn', jobs.append)
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: jobs.append(fn))
     return jobs
 
 
@@ -830,7 +830,7 @@ def test_summary_worker_exception_reaches_all_and_clears_registry(tg, habr, llm,
 
 
 def test_spawn_failure_clears_registry(tg, habr, llm, monkeypatch):
-    def no_thread(fn):
+    def no_thread(fn, name):
         raise RuntimeError("can't start new thread")
     monkeypatch.setattr(bot_module, '_spawn', no_thread)
     list_id = _list_for(FRIEND)
@@ -845,17 +845,27 @@ def test_spawn_runs_daemon_thread(monkeypatch):
     started = []
 
     class FakeThread:
-        def __init__(self, target, daemon):
-            started.append((target, daemon))
+        def __init__(self, target, daemon, name):
+            started.append((target, daemon, name))
 
         def start(self):
             started.append('start')
     monkeypatch.setattr(bot_module.threading, 'Thread', FakeThread)
     job = lambda: None  # noqa: E731
 
-    bot_module._spawn(job)
+    bot_module._spawn(job, 'summary-1')
 
-    assert started == [(job, True), 'start']
+    assert started == [(job, True, 'summary-1'), 'start']
+
+
+def test_summary_thread_named_by_habr_id(tg, habr, llm, monkeypatch):
+    names = []
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: names.append(name))
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    assert names == [f'summary-{HABR_ID}']
 
 
 def test_reset_for_tests_clears_registry_used_by_bot(tg, habr, llm, captured_spawn):

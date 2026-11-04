@@ -1954,9 +1954,13 @@ def _to_markup(rows: list[list[tuple[str, str]]]) -> types.InlineKeyboardMarkup:
     return markup
 
 
-def _spawn(fn) -> None:
-    """Runs fn in a daemon thread so handler workers are never blocked; tests patch it."""
-    threading.Thread(target=fn, daemon=True).start()
+def _spawn(fn, name: str) -> None:
+    """
+    The one helper for the bot's background threads: a named daemon thread, so handler
+    workers are never blocked and logs/thread dumps show what runs ('digest-scheduler',
+    'habr-backfill', 'summary-{habr_id}'). Tests patch it.
+    """
+    threading.Thread(target=fn, daemon=True, name=name).start()
 
 
 def _answer(call: telebot.types.CallbackQuery, text: str | None = None) -> None:
@@ -2125,7 +2129,7 @@ def _start_summary(call: telebot.types.CallbackQuery, chat_id: int, user_id: int
     if result.kind != feed.CLICK_STARTED:
         return
     try:
-        _spawn(lambda: _summary_job(chat_id, user_id, habr_id, source))
+        _spawn(lambda: _summary_job(chat_id, user_id, habr_id, source), f'summary-{habr_id}')
     except Exception as e:
         # No worker means nobody would clear the entry or answer the waiters
         waiters = feed.REGISTRY.finish(habr_id)
@@ -2266,8 +2270,7 @@ def handle_digest_now(message: telebot.types.Message) -> None:
 
 
 def _run_digest_scheduler() -> None:
-    """Scheduler thread body; digest._spawn names threads 'digest-now', so rename for logs."""
-    threading.current_thread().name = 'digest-scheduler'
+    """Scheduler thread body (thread 'digest-scheduler')."""
     digest.run_scheduler(digest_send, OWNER_ID, is_allowed)
 
 
@@ -2280,7 +2283,7 @@ def _start_digest_scheduler() -> None:
     except Exception:
         logger.exception('Дайджест: не удалось вычислить время запуска')
     try:
-        digest._spawn(_run_digest_scheduler)
+        _spawn(_run_digest_scheduler, 'digest-scheduler')
     except Exception:
         logger.exception('Дайджест: не удалось запустить планировщик')
 
@@ -2288,7 +2291,7 @@ def _start_digest_scheduler() -> None:
 def _start_backfill() -> None:
     """Starts the hubs/tags backfill daemon thread; a start failure never stops the bot."""
     try:
-        _spawn(habr_backfill.run_safely)
+        _spawn(habr_backfill.run_safely, 'habr-backfill')
     except Exception:
         logger.exception('Бэкфилл хабов/тегов: не удалось запустить поток')
 

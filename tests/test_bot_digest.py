@@ -10,6 +10,7 @@ and no LLM call is ever made.
 """
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -150,7 +151,7 @@ def sync_spawn(monkeypatch):
         calls.append(fn)
         fn()
     monkeypatch.setattr(digest, '_spawn', spawn)
-    monkeypatch.setattr(bot_module, '_spawn', lambda fn: fn())
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())
     return calls
 
 
@@ -596,7 +597,7 @@ def main_env(tg, tmp_db, monkeypatch):
     monkeypatch.setattr(bot_module, 'ensure_directories', lambda: None)
     monkeypatch.setattr(bot_module, 'check_providers_status', lambda: {})
     monkeypatch.setattr(bot_module, 'check_model_availability', lambda model, provider: (True, ''))
-    monkeypatch.setattr(bot_module, '_spawn', calls['bot_spawn'].append)
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: calls['bot_spawn'].append((fn, name)))
 
     def polling(*a, **kw):
         calls['polling'] += 1
@@ -613,11 +614,12 @@ def test_main_starts_scheduler_thread(main_env, tg, monkeypatch, caplog):
         bot_module.main()
 
     assert main_env['polling'] == 1
-    # The scheduler starts through digest._spawn; bot._spawn (patched by main_env, so no
-    # real backfill runs) gets only the hubs/tags backfill thread (Task 14)
-    assert len(main_env['digest_spawn']) == 1
-    assert main_env['bot_spawn'] == [habr_backfill.run_safely]
-    main_env['digest_spawn'][0]()
+    # One spawn helper (bot._spawn, patched by main_env, so no real threads run) starts the
+    # named scheduler and backfill threads; digest._spawn is only for /digest_now (CA-4)
+    assert main_env['digest_spawn'] == []
+    assert main_env['bot_spawn'] == [(bot_module._run_digest_scheduler, 'digest-scheduler'),
+                                     (habr_backfill.run_safely, 'habr-backfill')]
+    main_env['bot_spawn'][0][0]()
     ((send, owner_id, is_allowed),) = scheduler_args
     assert send is bot_module.digest_send and owner_id == OWNER
     assert is_allowed(OWNER) and is_allowed(FRIEND) and not is_allowed(STRANGER)
@@ -629,31 +631,53 @@ def test_main_starts_scheduler_thread(main_env, tg, monkeypatch, caplog):
 
 
 def test_main_scheduler_start_failure_does_not_stop_polling(main_env, monkeypatch, caplog):
-    def broken(fn):
-        raise RuntimeError('no threads')
-    monkeypatch.setattr(digest, '_spawn', broken)
+    started = []
+
+    def broken_for_scheduler(fn, name):
+        if name == 'digest-scheduler':
+            raise RuntimeError('no threads')
+        started.append(name)
+    monkeypatch.setattr(bot_module, '_spawn', broken_for_scheduler)
 
     with caplog.at_level(logging.ERROR, logger='bot'):
         bot_module.main()
 
     assert main_env['polling'] == 1
+    assert started == ['habr-backfill']          # the backfill still starts
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
-def test_digest_scheduler_spawn_is_daemon(monkeypatch):
+@pytest.mark.parametrize('module', [bot_module, digest], ids=['bot', 'digest'])
+def test_spawn_helpers_start_named_daemon_threads(monkeypatch, module):
     started = []
 
     class FakeThread:
         def __init__(self, target, daemon, name=None):
-            started.append(daemon)
+            started.append((daemon, name))
 
         def start(self):
             pass
-    monkeypatch.setattr(digest.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(module.threading, 'Thread', FakeThread)
 
-    digest._spawn(lambda: None)
+    if module is bot_module:
+        bot_module._spawn(lambda: None, 'habr-backfill')
+        assert started == [(True, 'habr-backfill')]
+    else:
+        digest._spawn(lambda: None)
+        assert started == [(True, 'digest-now')]
 
-    assert started == [True]
+
+def test_spawn_real_thread_is_named(monkeypatch):
+    names = []
+    done = threading.Event()
+
+    def job():
+        names.append(threading.current_thread().name)
+        done.set()
+
+    bot_module._spawn(job, 'summary-42')
+    assert done.wait(5)
+    assert names == ['summary-42']
 
 
 def test_send_adapter_converts_rows_to_markup(monkeypatch):
