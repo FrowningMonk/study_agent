@@ -23,20 +23,21 @@ def test_real_habr_request_is_blocked(url):
         requests.Session().get(url, timeout=1)
 
 
-def test_throttle_state_is_dirtied_by_a_request(monkeypatch):
+def test_throttle_state_is_dirtied_by_a_request(monkeypatch, fixture_text):
+    body = fixture_text('habr_article.json').encode('utf-8')
+
     class _Resp:
         status_code = 200
         headers: dict = {}
 
         def iter_content(self, chunk_size=1):
-            yield b'{"httpCode":404,"errorCode":"NOT_FOUND"}'
+            yield body
 
         def close(self):
             pass
 
     monkeypatch.setattr(habr_api.requests, 'get', lambda *a, **kw: _Resp())
-    with pytest.raises(habr_api.HabrUnavailable):
-        habr_api.fetch_article(1)
+    assert habr_api.fetch_article(1102920)['habr_id'] == 1102920
 
     assert habr_api._last_request_at is not None
 

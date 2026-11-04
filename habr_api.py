@@ -15,7 +15,13 @@ Normalized article item (list and by-id share the shape):
     - lead_text is the RAW `leadData.textHtml` (HTML, unchanged). Callers pass
       (title, lead_text) to `summarizer.generate_short_description`, which strips
       HTML itself, and sanitize the lead for display via `feed` helpers;
-    - url is always the canonical form built from the integer id.
+    - url is always the canonical form built from the integer id;
+    - hubs carry their type: an alias may exist both as a collective hub and as a
+      company (corporative) hub (e.g. `bitrix`), so match on (alias, type).
+
+Hub catalog item: {alias, title (unescaped), rating: float, hub_type}. The live
+catalog has no per-hub type field and lists collective hubs only, so hub_type is
+'collective' unless the API states a type explicitly.
     Items with a wrong field type are rejected (the whole attempt fails), never coerced.
 
 Errors:
@@ -71,7 +77,9 @@ LIST_PER_PAGE: int = 100
 LIST_MAX_ITEMS: int = 1000          # Habr paginator cap (400 PAGINATOR_LIMIT beyond it)
 HUBS_PER_PAGE: int = 100
 HUBS_MAX_PAGES: int = 20            # ~5 pages live; a sanity bound against a runaway loop
-_READ_CHUNK: int = 64 * 1024
+# Small chunks: urllib3 blocks until a whole chunk arrives, so this bounds how long
+# a slow-drip body can hold the lock between whole-body deadline checks
+_READ_CHUNK: int = 8 * 1024
 
 NOT_FOUND_CODES = frozenset({'NOT_FOUND', 'POST_TYPE_MISMATCH'})
 HUB_TYPES = frozenset({'collective', 'corporative'})
@@ -252,7 +260,7 @@ def _request(path: str, params: dict, wait_timeout: float | None) -> tuple[int, 
 def _decode_json(status: int, body: bytes) -> Any:
     try:
         return json.loads(body)
-    except ValueError as e:   # JSONDecodeError and UnicodeDecodeError
+    except (ValueError, RecursionError) as e:   # JSONDecodeError, UnicodeDecodeError, deep nesting
         raise HabrUnavailable('invalid_json', status) from e
 
 
@@ -310,7 +318,10 @@ def _normalize_item(raw: Any, expected_id: int | None = None) -> dict:
     statistics = _field(raw, 'statistics', dict)
     hubs = []
     for hub in _field(raw, 'hubs', list):
-        hubs.append((_field(hub, 'alias', str), _field(hub, 'type', str)))
+        hub_type = _field(hub, 'type', str)
+        if hub_type not in HUB_TYPES:
+            raise _invalid('bad hub type')
+        hubs.append((_field(hub, 'alias', str), hub_type))
     tags = [html.unescape(_field(tag, 'titleHtml', str)) for tag in _field(raw, 'tags', list)]
     lead = _field(raw, 'leadData', dict)
 
@@ -361,7 +372,9 @@ def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None) 
             for raw_id in ids:
                 if not isinstance(raw_id, str) or raw_id not in refs:
                     raise HabrUnavailable('partial', 200, f'id missing from refs on page {page}')
-                page_items.append(_normalize_item(refs[raw_id], expected_id=_id_or_none(raw_id)))
+                if not _DIGITS_RE.fullmatch(raw_id):
+                    raise _invalid('bad id in publicationIds')
+                page_items.append(_normalize_item(refs[raw_id], expected_id=int(raw_id)))
 
             if len(ids) < LIST_PER_PAGE and page < pages_count:
                 raise HabrUnavailable('partial', 200, f'short page {page}/{pages_count}')
@@ -381,10 +394,6 @@ def fetch_articles_since(since: datetime, *, wait_timeout: float | None = None) 
     logger.info('Habr list fetched: requests=%d, items=%d, duration=%.1fs',
                 page, len(items), time.monotonic() - started)
     return items
-
-
-def _id_or_none(raw_id: str) -> int | None:
-    return int(raw_id) if _DIGITS_RE.fullmatch(raw_id) else None
 
 
 def fetch_article(habr_id: int, *, wait_timeout: float | None = None) -> dict:
@@ -418,8 +427,11 @@ def fetch_article(habr_id: int, *, wait_timeout: float | None = None) -> dict:
 def _normalize_hub(alias: str, ref: Any) -> dict:
     if _field(ref, 'alias', str) != alias:
         raise _invalid('hub alias mismatch')
-    # The catalog lists collective hubs only and carries no per-hub type field;
-    # an explicit API type, when present, is taken as-is (validated)
+    # Deviation from "hub_type taken from the API": the live catalog (verified
+    # 2026-11-04, 439 hubs) has no per-hub type field and is the collective-hub
+    # namespace only (company blogs are not listed; an alias such as `bitrix` can
+    # exist both as a collective hub here and as a corporative hub on articles).
+    # An explicit API type, when present, is validated and taken as-is.
     hub_type = ref.get('type', 'collective')
     if hub_type not in HUB_TYPES:
         raise _invalid('bad hub type')

@@ -303,6 +303,7 @@ def _drop(path):
     (_set(['hubs']), [{'alias': 5, 'type': 'collective'}]),
     (_set(['hubs']), [{'alias': 'python'}]),
     (_set(['hubs']), ['python']),
+    (_set(['hubs']), [{'alias': 'python', 'type': 'weird'}]),
     (_set(['tags']), [{'titleHtml': None}]),
     (_set(['tags']), 'tag'),
     (_set(['leadData']), None),
@@ -415,6 +416,13 @@ def _partial_cases():
         page2['publicationRefs'][page2['publicationIds'][5]]['statistics']['score'] = None
         return {1: full(make_item, 1000), 2: page2}
 
+    def non_digit_id_key(make_item):
+        page = full(make_item, 1000, crossed=True)
+        key = page['publicationIds'][3]
+        page['publicationIds'][3] = 'abc'
+        page['publicationRefs']['abc'] = page['publicationRefs'].pop(key)
+        return {1: page}
+
     def wrong_envelope_types(make_item):
         page = full(make_item, 1000, crossed=True)
         page['pagesCount'] = '10'
@@ -434,6 +442,7 @@ def _partial_cases():
         'error_envelope_400': lambda mi: {1: full(mi, 1000), 2: FakeResponse(400, _error_envelope(400, 'PAGINATOR_LIMIT'))},
         'error_envelope_with_200': lambda mi: {1: FakeResponse(200, _error_envelope(400, 'PAGINATOR_LIMIT'))},
         'non_json': lambda mi: {1: FakeResponse(200, '<html>maintenance</html>')},
+        'deeply_nested_json': lambda mi: {1: FakeResponse(200, '[' * 100_000 + ']' * 100_000)},
         'json_not_object': lambda mi: {1: FakeResponse(200, [1, 2, 3])},
         'missing_publicationIds': missing('publicationIds'),
         'missing_publicationRefs': missing('publicationRefs'),
@@ -441,6 +450,7 @@ def _partial_cases():
         'wrong_envelope_types': wrong_envelope_types,
         'refs_not_dict': refs_not_dict,
         'id_absent_from_refs': id_absent,
+        'non_digit_id_key': non_digit_id_key,
         'bad_item_on_page2': bad_item_on_page2,
         'short_page_before_last': lambda mi: {1: full(mi, 1000, count=50, crossed=True)},
         'empty_page_before_last': lambda mi: {1: make_page([], 10)},
