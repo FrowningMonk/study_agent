@@ -343,7 +343,7 @@ WARN_AFTER = timedelta(hours=3)
 TICK_SECONDS = 60
 RECIPIENT_PAUSE = 0.1                   # seconds between recipients (Telegram flood limits)
 RETRY_AFTER_DEFAULT = 5                 # 429 without a usable retry_after
-RETRY_AFTER_MAX = 3600
+RETRY_AFTER_MAX = 60                    # a longer 429 wait fails the delivery instead
 
 TEXT_BUSY = 'Уже собираю дайджест'
 TEXT_OWNER_WARNING = 'Дайджест за сегодня ещё не разослан: {reason}'
@@ -461,16 +461,17 @@ def _is_blocked(exc: BaseException) -> bool:
 
 
 def _retry_after(exc: BaseException) -> float | None:
-    """Seconds to wait for a 429, else None. A missing/invalid retry_after -> small default."""
+    """Seconds to wait for a 429, else None. A missing/invalid retry_after -> small default;
+    one above RETRY_AFTER_MAX -> None (no retry: the scheduler thread is never stalled)."""
     err = _telegram_error(exc)
     if err is None or err.error_code != 429:
         return None
     result_json = err.result_json if isinstance(err.result_json, dict) else {}
     params = result_json.get('parameters')
     value = params.get('retry_after') if isinstance(params, dict) else None
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= RETRY_AFTER_MAX:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return RETRY_AFTER_DEFAULT
-    return value
+    return value if value <= RETRY_AFTER_MAX else None
 
 
 def _send_parts(send: Send, chat_id: int, parts: list) -> str:
@@ -581,10 +582,7 @@ def _attempt(run: dict, now: datetime, send: Send, is_allowed, describe) -> None
     try:
         # Background call: default wait_timeout=None (never HANDLER_WAIT_TIMEOUT)
         articles = fetch_day_articles(day)
-        for delivery in habr_store.list_deliveries(run_id, status='pending'):
-            _deliver_one(run_id, delivery['user_id'], articles, day, describe, send, is_allowed)
-            _sleep(RECIPIENT_PAUSE)
-    except Exception as e:  # noqa: BLE001 — any attempt failure is retried in 15 min
+    except Exception as e:  # noqa: BLE001 — any fetch failure is retried in 15 min
         reason = failure_reason(e)
         habr_store.update_run(run_id, last_error=reason, next_attempt_at=now + RETRY_DELAY)
         if isinstance(e, habr_api.HabrUnavailable):
@@ -592,6 +590,17 @@ def _attempt(run: dict, now: datetime, send: Send, is_allowed, describe) -> None
         else:
             logger.exception('Digest attempt failed: %s, %s', run_id, reason)
         return
+    for delivery in habr_store.list_deliveries(run_id, status='pending'):
+        user_id = delivery['user_id']
+        try:
+            _deliver_one(run_id, user_id, articles, day, describe, send, is_allowed)
+        except Exception:  # noqa: BLE001 — one recipient's error never blocks the others
+            logger.exception('Digest delivery failed: user_id=%s', user_id)
+            try:
+                habr_store.set_delivery_status(run_id, user_id, 'failed')
+            except Exception:  # noqa: BLE001
+                logger.exception('Could not mark delivery failed: user_id=%s', user_id)
+        _sleep(RECIPIENT_PAUSE)
     _finish_if_done(run_id, now)
 
 
@@ -609,6 +618,10 @@ def tick(now: datetime, *, send: Send, owner_id: int, is_allowed, describe=_USE_
     now = now.astimezone(feed.MSK)
     today = now.date()
     _housekeeping(now)
+    # A previous-day run still open means no tick landed in its 23:59 minute (a long attempt
+    # overran it): skip it now with its own reason; never catch it up
+    for stale in habr_store.list_unfinished_runs(before_date=today.isoformat()):
+        _skip_run(stale['digest_date'], now, stale.get('last_error') or REASON_BOT_DOWN, send, owner_id)
     start = _at(today, digest_time())
     skip_at = _at(today, SKIP_TIME)
     if now < start:

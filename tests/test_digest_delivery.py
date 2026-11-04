@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -403,7 +404,7 @@ def test_full_run_owner_and_approved_user(tmp_db, habr, send, sleeps):
     run = habr_store.get_run(TODAY.isoformat())
     assert run['status'] == 'done' and run['finished_at']
     assert len(habr.log) == 1                               # one shared fetch
-    assert sleeps.count(digest.RECIPIENT_PAUSE) == 2
+    assert sleeps.count(0.1) == 2                         # pause between recipients
 
 
 def test_same_day_rerun_sends_nothing(tmp_db, habr, send, sleeps):
@@ -454,9 +455,26 @@ def test_next_day_no_catch_up(tmp_db, habr, send, sleeps):
     requests_made = len(habr.log)
     tick(at(10, 0, day=TOMORROW), send)
     tick(at(17, 59, day=TOMORROW), send)
-    assert send.attempts == [] and len(habr.log) == requests_made
+    # Nothing is sent for the previous day: only the owner learns that it was skipped
+    assert send.sent == [(OWNER, 'Дайджест за 4 ноября пропущен: Хабр не ответил (HTTP 503)', None)]
+    assert len(habr.log) == requests_made
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'skipped'
     assert habr_store.get_run(TOMORROW.isoformat()) is None
     assert set(statuses().values()) == {'pending'}
+
+
+def test_tick_skips_previous_day_run_when_2359_was_missed(tmp_db, habr, send, sleeps):
+    habr.status = 503
+    tick(at(18, 0), send)
+    tick(at(23, 58), send)                              # the 23:59 minute had no tick
+    tick(at(0, 2, day=TOMORROW), send)
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'skipped'
+    assert [t for _, t, _ in send.sent] == [
+        'Дайджест за сегодня ещё не разослан: Хабр не ответил (HTTP 503)',
+        'Дайджест за 4 ноября пропущен: Хабр не ответил (HTTP 503)',
+    ]
+    tick(at(0, 3, day=TOMORROW), send)
+    assert len(send.sent) == 2
 
 
 def test_empty_day_sends_nothing_new(tmp_db, habr, send, sleeps):
@@ -481,17 +499,7 @@ def _settings_row(uid):
         conn.close()
 
 
-@pytest.mark.parametrize('error', [
-    tg_error(403, 'Forbidden: bot was blocked by the user'),
-    tg_error(400, 'Bad Request: chat not found'),
-], ids=['403', '400-chat-not-found'])
-def test_blocked_user_disables_digest(tmp_db, habr, send, sleeps, caplog, error):
-    approve(USER)
-    approve(OTHER)
-    fill_day(habr)
-    send.errors[USER] = [error]
-    with caplog.at_level(logging.WARNING, logger='digest'):
-        tick(at(18, 0), send)
+def _assert_blocked(send, caplog):
     assert statuses() == {OWNER: 'sent', USER: 'failed', OTHER: 'sent'}
     assert _settings_row(USER) == (0, 'blocked')
     assert habr_store.get_digest_enabled(USER) is False
@@ -499,23 +507,26 @@ def test_blocked_user_disables_digest(tmp_db, habr, send, sleeps, caplog, error)
     assert len(send.to(OTHER)) == 1 and send.to(USER) == []
 
 
-def test_blocked_user_403_disables_digest(tmp_db, habr, send, sleeps):
-    """Anchor name; the parametrized test above covers 403 and 400 fully."""
+@pytest.mark.parametrize('description', ['Forbidden: bot was blocked by the user',
+                                         'Forbidden: user is deactivated'])
+def test_blocked_user_403_disables_digest(tmp_db, habr, send, sleeps, caplog, description):
     approve(USER)
+    approve(OTHER)
     fill_day(habr)
-    send.errors[USER] = [tg_error(403, 'Forbidden: user is deactivated')]
-    tick(at(18, 0), send)
-    assert statuses()[USER] == 'failed' and _settings_row(USER) == (0, 'blocked')
+    send.errors[USER] = [tg_error(403, description)]
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        tick(at(18, 0), send)
+    _assert_blocked(send, caplog)
 
 
-def test_chat_not_found_400_disables_digest(tmp_db, habr, send, sleeps):
+def test_chat_not_found_400_disables_digest(tmp_db, habr, send, sleeps, caplog):
     approve(USER)
     approve(OTHER)
     fill_day(habr)
     send.errors[USER] = [tg_error(400, 'Bad Request: chat not found')]
-    tick(at(18, 0), send)
-    assert statuses() == {OWNER: 'sent', USER: 'failed', OTHER: 'sent'}
-    assert _settings_row(USER) == (0, 'blocked')
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        tick(at(18, 0), send)
+    _assert_blocked(send, caplog)
 
 
 def test_other_400_does_not_disable(tmp_db, habr, send, sleeps):
@@ -559,6 +570,35 @@ def test_two_consecutive_429_mark_failed_not_resent(tmp_db, habr, send, sleeps):
     tick(at(19, 0), send)
     assert len(send.attempts) == attempts
     assert habr_store.get_digest_enabled(USER) is True
+
+
+def test_429_with_long_retry_after_fails_without_waiting(tmp_db, habr, send, sleeps):
+    approve(USER)
+    fill_day(habr)
+    send.errors[USER] = [tg_error(429, 'Too Many Requests', retry_after=3600)]
+    tick(at(18, 0), send)
+    assert statuses()[USER] == 'failed'
+    assert 3600 not in sleeps and len([a for a in send.attempts if a[0] == USER]) == 1
+
+
+def test_one_recipient_build_error_does_not_block_others(tmp_db, habr, send, sleeps, monkeypatch, caplog):
+    approve(USER)
+    approve(OTHER)
+    fill_day(habr)
+    real_build = digest.build_user_digest
+
+    def build(user_id, *a, **kw):
+        if user_id == USER:
+            raise sqlite3.OperationalError('disk I/O error')
+        return real_build(user_id, *a, **kw)
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    with caplog.at_level(logging.ERROR, logger='digest'):
+        tick(at(18, 0), send)
+    assert statuses() == {OWNER: 'sent', USER: 'failed', OTHER: 'sent'}
+    run = habr_store.get_run(TODAY.isoformat())
+    assert run['status'] == 'done' and run['last_error'] is None
+    assert any(str(USER) in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize('error', [tg_error(500, 'Internal Server Error'), RuntimeError('network down')],
@@ -746,12 +786,64 @@ def test_user_without_subscriptions_gets_site_part_only(tmp_db, habr, send, slee
 def test_feed_lists_and_views_do_not_change_digest(tmp_db, habr, send, sleeps):
     approve(USER)
     approve(OTHER)
-    fill_day(habr, site=8)
+    fill_day(habr, site=5)
+    # /feed shown to USER (a persisted feed list): no view is recorded by showing a list
     feed.create_list(USER, 'feed', TODAY, [100, 101, 102])
+    assert habr_store.get_viewed_ids(USER) == set()
     tick(at(18, 0), send)
     user_text, other_text = send.to(USER)[0][0], send.to(OTHER)[0][0]
     assert user_text == other_text
-    assert '1. Статья 100' in user_text
+    for n in range(5):
+        assert f'{n + 1}. Статья {100 + n} ' in user_text
+    kinds = {habr_store.get_ranked_list(int(CALLBACK_RE.fullmatch(cb).group(2)))['kind']
+             for cb in callbacks(send.to(USER)[0][1])}
+    assert kinds == {'digest_site'}
+
+
+def test_feed_summary_view_excludes_article_from_digest(tmp_db, habr, send, sleeps):
+    """A "Саммари" click from /feed is a seen event (source 'feed'): excluded like any view."""
+    approve(USER)
+    fill_day(habr, site=3)
+    habr_store.record_view(USER, 100, 'feed')
+    tick(at(18, 0), send)
+    user_text = send.to(USER)[0][0]
+    assert 'Статья 100' not in user_text and '1. Статья 101 ' in user_text
+    assert '1. Статья 100 ' in send.to(OWNER)[0][0]
+
+
+def _make_list(age_days):
+    list_id = feed.create_list(USER, 'feed', TODAY, [1])
+    created = (at(10, 0) - timedelta(days=age_days)).astimezone(UTC).isoformat(timespec='microseconds')
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        with conn:
+            conn.execute('UPDATE ranked_lists SET created_at = ? WHERE id = ?', (created, list_id))
+    finally:
+        conn.close()
+    return list_id
+
+
+def test_housekeeping_deletes_old_lists_once_per_day(tmp_db, habr, send, sleeps):
+    old, fresh = _make_list(31), _make_list(29)
+    tick(at(10, 0), send)                                # before DIGEST_TIME: cleanup still runs
+    assert habr_store.get_ranked_list(old) is None
+    assert habr_store.get_ranked_list(fresh) is not None
+    old_again = _make_list(40)
+    tick(at(10, 5), send)                                # once per day
+    assert habr_store.get_ranked_list(old_again) is not None
+    tick(at(10, 0, day=TOMORROW), send)
+    assert habr_store.get_ranked_list(old_again) is None
+    assert habr.log == [] and send.attempts == []
+
+
+def test_housekeeping_failure_does_not_break_tick(tmp_db, habr, send, sleeps, monkeypatch):
+    def broken(now=None, days=30):
+        raise sqlite3.OperationalError('locked')
+
+    monkeypatch.setattr(habr_store, 'cleanup_ranked_lists', broken)
+    fill_day(habr, site=2)
+    tick(at(18, 0), send)
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
 
 
 # =============================================================================
@@ -810,12 +902,37 @@ def test_digest_now_plain_does_not_count(tmp_db, habr, send, sleeps, monkeypatch
     assert statuses() == {OWNER: 'sent'}
 
 
-def test_digest_now_single_flight(tmp_db, send, monkeypatch):
-    spawned = []
-    monkeypatch.setattr(digest, '_spawn', spawned.append)   # work "in progress", not run yet
+def test_digest_now_single_flight(tmp_db, habr, send, monkeypatch):
+    fill_day(habr, site=2)
+    monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', None)
+    monkeypatch.setattr(digest, '_now', lambda: at(12, 0))
+    entered, release = threading.Event(), threading.Event()
+    real_fetch = digest.fetch_day_articles
+
+    def blocking_fetch(day, wait_timeout=None):
+        entered.set()
+        assert release.wait(10)
+        return real_fetch(day, wait_timeout)
+
+    monkeypatch.setattr(digest, 'fetch_day_articles', blocking_fetch)
+    threads = []
+
+    def spawn(target):
+        t = threading.Thread(target=target, daemon=True)
+        threads.append(t)
+        t.start()
+
+    monkeypatch.setattr(digest, '_spawn', spawn)
     assert digest.start_digest_now(send, OWNER, False) is True
-    assert digest.start_digest_now(send, OWNER, True) is False
-    assert len(spawned) == 1
+    assert entered.wait(10)
+    assert digest.start_digest_now(send, OWNER, True) is False      # work is running
+    assert len(threads) == 1
+    release.set()
+    threads[0].join(10)
+    assert not threads[0].is_alive()
+    assert len(send.to(OWNER)) == 1
+    assert digest.start_digest_now(send, OWNER, False) is True      # cleared after completion
+    threads[1].join(10)
     assert digest.TEXT_BUSY == 'Уже собираю дайджест'
 
 
@@ -884,15 +1001,19 @@ def test_digest_now_default_thread_runs_work(tmp_db, habr, send, monkeypatch):
 
 def test_default_describe_is_real_function(tmp_db, habr, send, sleeps, monkeypatch, _no_real_llm):
     assert digest._DEFAULT_DESCRIBE is summarizer.generate_short_description
-    fake = Describe(result=None)                        # nothing stored: every path asks again
+    fake = Describe()
     monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', fake)
     fill_day(habr, site=1)
-    fill_day(habr, site=1, day=TODAY)
+    digest.tick(at(18, 0), send=send, owner_id=OWNER, is_allowed=allowed)   # describe omitted
+    assert fake.calls == ['Статья 100']
+    assert _no_real_llm == []
 
-    digest.tick(at(18, 0), send=send, owner_id=OWNER, is_allowed=allowed)
-    assert len(fake.calls) == 1
 
-    monkeypatch.setattr(digest, '_now', lambda: at(18, 0, day=TOMORROW))
+def test_run_scheduler_uses_default_describe(tmp_db, habr, send, monkeypatch, _no_real_llm):
+    fake = Describe()
+    monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', fake)
+    fill_day(habr, site=1)
+    monkeypatch.setattr(digest, '_now', lambda: at(18, 0))
 
     def stop(seconds):
         if seconds == digest.TICK_SECONDS:
@@ -901,11 +1022,18 @@ def test_default_describe_is_real_function(tmp_db, habr, send, sleeps, monkeypat
     monkeypatch.setattr(digest, '_sleep', stop)
     with pytest.raises(_StopLoop):
         digest.run_scheduler(send, OWNER, allowed)
-    assert len(fake.calls) == 2
+    assert fake.calls == ['Статья 100']
+    assert _no_real_llm == []
 
+
+def test_start_digest_now_uses_default_describe(tmp_db, habr, send, monkeypatch, _no_real_llm):
+    fake = Describe()
+    monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', fake)
+    fill_day(habr, site=1)
+    monkeypatch.setattr(digest, '_now', lambda: at(12, 0))
     sync_spawn(monkeypatch)
     assert digest.start_digest_now(send, OWNER, False)
-    assert len(fake.calls) == 3
+    assert fake.calls == ['Статья 100']
     assert _no_real_llm == []
 
 
