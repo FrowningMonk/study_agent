@@ -354,6 +354,22 @@ def test_digest_now_owner_runs_in_spawn(tg, tmp_db, habr, jobs, describe, now):
     assert describe.calls                       # the injected fake, not the real LLM
 
 
+def test_digest_part_sends_cleaned_fallback_lead(tg, tmp_db, habr, sync_spawn, now, monkeypatch):
+    """The text actually sent: no-describe fallback lead without links, mentions, commands."""
+    monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', lambda title, lead: None)   # LLM gives nothing
+    habr.fill(digest.digest_day(now), site=1)
+    habr.items[0]['lead_text'] = ('<p>см. https://evil.example/x и evil.ru/login, пиши @admin, '
+                                  'жми /start ' + chr(0x202E) + 'текст анонса</p>')
+
+    _send(OWNER, '/digest_now')
+
+    ((text, _),) = _digest_parts(tg)
+    for bad in ('http', 'evil', '@admin', '/start', chr(0x202E)):
+        assert bad not in text, bad
+    assert 'текст анонса' in text
+    assert habr_store.get_habr_article(100)['short_description'] is None
+
+
 def test_digest_now_does_not_touch_run_rows(tg, tmp_db, habr, sync_spawn, now):
     habr.fill(digest.digest_day(now))
 

@@ -27,6 +27,7 @@ OTHER = 4000                     # a second approved non-owner user
 HABR_ID = 123
 CANONICAL = habr_api.canonical_url(HABR_ID)
 TODAY = date(2026, 11, 4)
+RLO, RLM = chr(0x202E), chr(0x200F)          # bidi override / right-to-left mark
 
 
 # =============================================================================
@@ -512,6 +513,26 @@ def test_feed_with_data_first_page(tg, habr, llm, tmp_db):
     assert habr.calls == [('list', habr_api.HANDLER_WAIT_TIMEOUT)]     # handler throttle mode
 
 
+def test_feed_sends_sanitized_title(tg, habr):
+    """The text actually sent by /feed: control/bidi characters gone, title capped at 200."""
+    habr_store.add_subscription(FRIEND, 'python')
+    evil = _item(1, score=5)
+    evil['title'] = RLO + 'evil' + RLM + '\x07 ' + 'x' * 300 + '\nsecond line'
+    habr.items = [evil]
+
+    _send(FRIEND, '/feed')
+
+    (msg,) = _sent_to(tg, FRIEND)
+    text = msg[1][1]
+    for bad in (RLO, RLM, '\x07'):
+        assert bad not in text
+    lines = text.split('\n')
+    assert not any(line.startswith('second line') for line in lines)    # one line per article
+    title = lines[0].split('. ', 1)[1].split(' — рейтинг')[0]
+    assert title.startswith('evil x') and len(title) <= feed.TITLE_MAX_LEN
+    assert 'parse_mode' not in msg[2]
+
+
 def test_feed_more_10_to_the_end(tg, habr):
     habr_store.add_subscription(FRIEND, 'python')
     habr.items = [_item(i, score=100 - i) for i in range(1, 26)]
@@ -682,6 +703,52 @@ def test_summary_button_cached(tg, habr, llm, tmp_db, sync_spawn):
     assert _views(tmp_db, FRIEND) == [(HABR_ID, 'feed')]
     assert _answers(tg) == [None]
     assert len(feed.REGISTRY) == 0
+
+
+def _idea_links(db):
+    return _query(db, 'SELECT article_id, idea_id FROM idea_articles ORDER BY idea_id')
+
+
+def _edits(sent, chat_id):
+    return [s[1][0] for s in sent if s[0] == 'edit_message_text' and s[2].get('chat_id') == chat_id]
+
+
+def test_summary_on_other_users_cached_article_then_link_to_own_idea(tg, habr, llm, tmp_db, sync_spawn):
+    """Decision 20 end to end: FRIEND opens OWNER's cached row via «Саммари» and links it."""
+    article_id = _save_cached(tmp_db)                    # OWNER's row for HABR_ID
+    idea = tmp_db.create_idea('Идея', None, FRIEND)
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+    assert bot_module.MSG_LINK_SELECT_IDEAS in _texts(tg, FRIEND)
+    assert bot_module.pending_article_links[FRIEND]['article_id'] == article_id
+    assert bot_module.pending_article_links[FRIEND]['created_now'] is False
+
+    _press(FRIEND, f'toggle_link:{idea}', update_id=3)
+    _press(FRIEND, 'link_done', update_id=4)
+
+    assert _idea_links(tmp_db) == [(article_id, idea)]
+    assert _edits(tg, FRIEND) == [bot_module.MSG_LINK_DONE.format(ideas='Идея')]
+    assert FRIEND not in bot_module.pending_article_links
+    # The row is still OWNER's: linking never transfers ownership
+    assert _query(tmp_db, 'SELECT user_id FROM articles WHERE id = ?', (article_id,)) == [(OWNER,)]
+
+
+def test_link_done_without_view_row_creates_no_link(tg, habr, llm, tmp_db):
+    """Same session for FRIEND, but no «Саммари» click: no article_views row, no link."""
+    article_id = _save_cached(tmp_db)
+    idea = tmp_db.create_idea('Идея', None, FRIEND)
+    bot_module.pending_article_links[FRIEND] = {
+        'article_id': article_id, 'selected_ideas': set(), 'created_now': False,
+    }
+
+    _press(FRIEND, f'toggle_link:{idea}', update_id=3)
+    _press(FRIEND, 'link_done', update_id=4)
+
+    assert _views(tmp_db, FRIEND) == []
+    assert _idea_links(tmp_db) == []
+    assert _edits(tg, FRIEND) == [bot_module.MSG_LINK_SKIPPED]
+    assert FRIEND not in bot_module.pending_article_links
 
 
 def test_summary_button_new_generates_once_and_saves(tg, habr, llm, tmp_db, sync_spawn):

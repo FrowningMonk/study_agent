@@ -10,11 +10,12 @@ autouse guard in conftest.
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
 import bot as bot_module
+import feed
 import habr_api
 import habr_store
 import pipeline
@@ -310,16 +311,26 @@ def test_text_with_url_still_handled(tg, tmp_db, fake):
 # --- "Не привязывать" (Decision 20) --------------------------------------------
 
 
-def test_link_skip_keeps_row_created_by_other_user(tg, tmp_db, fake):
+def test_link_skip_keeps_row_created_by_other_user(tg, tmp_db, fake, kek, monkeypatch):
+    """Through dispatch: FRIEND's «Саммари» on OWNER's cached row, then «Не привязывать»."""
     article_id = _save_habr(tmp_db, CANONICAL_123, 123, user_id=OWNER)
     tmp_db.create_idea('Idea', None, FRIEND)
-    bot_module._summarize_for_user(FRIEND, FRIEND, 123, 'feed')
-    assert bot_module.pending_article_links[FRIEND]['created_now'] is False
+    habr_store.upsert_habr_article(kek(123))
+    kek.calls.clear()
+    list_id = feed.create_list(FRIEND, 'feed', date(2026, 11, 4), [123])
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())     # worker runs inline
 
-    _press(FRIEND, f'link_skip:{article_id}')
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    session = bot_module.pending_article_links[FRIEND]
+    assert session['article_id'] == article_id and session['created_now'] is False
+    assert fake.calls == []                                # cached: no new generation
+
+    _press(FRIEND, f'link_skip:{article_id}', update_id=3)
 
     assert tmp_db.get_article_by_id(article_id) is not None
     assert FRIEND not in bot_module.pending_article_links
+    assert any(s[0] == 'edit_message_text' and s[1][0] == bot_module.MSG_LINK_SKIPPED for s in tg)
 
 
 def test_link_skip_deletes_own_newly_created_row(tg, tmp_db, fake):
