@@ -527,6 +527,7 @@ def _generate_with_polza(
     user_prompt: str,
     model: str,
     max_tokens: int = MAX_OUTPUT_TOKENS,
+    disable_reasoning: bool = False,
 ) -> str:
     """
     Генерирует текст через Polza.ai API (OpenAI-совместимый).
@@ -536,6 +537,9 @@ def _generate_with_polza(
         user_prompt: Пользовательский промпт.
         model: Название модели в Polza.ai.
         max_tokens: Лимит токенов ответа.
+        disable_reasoning: Отключить рассуждения reasoning-модели. Токены
+            рассуждений входят в max_tokens: при малом лимите они съедают его
+            целиком и ответ приходит пустым.
 
     Returns:
         Сгенерированный текст.
@@ -556,6 +560,7 @@ def _generate_with_polza(
         temperature=0.3,
         max_tokens=max_tokens,
         timeout=GENERATION_TIMEOUT_SECONDS,
+        extra_body={'reasoning': {'enabled': False}} if disable_reasoning else None,
     )
 
     return response.choices[0].message.content
@@ -572,6 +577,7 @@ def _generate(
     model: str,
     provider: str,
     max_tokens: int = MAX_OUTPUT_TOKENS,
+    disable_reasoning: bool = False,
 ) -> str:
     """
     Диспетчер: вызывает генерацию через нужного провайдера.
@@ -582,6 +588,7 @@ def _generate(
         model: Название модели.
         provider: Провайдер ('polza', 'ollama').
         max_tokens: Лимит токенов ответа (по умолчанию MAX_OUTPUT_TOKENS).
+        disable_reasoning: Отключить рассуждения (только Polza; Ollama игнорирует).
 
     Returns:
         Сгенерированный текст.
@@ -592,7 +599,7 @@ def _generate(
     if provider == 'ollama':
         return _generate_with_ollama(system_prompt, user_prompt, model, max_tokens)
     elif provider == 'polza':
-        return _generate_with_polza(system_prompt, user_prompt, model, max_tokens)
+        return _generate_with_polza(system_prompt, user_prompt, model, max_tokens, disable_reasoning)
     else:
         raise ValueError(f'Неподдерживаемый провайдер: {provider}')
 
@@ -794,7 +801,7 @@ def generate_short_description(title: str, lead_text: str) -> str | None:
     try:
         raw = _generate(
             SHORT_DESCRIPTION_SYSTEM_PROMPT, user_prompt, DEFAULT_MODEL, DEFAULT_PROVIDER,
-            max_tokens=SHORT_DESCRIPTION_MAX_TOKENS,
+            max_tokens=SHORT_DESCRIPTION_MAX_TOKENS, disable_reasoning=True,
         )
     except Exception as e:
         logger.warning('generate_short_description failed: model=%s, provider=%s, error=%s',

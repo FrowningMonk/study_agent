@@ -159,10 +159,12 @@ def _capture_generate(monkeypatch, result='Автор сравнивает дв�
     """
     calls = []
 
-    def fake_generate(system_prompt, user_prompt, model, provider, max_tokens=summarizer.MAX_OUTPUT_TOKENS):
+    def fake_generate(system_prompt, user_prompt, model, provider,
+                      max_tokens=summarizer.MAX_OUTPUT_TOKENS, disable_reasoning=False):
         calls.append({
             'system_prompt': system_prompt, 'user_prompt': user_prompt,
             'model': model, 'provider': provider, 'max_tokens': max_tokens,
+            'disable_reasoning': disable_reasoning,
         })
         return result
 
@@ -190,6 +192,8 @@ def test_short_description_uses_default_model_and_max_tokens(monkeypatch):
     assert calls[0]['provider'] == summarizer.DEFAULT_PROVIDER
     assert calls[0]['model'] == summarizer.DEFAULT_MODEL
     assert calls[0]['max_tokens'] == 300
+    # Reasoning tokens count toward max_tokens and would leave the answer empty
+    assert calls[0]['disable_reasoning'] is True
     assert calls[0]['system_prompt'] == summarizer.SHORT_DESCRIPTION_SYSTEM_PROMPT
 
 
@@ -343,9 +347,27 @@ def test_generate_passes_max_tokens_to_polza(monkeypatch):
 
     assert summarizer._generate('s', 'u', 'm', 'polza', max_tokens=123) == 'ok'
     assert captured['max_tokens'] == 123
+    assert captured['extra_body'] is None
 
     summarizer._generate('s', 'u', 'm', 'polza')
     assert captured['max_tokens'] == summarizer.MAX_OUTPUT_TOKENS
+
+
+def test_generate_disable_reasoning_reaches_polza_request(monkeypatch):
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok'))])
+
+    monkeypatch.setattr(summarizer, 'POLZA_API_KEY', 'test-key')
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(summarizer, 'polza_client', fake_client)
+
+    summarizer._generate('s', 'u', 'm', 'polza', max_tokens=300, disable_reasoning=True)
+
+    assert captured['extra_body'] == {'reasoning': {'enabled': False}}
+    assert captured['max_tokens'] == 300
 
 
 def test_generate_passes_max_tokens_to_ollama(monkeypatch):
