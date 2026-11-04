@@ -10,8 +10,12 @@ Every connection is opened through `database._get_connection()` at call time:
 tests patch `database.DB_PATH`, and the connection enables `PRAGMA foreign_keys`
 needed for the `ranked_list_items` cascade.
 
-Timestamps written here are aware ISO strings in UTC; `list_date` and
+Timestamps written here are aware ISO strings in UTC with fixed-width
+microseconds, so string comparison is chronological; `list_date` and
 `digest_date` are MSK dates `YYYY-MM-DD` supplied by callers.
+
+`habr_articles` rows created by `mark_unavailable` may have NULL metadata
+(title, score, published_at...): consumers filter on `unavailable_at IS NULL`.
 """
 
 import logging
@@ -25,7 +29,8 @@ import database
 
 logger = logging.getLogger(__name__)
 
-# Single source of the hub alias rule: catalog import, callback data, user input
+# Single source of the hub alias rule: catalog import, callback data, user input.
+# Always apply it with .fullmatch(): with .match() the `$` accepts a trailing "\n".
 HUB_ALIAS_RE = re.compile(r'^[A-Za-z0-9_-]{1,50}$')
 
 VIEW_SOURCES = ('link', 'digest', 'feed', 'legacy')
@@ -136,7 +141,7 @@ CREATE TABLE IF NOT EXISTS digest_deliveries (
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 
 def _to_text(value):
@@ -144,7 +149,7 @@ def _to_text(value):
     if isinstance(value, datetime):
         if value.tzinfo is None:
             raise ValueError('naive datetime is not allowed, pass an aware one')
-        return value.astimezone(timezone.utc).isoformat()
+        return value.astimezone(timezone.utc).isoformat(timespec='microseconds')
     return value
 
 
@@ -243,15 +248,24 @@ def migrate_articles(conn: sqlite3.Connection) -> None:
 
 
 def record_view(user_id: int, habr_id: int, source: str) -> None:
-    """Records that the user has seen the article (any row excludes it from lists)."""
+    """
+    Records that the user has seen the article (any row excludes it from lists).
+    A repeated (user_id, habr_id, source) is not stored again; the first time is kept.
+    """
     if source not in VIEW_SOURCES:
         raise ValueError(f'unknown view source: {source!r}')
     conn = database._get_connection()
     try:
         with conn:
             conn.execute(
-                'INSERT INTO article_views (user_id, habr_id, source, created_at) VALUES (?, ?, ?, ?)',
-                (user_id, habr_id, source, _now()),
+                """
+                INSERT INTO article_views (user_id, habr_id, source, created_at)
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM article_views WHERE user_id = ? AND habr_id = ? AND source = ?
+                )
+                """,
+                (user_id, habr_id, source, _now(), user_id, habr_id, source),
             )
     finally:
         conn.close()
@@ -368,7 +382,10 @@ def get_habr_article(habr_id: int) -> dict | None:
 
 
 def mark_unavailable(habr_id: int) -> None:
-    """Marks an article as deleted/hidden on Habr; creates a bare row if there is no metadata yet."""
+    """
+    Marks an article as deleted/hidden on Habr. If there is no metadata yet, creates
+    a bare row with only habr_id and unavailable_at (other columns NULL, fetched_at NULL).
+    """
     conn = database._get_connection()
     try:
         with conn:
@@ -405,6 +422,8 @@ def replace_hub_catalog(hubs: Iterable[dict]) -> int:
     """
     Replaces the whole catalog with `hubs` ({alias, title, rating}) in one transaction.
     Aliases not matching HUB_ALIAS_RE are skipped and logged. Returns the stored count.
+    If no valid hub remains, the existing catalog is kept untouched and 0 is returned:
+    a broken response must not destroy the stale copy (Decision 14).
     """
     fetched_at = _now()
     rows = []
@@ -416,6 +435,9 @@ def replace_hub_catalog(hubs: Iterable[dict]) -> int:
             logger.warning("Hub catalog: skipped unsafe alias %.60r", alias)
             continue
         rows.append((alias, hub.get('title'), hub.get('rating'), fetched_at))
+    if not rows:
+        logger.warning("Hub catalog: no valid hubs in import (%d skipped), existing catalog kept", skipped)
+        return 0
     conn = database._get_connection()
     try:
         with conn:
@@ -467,7 +489,9 @@ def catalog_fetched_at() -> str | None:
 
 
 def add_subscription(user_id: int, hub_alias: str) -> bool:
-    """True if added, False if it already existed."""
+    """True if added, False if it already existed. Unsafe aliases raise ValueError."""
+    if not isinstance(hub_alias, str) or not HUB_ALIAS_RE.fullmatch(hub_alias):
+        raise ValueError(f'unsafe hub alias: {hub_alias!r:.60}')
     conn = database._get_connection()
     try:
         with conn:
@@ -531,8 +555,11 @@ def create_ranked_list(user_id: int, kind: str, list_date: str, habr_ids: Iterab
 def get_ranked_list(list_id: int, offset: int = 0, limit: int | None = None) -> dict | None:
     """
     List header plus `total` item count and `items` ([{position, habr_id}]) ordered
-    by position, sliced by offset/limit (offset 0 = position 1). None if missing.
+    by position, sliced by offset/limit (offset 0 = position 1, limit None = all).
+    None if missing. Negative offset/limit raise ValueError.
     """
+    if offset < 0 or (limit is not None and limit < 0):
+        raise ValueError('offset and limit must be non-negative')
     conn = database._get_connection()
     try:
         row = conn.execute('SELECT * FROM ranked_lists WHERE id = ?', (list_id,)).fetchone()
@@ -722,7 +749,10 @@ def claim_delivery(digest_date: str, user_id: int) -> bool:
 
 
 def set_delivery_status(digest_date: str, user_id: int, status: str) -> bool:
-    """Sets the delivery status ('sent' also stamps sent_at). False if the row is missing."""
+    """
+    Sets the delivery status ('sent' also stamps sent_at). 'sent' is terminal: a later
+    non-'sent' status never overwrites it. False if the row is missing or already sent.
+    """
     if status not in DELIVERY_STATUSES:
         raise ValueError(f'unknown delivery status: {status!r}')
     conn = database._get_connection()
@@ -735,7 +765,8 @@ def set_delivery_status(digest_date: str, user_id: int, status: str) -> bool:
                 )
             else:
                 cur = conn.execute(
-                    'UPDATE digest_deliveries SET status = ? WHERE digest_date = ? AND user_id = ?',
+                    "UPDATE digest_deliveries SET status = ? "
+                    "WHERE digest_date = ? AND user_id = ? AND status != 'sent'",
                     (status, digest_date, user_id),
                 )
         return cur.rowcount > 0

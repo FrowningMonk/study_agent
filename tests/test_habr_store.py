@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -105,6 +106,8 @@ def test_migration_on_preexisting_db_sets_habr_id(tmp_path, monkeypatch):
         ('https://habr.com/ru/articles/105/?utm_source=tg&utm_medium=x#comments', 'habr', 1),
         ('https://www.habr.com/en/company/x/blog/106/', 'habr', 1),
         ('https://m.habr.com/ru/articles/107/comments/', 'habr', 1),
+        ('HTTPS://HABR.COM/ru/articles/108/', 'habr', 1),
+        ('https://habr.com/ru/articles/123456789012345678/', 'habr', 1),  # 18 digits: at the cap
         ('https://github.com/owner/repo', 'github', 1),
         ('https://infostart.ru/1c/articles/2000000/', 'infostart', 1),
     ]
@@ -120,6 +123,8 @@ def test_migration_on_preexisting_db_sets_habr_id(tmp_path, monkeypatch):
     assert got['https://habr.com/ru/articles/105/?utm_source=tg&utm_medium=x#comments'] == 105
     assert got['https://www.habr.com/en/company/x/blog/106/'] == 106
     assert got['https://m.habr.com/ru/articles/107/comments/'] == 107
+    assert got['HTTPS://HABR.COM/ru/articles/108/'] == 108
+    assert got['https://habr.com/ru/articles/123456789012345678/'] == 123456789012345678
     assert got['https://github.com/owner/repo'] is None
     assert got['https://infostart.ru/1c/articles/2000000/'] is None
 
@@ -136,6 +141,9 @@ def test_migration_rejects_lookalike_hosts(tmp_path, monkeypatch):
         'https://habr.com.evil.com/ru/articles/5/',
         'https://habr.com/ru/articles/٥٦/',  # Arabic-Indic digits
         'https://habr.com/ru/articles/' + '9' * 30 + '/',  # does not fit INTEGER
+        'https://habr.com/ru/articles/' + '9' * 19 + '/',  # one digit over the cap
+        'https://habr.com:password@habr.com/ru/articles/5/',
+        'https://habr.com:443/ru/articles/5/',
         'https://habr.com/ru/articles/5/../../evil',
     ]
     db_file = _old_shape_db(tmp_path, monkeypatch, [(u, 'habr', 1) for u in bad])
@@ -247,6 +255,9 @@ def test_record_view_and_seen_set(tmp_db):
     assert habr_store.get_viewed_ids(1) == {10, 11, 12}
     assert habr_store.get_viewed_ids(2) == {99}
     assert habr_store.get_viewed_ids(3) == set()
+    # Repeating the same (user, habr_id, source) stores no second row
+    habr_store.record_view(1, 10, 'link')
+    assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM article_views WHERE user_id = 1 AND habr_id = 10') == [(1,)]
     with pytest.raises(ValueError):
         habr_store.record_view(1, 13, 'bogus')
     assert 13 not in habr_store.get_viewed_ids(1)
@@ -280,10 +291,18 @@ def test_upsert_habr_article_replaces_hubs_tags_keeps_description(tmp_db):
     assert got['tags'] == ['c']
     assert got['short_description'] == 'Short text'
     assert got['unavailable_at'] is not None
-    assert got['published_at'] == '2026-11-03T09:00:00+00:00'
+    assert got['published_at'] == '2026-11-03T09:00:00.000000+00:00'
     assert got['fetched_at'] is not None
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_hubs') == [(1,)]
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_tags') == [(1,)]
+
+
+def test_upsert_rejects_naive_datetime(tmp_db):
+    item = _item(1)
+    item['published_at'] = datetime(2026, 11, 3, 9, 0)
+    with pytest.raises(ValueError):
+        habr_store.upsert_habr_article(item)
+    assert habr_store.get_habr_article(1) is None
 
 
 def test_get_habr_articles_by_ids(tmp_db):
@@ -331,6 +350,18 @@ def test_hub_catalog_import_rejects_bad_aliases(tmp_db):
     assert habr_store.HUB_ALIAS_RE.pattern == '^[A-Za-z0-9_-]{1,50}$'
     assert all(habr_store.HUB_ALIAS_RE.fullmatch(a) for a in good)
     assert not any(isinstance(a, str) and habr_store.HUB_ALIAS_RE.fullmatch(a) for a in BAD_ALIASES)
+    assert habr_store.find_hub('python\n') is None
+
+
+@pytest.mark.parametrize('broken', [[], [{'alias': 'bad alias', 'title': 'X', 'rating': 1.0}]])
+def test_hub_catalog_empty_or_all_invalid_import_keeps_old_copy(tmp_db, broken):
+    habr_store.replace_hub_catalog([{'alias': 'python', 'title': 'Python', 'rating': 1.0}])
+    fetched_before = habr_store.catalog_fetched_at()
+
+    assert habr_store.replace_hub_catalog(broken) == 0
+
+    assert habr_store.find_hub('python')['title'] == 'Python'
+    assert habr_store.catalog_fetched_at() == fetched_before
 
 
 def test_hub_catalog_replace_top_and_fetched_at(tmp_db):
@@ -367,6 +398,10 @@ def test_subscriptions_idempotent_per_user(tmp_db):
     assert habr_store.list_subscriptions(owner_id) == ['python']
     assert habr_store.list_subscriptions(2) == ['rust']
     assert habr_store.list_subscriptions(3) == []
+    for bad in ('a b', 'python\n', '', 'x' * 51):
+        with pytest.raises(ValueError):
+            habr_store.add_subscription(owner_id, bad)
+    assert habr_store.list_subscriptions(owner_id) == ['python']
 
 
 # --- ranked lists -----------------------------------------------------------
@@ -386,6 +421,10 @@ def test_ranked_list_roundtrip_and_cascade(tmp_db):
     assert [i['habr_id'] for i in page['items']] == ids[20:]
     assert page['total'] == 25
     assert habr_store.get_ranked_list(list_id + 1) is None
+    with pytest.raises(ValueError):
+        habr_store.get_ranked_list(list_id, offset=-1)
+    with pytest.raises(ValueError):
+        habr_store.get_ranked_list(list_id, limit=-1)
 
     with pytest.raises(ValueError):
         habr_store.create_ranked_list(1, 'bogus', '2026-11-03', [1])
@@ -419,6 +458,7 @@ def _age_list(db_path, list_id, days):
 
 
 def test_cleanup_deletes_lists_older_than_30_days(tmp_db):
+    # The exact 30-day instant is deliberately not pinned: only "clearly older" vs "clearly younger"
     old = habr_store.create_ranked_list(1, 'feed', '2026-10-01', [1, 2])
     kept = habr_store.create_ranked_list(1, 'feed', '2026-10-03', [3])
     fresh = habr_store.create_ranked_list(1, 'feed', '2026-11-03', [4])
@@ -522,6 +562,11 @@ def test_set_delivery_status_validates(tmp_db):
     assert habr_store.set_delivery_status('2026-11-03', 1, 'failed') is True
     assert habr_store.list_deliveries('2026-11-03')[0]['sent_at'] is None
     assert habr_store.set_delivery_status('2026-11-03', 2, 'sent') is False
+    # 'sent' is terminal: a late 'failed' or 'pending' does not overwrite it
+    assert habr_store.set_delivery_status('2026-11-03', 1, 'sent') is True
+    for late in ('failed', 'pending', 'sending'):
+        assert habr_store.set_delivery_status('2026-11-03', 1, late) is False
+    assert habr_store.list_deliveries('2026-11-03')[0]['status'] == 'sent'
 
 
 def test_delivery_claim_is_atomic(tmp_db):
@@ -549,7 +594,7 @@ def test_delivery_claim_is_atomic(tmp_db):
 
     assert len(results) == workers
     assert results.count(True) == 1
-    assert habr_store.list_deliveries('2026-11-03', status='sending')[1]['user_id'] == 2
+    assert {d['user_id'] for d in habr_store.list_deliveries('2026-11-03', status='sending')} == {1, 2}
 
 
 def test_list_deliveries_filters_by_status(tmp_db):
@@ -630,11 +675,21 @@ def test_link_article_to_idea_refused_without_view_row(tmp_db):
     assert tmp_db.link_article_to_idea(orphan, idea_b, 2) is True
 
 
-def test_functions_use_patched_db_path(tmp_db, tmp_path):
+def test_functions_use_patched_db_path(tmp_db, tmp_path, monkeypatch):
     assert database.DB_PATH == str(tmp_path / 'test.db')
+    opened = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, 'connect', spy_connect)
     habr_store.record_view(1, 5, 'link')
     habr_store.add_subscription(1, 'python')
 
     assert _query(str(tmp_path / 'test.db'), 'SELECT habr_id FROM article_views') == [(5,)]
     assert _query(str(tmp_path / 'test.db'), 'SELECT hub_alias FROM hub_subscriptions') == [('python',)]
     assert habr_store.get_viewed_ids(1) == {5}
+    # Every connection habr_store opened went to the patched file, none to data/study_agent.db
+    assert opened and set(opened) == {str(tmp_path / 'test.db')}
