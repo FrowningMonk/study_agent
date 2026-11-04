@@ -20,6 +20,7 @@ import bot as bot_module
 import digest
 import feed
 import habr_api
+import habr_backfill
 import habr_store
 import summarizer
 from conftest import FRIEND, STRANGER, _callback_update, _message_update
@@ -611,7 +612,10 @@ def test_main_starts_scheduler_thread(main_env, tg, monkeypatch, caplog):
         bot_module.main()
 
     assert main_env['polling'] == 1
+    # The scheduler starts through digest._spawn; bot._spawn (patched by main_env, so no
+    # real backfill runs) gets only the hubs/tags backfill thread (Task 14)
     assert len(main_env['digest_spawn']) == 1
+    assert main_env['bot_spawn'] == [habr_backfill.run_safely]
     main_env['digest_spawn'][0]()
     ((send, owner_id, is_allowed),) = scheduler_args
     assert send is bot_module.digest_send and owner_id == OWNER

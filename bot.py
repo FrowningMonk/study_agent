@@ -54,6 +54,7 @@ from pipeline import ensure_directories, process_article, save_article_to_db
 import digest
 import feed
 import habr_api
+import habr_backfill
 import habr_store
 import hubs
 from summarizer import (
@@ -1515,6 +1516,34 @@ def handle_url(message: telebot.types.Message) -> None:
     # The user URL (not the id) is passed so it is stored and shown as «Источник»
     _summarize_for_user(message.chat.id, user_id, url, 'link')
 
+    # Last step: the summary and the idea offer are already sent, so a slow or failed
+    # kek fetch can neither delay nor break them
+    if habr_id is not None:
+        _store_link_metadata(habr_id)
+
+
+def _store_link_metadata(habr_id: int) -> None:
+    """
+    Best-effort hubs/tags fetch for a linked Habr article (handler mode). Skipped if
+    the metadata is already fetched or the article is marked unavailable. Every
+    failure is logged and never shown to the user. No DB transaction spans the fetch.
+    """
+    try:
+        if not habr_store.needs_metadata_fetch(habr_id):
+            return
+        item = habr_api.fetch_article(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT)
+        habr_store.upsert_habr_article(item)
+    except habr_api.HabrNotFound:
+        logger.warning('Хабы/теги статьи %s: статья не найдена, отмечаю недоступной', habr_id)
+        try:
+            habr_store.mark_unavailable(habr_id)
+        except Exception as e:
+            logger.error('Не удалось отметить статью %s недоступной: %s', habr_id, _error_text(e))
+    except (habr_api.HabrUnavailable, habr_api.HabrBusy) as e:
+        logger.warning('Хабы/теги статьи %s не получены: %s', habr_id, e)
+    except Exception:
+        logger.exception('Хабы/теги статьи %s: непредвиденная ошибка', habr_id)
+
 
 @bot.message_handler(commands=['new_idea'])
 def handle_new_idea(message: telebot.types.Message) -> None:
@@ -2257,6 +2286,14 @@ def _start_digest_scheduler() -> None:
         logger.exception('Дайджест: не удалось запустить планировщик')
 
 
+def _start_backfill() -> None:
+    """Starts the hubs/tags backfill daemon thread; a start failure never stops the bot."""
+    try:
+        _spawn(habr_backfill.run_safely)
+    except Exception:
+        logger.exception('Бэкфилл хабов/тегов: не удалось запустить поток')
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_unknown(message: telebot.types.Message) -> None:
     """Обрабатывает все остальные сообщения - отправляет подсказку."""
@@ -2669,6 +2706,7 @@ def main() -> None:
             logger.warning('Модель по умолчанию (%s): %s (%s) — НЕДОСТУПНА: %s', label, model, provider, err)
 
     _start_digest_scheduler()
+    _start_backfill()
 
     try:
         bot.set_my_commands([types.BotCommand(name, desc) for name, desc in BOT_COMMANDS])

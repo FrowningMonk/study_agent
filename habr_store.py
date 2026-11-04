@@ -368,6 +368,45 @@ def mark_unavailable(habr_id: int) -> None:
         conn.close()
 
 
+def needs_metadata_fetch(habr_id: int) -> bool:
+    """True if the article has neither `fetched_at` nor `unavailable_at` (or no row at all)."""
+    conn = database._get_connection()
+    try:
+        row = conn.execute(
+            'SELECT 1 FROM habr_articles WHERE habr_id = ? '
+            'AND (fetched_at IS NOT NULL OR unavailable_at IS NOT NULL)',
+            (habr_id,),
+        ).fetchone()
+        return row is None
+    finally:
+        conn.close()
+
+
+def list_backfill_candidates() -> list[int]:
+    """
+    Distinct `articles.habr_id` values (NULLs skipped) whose metadata has neither
+    `fetched_at` nor `unavailable_at`, ascending. Duplicate article rows give one id
+    and are never modified (Decision 18).
+    """
+    conn = database._get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT a.habr_id FROM articles a
+            WHERE a.habr_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM habr_articles h
+                  WHERE h.habr_id = a.habr_id
+                    AND (h.fetched_at IS NOT NULL OR h.unavailable_at IS NOT NULL)
+              )
+            ORDER BY a.habr_id
+            """
+        )
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
 def set_short_description(habr_id: int, text: str) -> bool:
     """Stores the cached short description; False if there is no metadata row."""
     conn = database._get_connection()

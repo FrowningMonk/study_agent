@@ -7,11 +7,14 @@ Bot tests run through real telebot dispatch (`tg`); `process_article` and
 autouse guard in conftest.
 """
 
+import logging
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
 import bot as bot_module
+import habr_api
 import habr_store
 import pipeline
 from conftest import FRIEND, _buttons, _callback_update, _message_update, _sent_to
@@ -544,3 +547,95 @@ def test_is_article_linked_to_other_users_idea(tmp_db):
     tmp_db.link_article_to_idea(article_id, own, FRIEND)
     assert tmp_db.is_article_linked_to_other_users_idea(article_id, FRIEND) is False
     assert tmp_db.is_article_linked_to_other_users_idea(article_id, OWNER) is True
+
+
+# --- hubs/tags for linked articles (Task 14) -----------------------------------
+
+
+class FakeKek:
+    """Stand-in for habr_api.fetch_article: records calls and how many bot calls preceded each."""
+
+    def __init__(self, sent, error=None):
+        self.sent = sent
+        self.error = error
+        self.calls: list[tuple[int, object, int]] = []
+
+    def __call__(self, habr_id, *, wait_timeout=None):
+        self.calls.append((habr_id, wait_timeout, len(self.sent)))
+        if self.error is not None:
+            raise self.error
+        return {
+            'habr_id': habr_id, 'title': 'T', 'url': habr_api.canonical_url(habr_id),
+            'published_at': datetime(2026, 1, 1, tzinfo=timezone.utc), 'score': 1, 'comments': 0,
+            'hubs': [('python', 'collective'), ('bitrix', 'corporative')], 'tags': ['tag1'],
+            'lead_text': '', 'post_type': 'article',
+        }
+
+
+@pytest.fixture
+def kek(tg, monkeypatch):
+    fake_kek = FakeKek(tg)
+    monkeypatch.setattr(habr_api, 'fetch_article', fake_kek)
+    return fake_kek
+
+
+def test_link_flow_stores_hubs_tags_for_new_article(tg, tmp_db, fake, kek):
+    _send(FRIEND, 'https://habr.com/ru/companies/x/articles/77/?utm_source=tg')
+
+    assert [(c[0], c[1]) for c in kek.calls] == [(77, habr_api.HANDLER_WAIT_TIMEOUT)]
+    meta = habr_store.get_habr_article(77)
+    assert meta['fetched_at'] is not None
+    assert meta['hubs'] == [{'alias': 'bitrix', 'hub_type': 'corporative'},
+                            {'alias': 'python', 'hub_type': 'collective'}]
+    assert meta['tags'] == ['tag1']
+
+
+def test_link_flow_summary_sent_before_kek_fetch(tg, tmp_db, fake, kek):
+    tmp_db.create_idea('Idea', None, FRIEND)
+    kek.error = RuntimeError('kek exploded')
+
+    _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    texts = _texts(tg, FRIEND)
+    assert texts[-2].startswith('Готово!') and texts[-1] == bot_module.MSG_LINK_SELECT_IDEAS
+    # The kek call starts only after every bot message of the flow was sent
+    ((_, _, sent_before),) = kek.calls
+    assert sent_before == len(tg)
+    assert habr_store.get_habr_article(77) is None
+
+
+@pytest.mark.parametrize('error', [
+    habr_api.HabrUnavailable('http', 503),
+    habr_api.HabrBusy('busy'),
+    habr_api.HabrNotFound('NOT_FOUND'),
+    ValueError('boom'),
+], ids=['unavailable', 'busy', 'not_found', 'generic'])
+def test_link_flow_kek_errors_logged_not_shown(tg, tmp_db, fake, kek, caplog, error):
+    tmp_db.create_idea('Idea', None, FRIEND)
+    kek.error = error
+
+    with caplog.at_level(logging.WARNING, logger='bot'):
+        _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    texts = _texts(tg, FRIEND)
+    assert texts == [bot_module.MSG_PROCESSING, texts[1], bot_module.MSG_LINK_SELECT_IDEAS]
+    assert texts[1].startswith('Готово!')
+    assert [s[0] for s in tg if s[0] in ('reply_to', 'edit_message_text')] == []
+    assert any(r.name == 'bot' and r.levelno >= logging.WARNING and '77' in r.getMessage()
+               for r in caplog.records)
+    if isinstance(error, habr_api.HabrNotFound):
+        assert habr_store.get_habr_article(77)['unavailable_at'] is not None
+
+
+@pytest.mark.parametrize('state', ['fetched', 'unavailable'])
+def test_link_flow_skips_fetch_when_already_fetched(tg, tmp_db, fake, kek, state):
+    if state == 'fetched':
+        habr_store.upsert_habr_article(kek(77))
+        kek.calls.clear()
+    else:
+        habr_store.mark_unavailable(77)
+
+    _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    assert any(t.startswith('Готово!') for t in _texts(tg, FRIEND))
+    assert kek.calls == []
