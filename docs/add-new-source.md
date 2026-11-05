@@ -299,6 +299,8 @@ def create_prompt(article_data: dict) -> tuple[str, str]:
 
 ### 3.1. Добавление в список источников
 
+Новый источник определяется по вхождению домена в URL. Хабр — исключение: `get_source_name()` распознаёт его строго через `habr_api.parse_article_id()` (по номеру статьи), а прочие ссылки с `habr.com` считаются неподдерживаемыми.
+
 ```python
 # Поддерживаемые источники
 SUPPORTED_SOURCES: dict[str, str] = {
