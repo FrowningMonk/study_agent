@@ -134,3 +134,34 @@ def test_describe_user_strips_spoofing_characters():
     assert '\n' not in access.describe_user(record)
     long_name = {'user_id': 5, 'username': None, 'first_name': 'x' * 500}
     assert len(access.describe_user(long_name)) < 100
+
+
+# --- is_allowed: the single "owner or approved" rule (audit CA-3) ---------------
+
+
+def _user_with_status(tmp_db, uid, status):
+    if status is not None:
+        tmp_db.create_access_request(uid, f'u{uid}', 'U')
+        if status != 'pending':
+            tmp_db.set_user_status(uid, status)
+
+
+@pytest.mark.parametrize('status, expected', [
+    (None, False), ('pending', False), ('approved', True), ('rejected', False),
+])
+def test_is_allowed_by_status(tmp_db, status, expected):
+    uid = ALICE['user_id']
+    _user_with_status(tmp_db, uid, status)
+    assert access.is_allowed(uid, OWNER) is expected
+    assert access.is_allowed(OWNER, OWNER) is True
+    assert tmp_db.get_user(OWNER) is None
+
+
+@pytest.mark.parametrize('status', [None, 'pending', 'approved', 'rejected'])
+def test_gate_passes_exactly_when_is_allowed(tmp_db, status):
+    """gate and is_allowed share one rule: a message/button passes iff is_allowed."""
+    uid = ALICE['user_id']
+    _user_with_status(tmp_db, uid, status)
+    for data in (None, 'view_idea:1', 'hl:s:1:1'):
+        passed = access.gate(uid, 'private', data, OWNER) == access.Gate.PASS
+        assert passed is access.is_allowed(uid, OWNER), (status, data)

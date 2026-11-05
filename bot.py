@@ -54,6 +54,7 @@ from pipeline import ensure_directories, process_article, save_article_to_db
 import digest
 import feed
 import habr_api
+import habr_backfill
 import habr_store
 import hubs
 from summarizer import (
@@ -83,7 +84,6 @@ from database import (
     get_idea_md,
     update_idea_md,
     list_users,
-    get_user,
     count_articles,
     wipe_articles,
 )
@@ -1515,6 +1515,37 @@ def handle_url(message: telebot.types.Message) -> None:
     # The user URL (not the id) is passed so it is stored and shown as «Источник»
     _summarize_for_user(message.chat.id, user_id, url, 'link')
 
+    # Last step: the summary and the idea offer are already sent, so a slow or failed
+    # kek fetch can neither delay nor break them
+    if habr_id is not None:
+        _store_link_metadata(habr_id)
+
+
+def _store_link_metadata(habr_id: int) -> None:
+    """
+    Best-effort hubs/tags fetch for a linked Habr article (handler mode). Skipped if
+    the metadata is already fetched or the article is marked unavailable. Every
+    failure is logged and never shown to the user. No DB transaction spans the fetch.
+    """
+    try:
+        if not habr_store.needs_metadata_fetch(habr_id):
+            return
+        item = habr_api.fetch_article(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                      deadline=habr_api.handler_deadline())
+        habr_store.upsert_habr_article(item)
+    except habr_api.HabrNotFound:
+        logger.warning('Хабы/теги статьи %s: статья не найдена, отмечаю недоступной', habr_id)
+        try:
+            habr_store.mark_unavailable(habr_id)
+        except Exception as e:
+            logger.error('Не удалось отметить статью %s недоступной: %s', habr_id, _error_text(e))
+    except (habr_api.HabrUnavailable, habr_api.HabrBusy) as e:
+        # Category and status only: the message text is never logged
+        logger.warning('Хабы/теги статьи %s не получены: %s %s %s', habr_id, type(e).__name__,
+                       getattr(e, 'kind', ''), getattr(e, 'status', '') or '')
+    except Exception:
+        logger.exception('Хабы/теги статьи %s: непредвиденная ошибка', habr_id)
+
 
 @bot.message_handler(commands=['new_idea'])
 def handle_new_idea(message: telebot.types.Message) -> None:
@@ -1923,9 +1954,13 @@ def _to_markup(rows: list[list[tuple[str, str]]]) -> types.InlineKeyboardMarkup:
     return markup
 
 
-def _spawn(fn) -> None:
-    """Runs fn in a daemon thread so handler workers are never blocked; tests patch it."""
-    threading.Thread(target=fn, daemon=True).start()
+def _spawn(fn, name: str) -> None:
+    """
+    The one helper for the bot's background threads: a named daemon thread, so handler
+    workers are never blocked and logs/thread dumps show what runs ('digest-scheduler',
+    'habr-backfill', 'summary-{habr_id}'). Tests patch it.
+    """
+    threading.Thread(target=fn, daemon=True, name=name).start()
 
 
 def _answer(call: telebot.types.CallbackQuery, text: str | None = None) -> None:
@@ -2094,7 +2129,7 @@ def _start_summary(call: telebot.types.CallbackQuery, chat_id: int, user_id: int
     if result.kind != feed.CLICK_STARTED:
         return
     try:
-        _spawn(lambda: _summary_job(chat_id, user_id, habr_id, source))
+        _spawn(lambda: _summary_job(chat_id, user_id, habr_id, source), f'summary-{habr_id}')
     except Exception as e:
         # No worker means nobody would clear the entry or answer the waiters
         waiters = feed.REGISTRY.finish(habr_id)
@@ -2131,7 +2166,7 @@ def _deliver_to_all(clicker_chat: int | None, waiters, outcome: SummaryOutcome) 
 
 def _summarize_habr_click(chat_id: int, user_id: int, habr_id: int, source: str) -> SummaryOutcome:
     """
-    kek pre-check (Decision 13, before the cache): 404 -> "article gone" and marked
+    kek pre-check (Decision 13, before the cache): 404 or 403 IN_DRAFTS -> "article gone" and marked
     unavailable; Habr unavailable -> the normal scrape/cache path. A successful result
     refreshes the stored metadata with hubs/tags (no second request). Background mode
     (wait_timeout=None): the callback has already been answered.
@@ -2173,11 +2208,8 @@ MSG_DIGEST_NOW_USAGE = 'Использование: /digest_now или /digest_n
 
 
 def is_allowed(user_id: int) -> bool:
-    """Digest recipient check: the owner, or a user whose access is approved now."""
-    if user_id == OWNER_ID:
-        return True
-    record = get_user(user_id)
-    return record is not None and record.get('status') == 'approved'
+    """Digest recipient check: the single access rule (owner or approved now)."""
+    return access.is_allowed(user_id, OWNER_ID)
 
 
 def digest_send(chat_id: int, text: str, rows: list | None) -> None:
@@ -2238,8 +2270,7 @@ def handle_digest_now(message: telebot.types.Message) -> None:
 
 
 def _run_digest_scheduler() -> None:
-    """Scheduler thread body; digest._spawn names threads 'digest-now', so rename for logs."""
-    threading.current_thread().name = 'digest-scheduler'
+    """Scheduler thread body (thread 'digest-scheduler')."""
     digest.run_scheduler(digest_send, OWNER_ID, is_allowed)
 
 
@@ -2252,9 +2283,17 @@ def _start_digest_scheduler() -> None:
     except Exception:
         logger.exception('Дайджест: не удалось вычислить время запуска')
     try:
-        digest._spawn(_run_digest_scheduler)
+        _spawn(_run_digest_scheduler, 'digest-scheduler')
     except Exception:
         logger.exception('Дайджест: не удалось запустить планировщик')
+
+
+def _start_backfill() -> None:
+    """Starts the hubs/tags backfill daemon thread; a start failure never stops the bot."""
+    try:
+        _spawn(habr_backfill.run_safely, 'habr-backfill')
+    except Exception:
+        logger.exception('Бэкфилл хабов/тегов: не удалось запустить поток')
 
 
 @bot.message_handler(func=lambda message: True)
@@ -2669,6 +2708,7 @@ def main() -> None:
             logger.warning('Модель по умолчанию (%s): %s (%s) — НЕДОСТУПНА: %s', label, model, provider, err)
 
     _start_digest_scheduler()
+    _start_backfill()
 
     try:
         bot.set_my_commands([types.BotCommand(name, desc) for name, desc in BOT_COMMANDS])

@@ -102,8 +102,10 @@ def ensure_catalog(now: datetime | None = None) -> None:
     """
     Makes sure a usable catalog is stored. Refreshes it when older than
     CATALOG_MAX_AGE; concurrent callers wait for the running refresh and reuse its
-    outcome (one Habr request). Raises habr_api.HabrBusy or CatalogUnavailable only
-    when there is no stored copy.
+    outcome (one Habr request). One handler deadline (habr_api.HANDLER_DEADLINE) bounds
+    the whole call: the refresh-lock wait (also capped by HANDLER_WAIT_TIMEOUT) plus
+    every catalog page. Raises habr_api.HabrBusy or CatalogUnavailable only when there
+    is no stored copy.
     """
     global _refresh_generation, _last_refresh_error, _last_failure_at
     now = now or _now()
@@ -114,7 +116,8 @@ def ensure_catalog(now: datetime | None = None) -> None:
     if has_copy and failed_at is not None and timedelta(0) <= now - failed_at < REFRESH_RETRY_AFTER:
         return
     generation = _refresh_generation
-    if not _refresh_lock.acquire(timeout=habr_api.HANDLER_WAIT_TIMEOUT):
+    deadline = habr_api.handler_deadline()
+    if not _refresh_lock.acquire(timeout=habr_api.wait_budget(habr_api.HANDLER_WAIT_TIMEOUT, deadline)):
         if habr_store.catalog_fetched_at() is not None:
             return
         raise habr_api.HabrBusy('hub catalog refresh is already running')
@@ -129,7 +132,7 @@ def ensure_catalog(now: datetime | None = None) -> None:
             return
         error = None
         try:
-            items = habr_api.fetch_hub_catalog(wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT)
+            items = habr_api.fetch_hub_catalog(wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT, deadline=deadline)
             # The HTTP call is over: the DB transaction opens only now
             stored = habr_store.replace_hub_catalog(_import_items(items))
             if stored == 0:

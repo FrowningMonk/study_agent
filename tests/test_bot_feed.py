@@ -20,13 +20,15 @@ import feed
 import habr_api
 import habr_store
 import hubs
-from conftest import FRIEND, STRANGER, _buttons, _callback_update, _message_update, _sent_to
+from conftest import IN_DRAFTS_ENVELOPE, KekResponse, FRIEND, STRANGER, _buttons, _callback_update, _message_update, _sent_to
 
 OWNER = bot_module.OWNER_ID
 OTHER = 4000                     # a second approved non-owner user
 HABR_ID = 123
 CANONICAL = habr_api.canonical_url(HABR_ID)
 TODAY = date(2026, 11, 4)
+_REAL_FETCH_ARTICLE = habr_api.fetch_article     # saved before the `habr` fixture patches it
+RLO, RLM = chr(0x202E), chr(0x200F)          # bidi override / right-to-left mark
 
 
 # =============================================================================
@@ -62,19 +64,19 @@ class FakeHabr:
         self.catalog_error = self.list_error = self.article_error = None
         self.calls: list[tuple] = []
 
-    def fetch_hub_catalog(self, *, wait_timeout=None):
+    def fetch_hub_catalog(self, *, wait_timeout=None, deadline=None):
         self.calls.append(('catalog', wait_timeout))
         if self.catalog_error:
             raise self.catalog_error
         return list(self.catalog)
 
-    def fetch_articles_since(self, since, *, wait_timeout=None):
+    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append(('list', wait_timeout))
         if self.list_error:
             raise self.list_error
         return list(self.items)
 
-    def fetch_article(self, habr_id, *, wait_timeout=None):
+    def fetch_article(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append(('article', habr_id, wait_timeout))
         if self.article_error:
             raise self.article_error
@@ -123,13 +125,13 @@ def llm(tg, tmp_db, monkeypatch):
 
 @pytest.fixture
 def sync_spawn(monkeypatch):
-    monkeypatch.setattr(bot_module, '_spawn', lambda fn: fn())
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())
 
 
 @pytest.fixture
 def captured_spawn(monkeypatch):
     jobs = []
-    monkeypatch.setattr(bot_module, '_spawn', jobs.append)
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: jobs.append(fn))
     return jobs
 
 
@@ -512,6 +514,26 @@ def test_feed_with_data_first_page(tg, habr, llm, tmp_db):
     assert habr.calls == [('list', habr_api.HANDLER_WAIT_TIMEOUT)]     # handler throttle mode
 
 
+def test_feed_sends_sanitized_title(tg, habr):
+    """The text actually sent by /feed: control/bidi characters gone, title capped at 200."""
+    habr_store.add_subscription(FRIEND, 'python')
+    evil = _item(1, score=5)
+    evil['title'] = RLO + 'evil' + RLM + '\x07 ' + 'x' * 300 + '\nsecond line'
+    habr.items = [evil]
+
+    _send(FRIEND, '/feed')
+
+    (msg,) = _sent_to(tg, FRIEND)
+    text = msg[1][1]
+    for bad in (RLO, RLM, '\x07'):
+        assert bad not in text
+    lines = text.split('\n')
+    assert not any(line.startswith('second line') for line in lines)    # one line per article
+    title = lines[0].split('. ', 1)[1].split(' — рейтинг')[0]
+    assert title.startswith('evil x') and len(title) <= feed.TITLE_MAX_LEN
+    assert 'parse_mode' not in msg[2]
+
+
 def test_feed_more_10_to_the_end(tg, habr):
     habr_store.add_subscription(FRIEND, 'python')
     habr.items = [_item(i, score=100 - i) for i in range(1, 26)]
@@ -684,6 +706,52 @@ def test_summary_button_cached(tg, habr, llm, tmp_db, sync_spawn):
     assert len(feed.REGISTRY) == 0
 
 
+def _idea_links(db):
+    return _query(db, 'SELECT article_id, idea_id FROM idea_articles ORDER BY idea_id')
+
+
+def _edits(sent, chat_id):
+    return [s[1][0] for s in sent if s[0] == 'edit_message_text' and s[2].get('chat_id') == chat_id]
+
+
+def test_summary_on_other_users_cached_article_then_link_to_own_idea(tg, habr, llm, tmp_db, sync_spawn):
+    """Decision 20 end to end: FRIEND opens OWNER's cached row via «Саммари» and links it."""
+    article_id = _save_cached(tmp_db)                    # OWNER's row for HABR_ID
+    idea = tmp_db.create_idea('Идея', None, FRIEND)
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+    assert bot_module.MSG_LINK_SELECT_IDEAS in _texts(tg, FRIEND)
+    assert bot_module.pending_article_links[FRIEND]['article_id'] == article_id
+    assert bot_module.pending_article_links[FRIEND]['created_now'] is False
+
+    _press(FRIEND, f'toggle_link:{idea}', update_id=3)
+    _press(FRIEND, 'link_done', update_id=4)
+
+    assert _idea_links(tmp_db) == [(article_id, idea)]
+    assert _edits(tg, FRIEND) == [bot_module.MSG_LINK_DONE.format(ideas='Идея')]
+    assert FRIEND not in bot_module.pending_article_links
+    # The row is still OWNER's: linking never transfers ownership
+    assert _query(tmp_db, 'SELECT user_id FROM articles WHERE id = ?', (article_id,)) == [(OWNER,)]
+
+
+def test_link_done_without_view_row_creates_no_link(tg, habr, llm, tmp_db):
+    """Same session for FRIEND, but no «Саммари» click: no article_views row, no link."""
+    article_id = _save_cached(tmp_db)
+    idea = tmp_db.create_idea('Идея', None, FRIEND)
+    bot_module.pending_article_links[FRIEND] = {
+        'article_id': article_id, 'selected_ideas': set(), 'created_now': False,
+    }
+
+    _press(FRIEND, f'toggle_link:{idea}', update_id=3)
+    _press(FRIEND, 'link_done', update_id=4)
+
+    assert _views(tmp_db, FRIEND) == []
+    assert _idea_links(tmp_db) == []
+    assert _edits(tg, FRIEND) == [bot_module.MSG_LINK_SKIPPED]
+    assert FRIEND not in bot_module.pending_article_links
+
+
 def test_summary_button_new_generates_once_and_saves(tg, habr, llm, tmp_db, sync_spawn):
     list_id = _list_for(FRIEND)
 
@@ -705,6 +773,28 @@ def test_summary_button_unavailable_404(tg, habr, llm, tmp_db, sync_spawn):
     _press(FRIEND, f'hl:s:{list_id}:1')
 
     assert _texts(tg, FRIEND) == ['Статья недоступна на Хабре — возможно, её удалили или скрыли']
+    assert habr_store.get_habr_article(HABR_ID)['unavailable_at'] is not None
+    assert llm.calls == [] and llm.model_checks == []
+    assert len(feed.REGISTRY) == 0
+
+
+def test_summary_button_drafted_article_shows_gone_without_scrape(tg, habr, llm, tmp_db, sync_spawn, monkeypatch):
+    """QA-2, through dispatch and the real habr_api: kek 403 IN_DRAFTS -> the standard
+    'article gone' text, unavailable_at set, no page scrape / LLM."""
+    monkeypatch.setattr(habr_api, 'fetch_article', _REAL_FETCH_ARTICLE)
+    kek_urls = []
+
+    def kek(url, params=None, **kw):
+        kek_urls.append(url)
+        return KekResponse(403, IN_DRAFTS_ENVELOPE)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    assert _texts(tg, FRIEND) == [bot_module.MSG_HABR_ARTICLE_GONE]
+    assert kek_urls == [f'https://habr.com/kek/v2/articles/{HABR_ID}/']
     assert habr_store.get_habr_article(HABR_ID)['unavailable_at'] is not None
     assert llm.calls == [] and llm.model_checks == []
     assert len(feed.REGISTRY) == 0
@@ -830,7 +920,7 @@ def test_summary_worker_exception_reaches_all_and_clears_registry(tg, habr, llm,
 
 
 def test_spawn_failure_clears_registry(tg, habr, llm, monkeypatch):
-    def no_thread(fn):
+    def no_thread(fn, name):
         raise RuntimeError("can't start new thread")
     monkeypatch.setattr(bot_module, '_spawn', no_thread)
     list_id = _list_for(FRIEND)
@@ -845,23 +935,33 @@ def test_spawn_runs_daemon_thread(monkeypatch):
     started = []
 
     class FakeThread:
-        def __init__(self, target, daemon):
-            started.append((target, daemon))
+        def __init__(self, target, daemon, name):
+            started.append((target, daemon, name))
 
         def start(self):
             started.append('start')
     monkeypatch.setattr(bot_module.threading, 'Thread', FakeThread)
     job = lambda: None  # noqa: E731
 
-    bot_module._spawn(job)
+    bot_module._spawn(job, 'summary-1')
 
-    assert started == [(job, True), 'start']
+    assert started == [(job, True, 'summary-1'), 'start']
+
+
+def test_summary_thread_named_by_habr_id(tg, habr, llm, monkeypatch):
+    names = []
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: names.append(name))
+    list_id = _list_for(FRIEND)
+
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    assert names == [f'summary-{HABR_ID}']
 
 
 def test_reset_for_tests_clears_registry_used_by_bot(tg, habr, llm, captured_spawn):
     list_id = _list_for(FRIEND)
     _press(FRIEND, f'hl:s:{list_id}:1')
-    assert feed.REGISTRY.is_running(HABR_ID)
+    assert len(feed.REGISTRY) == 1                # HABR_ID in flight (job captured, not run)
     assert not [v for v in vars(bot_module).values() if isinstance(v, feed.InFlightRegistry)]
 
     feed._reset_for_tests()

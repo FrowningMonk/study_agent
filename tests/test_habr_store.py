@@ -327,11 +327,22 @@ def test_upsert_habr_article_replaces_hubs_tags_keeps_description(tmp_db):
     assert got['hubs'] == [{'alias': 'go', 'hub_type': 'collective'}]
     assert got['tags'] == ['c']
     assert got['short_description'] == 'Short text'
-    assert got['unavailable_at'] is not None
+    assert got['unavailable_at'] is None            # a successful fetch: available again (CR-1)
     assert got['published_at'] == '2026-11-03T09:00:00.000000+00:00'
     assert got['fetched_at'] is not None
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_hubs') == [(1,)]
     assert _query(tmp_db.DB_PATH, 'SELECT COUNT(*) FROM habr_article_tags') == [(1,)]
+
+
+def test_republished_article_recovers_from_unavailable(tmp_db):
+    """Drafted (marked unavailable, no metadata), then republished and fetched again."""
+    habr_store.mark_unavailable(5)
+    assert habr_store.needs_metadata_fetch(5) is False
+    habr_store.upsert_habr_articles([_item(5)])                      # e.g. seen in a list fetch
+    got = habr_store.get_habr_article(5)
+    assert got['unavailable_at'] is None and got['fetched_at'] is not None
+    habr_store.mark_unavailable(5)                                    # hidden again
+    assert habr_store.get_habr_article(5)['unavailable_at'] is not None
 
 
 def test_upsert_rejects_naive_datetime(tmp_db):
@@ -730,3 +741,15 @@ def test_functions_use_patched_db_path(tmp_db, tmp_path, monkeypatch):
     assert habr_store.get_viewed_ids(1) == {5}
     # Every connection habr_store opened went to the patched file, none to data/study_agent.db
     assert opened and set(opened) == {str(tmp_path / 'test.db')}
+
+
+def test_is_delivery_pending_reads_without_claiming(tmp_db):
+    habr_store.snapshot_recipients('2026-11-03', [1, 2])
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is True
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is True        # a read, not a claim
+    assert habr_store.claim_delivery('2026-11-03', 1) is True
+    assert habr_store.is_delivery_pending('2026-11-03', 1) is False       # 'sending'
+    habr_store.set_delivery_status('2026-11-03', 2, 'sent')
+    assert habr_store.is_delivery_pending('2026-11-03', 2) is False
+    assert habr_store.is_delivery_pending('2026-11-03', 99) is False      # no row
+    assert habr_store.is_delivery_pending('2026-11-04', 1) is False

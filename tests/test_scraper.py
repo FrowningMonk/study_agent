@@ -1,9 +1,11 @@
 import json
+import time
 
 import pytest
 import requests
 from bs4 import BeautifulSoup
 
+import habr_api as habr_api_module
 import scraper
 
 CHALLENGE_HTML = (
@@ -141,22 +143,50 @@ def test_fetch_page_fixes_default_latin1_encoding(fake_session):
 # =============================================================================
 
 
-@pytest.fixture
-def habr_api(monkeypatch, fixture_text):
+class StreamedResponse:
+    """Minimal streamed response as habr_api._request reads it."""
+
+    def __init__(self, body: str, status: int = 200, headers: dict | None = None):
+        self.status_code = status
+        self.headers = headers or {}
+        self._body = body.encode('utf-8')
+
+    def iter_content(self, chunk_size=1):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+def _kek_get(monkeypatch, respond):
+    """Fake requests.get at the network seam (habr_api shares the requests module)."""
     calls = []
 
-    def fake_get(url, headers=None, timeout=None):
-        calls.append(url)
-        return FakeResponse(fixture_text('habr_comments.json'), url)
+    def fake_get(url, params=None, headers=None, timeout=None, allow_redirects=True, stream=False):
+        calls.append({'url': url, 'params': params, 'allow_redirects': allow_redirects,
+                      'stream': stream, 'timeout': timeout})
+        result = respond(url)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
-    monkeypatch.setattr(scraper.requests, 'get', fake_get)
+    monkeypatch.setattr(habr_api_module.requests, 'get', fake_get)
     return calls
+
+
+@pytest.fixture
+def habr_api(monkeypatch, fixture_text):
+    return _kek_get(monkeypatch, lambda url: StreamedResponse(fixture_text('habr_comments.json')))
 
 
 def test_habr_comments_tree_order_numbering_and_filtering(habr_api):
     comments = scraper._fetch_habr_comments('https://habr.com/ru/companies/x/articles/846432/')
 
-    assert habr_api == [scraper.HABR_COMMENTS_API.format(article_id='846432')]
+    # One kek request through habr_api's policy: no redirects, streamed, handler-bounded
+    assert [c['url'] for c in habr_api] == ['https://habr.com/kek/v2/articles/846432/comments/']
+    assert habr_api[0]['params'] == {'fl': 'ru', 'hl': 'ru'}
+    assert habr_api[0]['allow_redirects'] is False and habr_api[0]['stream'] is True
+    assert habr_api_module._last_request_at is not None
     # DFS order: 100(#1) → 101(#2) → 102(#3, moderated) → 103(#4); 200 suspended, 300 empty
     assert [(c['number'], c['author'], c['reply_to']) for c in comments] == [
         (1, 'alice', None),
@@ -173,26 +203,79 @@ def test_habr_comments_survive_cycle_in_tree(monkeypatch):
         '1': {'id': '1', 'parentId': None, 'status': 'published', 'children': ['2'], 'message': 'a'},
         '2': {'id': '2', 'parentId': '1', 'status': 'published', 'children': ['1'], 'message': 'b'},
     }}
-    monkeypatch.setattr(scraper.requests, 'get',
-                        lambda *a, **kw: FakeResponse(json.dumps(data), 'https://habr.com'))
+    _kek_get(monkeypatch, lambda url: StreamedResponse(json.dumps(data)))
 
     comments = scraper._fetch_habr_comments('https://habr.com/ru/articles/1/')
 
     assert [c['number'] for c in comments] == [1, 2]
 
 
-def test_habr_comments_api_failure_returns_empty(monkeypatch):
-    def boom(*a, **kw):
-        raise requests.exceptions.ConnectionError('down')
-    monkeypatch.setattr(scraper.requests, 'get', boom)
+@pytest.mark.parametrize('respond', [
+    lambda url: requests.exceptions.ConnectionError('down'),
+    lambda url: requests.exceptions.ReadTimeout('slow'),
+    lambda url: StreamedResponse('', 503),
+    lambda url: StreamedResponse('', 302, {'Location': 'http://169.254.169.254/'}),
+    lambda url: StreamedResponse('x', 200, {'Content-Length': str(64 * 1024 * 1024)}),
+    lambda url: StreamedResponse('not json'),
+], ids=['network', 'timeout', 'http', 'redirect', 'too_large', 'invalid_json'])
+def test_habr_comments_api_failure_returns_empty(monkeypatch, respond):
+    calls = _kek_get(monkeypatch, respond)
 
     assert scraper._fetch_habr_comments('https://habr.com/ru/articles/1/') == []
+    assert len(calls) == 1                      # never followed a redirect / retried
+
+
+def test_habr_comments_busy_throttle_returns_empty(monkeypatch):
+    calls = _kek_get(monkeypatch, lambda url: pytest.fail('unexpected request'))
+    monkeypatch.setattr(habr_api_module, 'HANDLER_WAIT_TIMEOUT', 30)
+    monkeypatch.setattr(habr_api_module, 'HANDLER_DEADLINE', 0.1)
+    habr_api_module._lock.acquire()
+    try:
+        started = time.monotonic()
+        assert scraper._fetch_habr_comments('https://habr.com/ru/articles/1/') == []
+        assert time.monotonic() - started < 2       # the deadline, not the 30 s wait, ended it
+    finally:
+        habr_api_module._lock.release()
+    assert calls == []
+
+
+def test_habr_comments_pass_handler_wait_and_deadline(monkeypatch):
+    seen = []
+
+    def spy(habr_id, *, wait_timeout=None, deadline=None):
+        seen.append((habr_id, wait_timeout, deadline))
+        return {}
+
+    monkeypatch.setattr(habr_api_module, 'fetch_comments', spy)
+    before = time.monotonic()
+    assert scraper._fetch_habr_comments('https://habr.com/ru/articles/42/') == []
+    (habr_id, wait_timeout, deadline), = seen
+    assert habr_id == 42 and wait_timeout == habr_api_module.HANDLER_WAIT_TIMEOUT
+    assert deadline is not None
+    assert before + habr_api_module.HANDLER_DEADLINE <= deadline <= time.monotonic() + habr_api_module.HANDLER_DEADLINE
+
+
+def test_habr_comments_malformed_values_do_not_crash(monkeypatch):
+    data = {'comments': {
+        '1': {'id': '1', 'parentId': None, 'status': 'published', 'message': 'a',
+              'children': ['2', {'x': 1}, None, '9'], 'author': 'not-a-dict'},
+        '2': {'id': '2', 'parentId': '1', 'status': 'published', 'message': 42, 'children': 'zz'},
+        '3': 'garbage',
+        '4': {'id': '4', 'parentId': None, 'status': 'published', 'message': '<p>b</p>',
+              'children': None, 'author': {'alias': 'bob'}},
+    }}
+    _kek_get(monkeypatch, lambda url: StreamedResponse(json.dumps(data)))
+
+    comments = scraper._fetch_habr_comments('https://habr.com/ru/articles/1/')
+
+    assert [(c['number'], c['author'], c['text']) for c in comments] == [(1, 'аноним', 'a'), (3, 'bob', 'b')]
 
 
 def test_habr_comments_url_without_article_id_skips_request(monkeypatch):
-    monkeypatch.setattr(scraper.requests, 'get', lambda *a, **kw: pytest.fail('unexpected request'))
+    _kek_get(monkeypatch, lambda url: pytest.fail('unexpected request'))
 
     assert scraper._fetch_habr_comments('https://habr.com/ru/feed/') == []
+    assert scraper._fetch_habr_comments('https://evilhabr.com/ru/articles/1/') == []
 
 
 # =============================================================================

@@ -132,7 +132,7 @@ def _clean_description(value) -> str | None:
     """
     Accepted describe/stored value -> plain lines without control/bidi chars; else None.
     Defense in depth (summarizer validates too): a description is broadcast to every
-    recipient, so one with URLs, @mentions, /commands, > 3 lines or > 400 chars is rejected.
+    recipient, so one with URLs (also bare domains), @mentions, /commands, > 3 lines or > 400 chars is rejected.
     """
     if not isinstance(value, str):
         return None
@@ -141,7 +141,7 @@ def _clean_description(value) -> str | None:
     text = '\n'.join(lines)
     if not text or len(lines) > DESCRIPTION_MAX_LINES or len(text) > DESCRIPTION_MAX_CHARS:
         return None
-    if any(p.search(text) for p in (feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE)):
+    if feed.is_unsafe_description(text):
         return None
     return text
 
@@ -211,7 +211,8 @@ def render_empty_day(digest_date: date) -> list[tuple[str, None]]:
 
 
 def render_page(list_id: int, offset: int) -> tuple[str, feed.Rows] | None:
-    """Paging page of a persisted digest list; the last page ends with 'Это все статьи за …'."""
+    """Paging page of a persisted digest list (used by dry_run); the last page ends with
+    'Это все статьи за …'."""
     return feed.render_list_page(list_id, offset)
 
 
@@ -386,15 +387,20 @@ def _reset_for_tests() -> None:
 
 
 def digest_time() -> dtime:
-    """DIGEST_TIME (strict HH:MM, MSK), read at call time; invalid -> 18:00 + warning."""
+    """DIGEST_TIME (strict HH:MM, MSK), read at call time; invalid -> 18:00 + warning.
+
+    A time at or after SKIP_TIME is invalid too: the run would start when the day is
+    already skipped, so no digest would ever be created.
+    """
     raw = os.environ.get('DIGEST_TIME')
     if not raw:
         return DEFAULT_DIGEST_TIME
     match = _DIGEST_TIME_RE.fullmatch(raw)
-    if match is None:
+    value = dtime(int(match.group(1)), int(match.group(2))) if match else None
+    if value is None or value >= SKIP_TIME:
         logger.warning('Invalid DIGEST_TIME %r, using %s', raw[:20], DEFAULT_DIGEST_TIME.strftime('%H:%M'))
         return DEFAULT_DIGEST_TIME
-    return dtime(int(match.group(1)), int(match.group(2)))
+    return value
 
 
 def _at(day: date, moment: dtime) -> datetime:
@@ -505,14 +511,20 @@ def _send_parts(send: Send, chat_id: int, parts: list) -> str:
 # =============================================================================
 
 
-def _recipients(owner_id: int) -> list[int]:
-    """Owner + approved users, minus digest disabled (missing setting = enabled)."""
-    ids = [owner_id] + [u['user_id'] for u in database.list_users()
-                        if u.get('status') == 'approved' and u['user_id'] != owner_id]
-    return [uid for uid in ids if habr_store.get_digest_enabled(uid)]
+def _recipients(owner_id: int, is_allowed) -> list[int]:
+    """Owner + every known user that passes the injected access rule (`is_allowed`, the same
+    check re-run at send time), minus digest disabled (missing setting = enabled).
+
+    Errors propagate on purpose: a DB error (e.g. 'database is locked') aborts the tick
+    before the snapshot and the run row exist, so the next tick retries instead of
+    silently leaving the user out of today's run.
+    """
+    ids = [owner_id] + [u['user_id'] for u in database.list_users() if u['user_id'] != owner_id]
+    return [uid for uid in ids if is_allowed(uid) and habr_store.get_digest_enabled(uid)]
 
 
 def _can_receive(user_id: int, is_allowed) -> bool:
+    """Send-time re-check: a broken check never sends (fail closed)."""
     try:
         return bool(is_allowed(user_id)) and habr_store.get_digest_enabled(user_id)
     except Exception as e:  # noqa: BLE001 — a broken check never sends
@@ -555,10 +567,19 @@ def _deliver_one(run_id: str, user_id: int, articles: list[dict], day: date, des
         habr_store.set_delivery_status(run_id, user_id, 'failed')
         logger.info('Digest not delivered, access revoked or digest off: user_id=%s', user_id)
         return
+    # Cheap pre-check: a row that stopped being pending (e.g. /digest_now final) costs
+    # no build/LLM work
+    if not habr_store.is_delivery_pending(run_id, user_id):
+        return
+    # The build (LLM calls, tens of seconds) runs while the row is still 'pending': a crash
+    # or restart here leaves it pending, so it is retried; a build error is marked 'failed'
+    # by _attempt
     with _BUILD_LOCK:
         parts = build_user_digest(user_id, articles, day, describe=describe)['parts']
+    # Atomic claim right before sending (pending -> sending): never sent twice
     if not habr_store.claim_delivery(run_id, user_id):
-        return                                       # no longer pending: never sent twice
+        logger.info('Digest delivery taken while building, not sent: user_id=%s', user_id)
+        return
     outcome = _send_parts(send, user_id, parts)
     if outcome == SEND_OK:
         habr_store.set_delivery_status(run_id, user_id, 'sent')
@@ -633,7 +654,7 @@ def tick(now: datetime, *, send: Send, owner_id: int, is_allowed, describe=_USE_
             return                                   # started too late: no run, no instant skip
         # Snapshot first (INSERT OR IGNORE keeps an owner row already 'sent' by /digest_now
         # final), then the run row: a crash in between only re-snapshots on the next tick
-        recipients = _recipients(owner_id)
+        recipients = _recipients(owner_id, is_allowed)
         habr_store.snapshot_recipients(run_id, recipients)
         habr_store.create_run(run_id)
         logger.info('Digest run created: %s, recipients=%d', run_id, len(recipients))

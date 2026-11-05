@@ -1,5 +1,7 @@
+import json
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,6 +10,7 @@ import feed
 import habr_api
 import habr_store
 import hubs
+from conftest import SignallingLock
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
 
@@ -34,7 +37,7 @@ class FakeCatalog:
     def __init__(self, result=CATALOG, error=None):
         self.result, self.error, self.calls = result, error, []
 
-    def __call__(self, *, wait_timeout=None):
+    def __call__(self, *, wait_timeout=None, deadline=None):
         self.calls.append(wait_timeout)
         if self.error is not None:
             raise self.error
@@ -217,7 +220,7 @@ def test_catalog_refresh_single_flight(tmp_db, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = []
 
-    def blocking_fetch(*, wait_timeout=None):
+    def blocking_fetch(*, wait_timeout=None, deadline=None):
         calls.append(wait_timeout)
         started.set()
         assert release.wait(5)
@@ -253,13 +256,15 @@ def test_catalog_single_flight_reuses_failed_outcome(tmp_db, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = []
 
-    def blocking_fail(*, wait_timeout=None):
+    def blocking_fail(*, wait_timeout=None, deadline=None):
         calls.append(wait_timeout)
         started.set()
         assert release.wait(5)
         raise habr_api.HabrUnavailable('network')
 
     monkeypatch.setattr(habr_api, 'fetch_hub_catalog', blocking_fail)
+    lock = SignallingLock()
+    monkeypatch.setattr(hubs, '_refresh_lock', lock)
     errors = []
 
     def worker():
@@ -273,7 +278,10 @@ def test_catalog_single_flight_reuses_failed_outcome(tmp_db, monkeypatch):
     assert started.wait(5)
     threads.append(threading.Thread(target=worker))
     threads[1].start()
+    # Thread 2 read the refresh generation and now waits on the lock held by thread 1
+    assert lock.contended.wait(5)
     threads[1].join(0.2)
+    assert threads[1].is_alive() and len(calls) == 1
     release.set()
     for t in threads:
         t.join(5)
@@ -395,3 +403,74 @@ def test_reset_for_tests_clears_failure_cooldown(tmp_db, monkeypatch):
     hubs._reset_for_tests()
     hubs.ensure_catalog(NOW + timedelta(minutes=1))
     assert len(fake.calls) == 2
+
+
+# =============================================================================
+# Handler deadline (audit CA-1): one end-to-end budget per catalog refresh
+# =============================================================================
+
+
+def test_refresh_passes_one_handler_deadline(tmp_db, monkeypatch):
+    seen = []
+
+    def fetch(*, wait_timeout=None, deadline=None):
+        seen.append((wait_timeout, deadline))
+        return list(CATALOG)
+
+    monkeypatch.setattr(habr_api, 'fetch_hub_catalog', fetch)
+    before = time.monotonic()
+    hubs.ensure_catalog()
+    (wait_timeout, deadline), = seen
+    assert wait_timeout == habr_api.HANDLER_WAIT_TIMEOUT
+    assert before + habr_api.HANDLER_DEADLINE <= deadline <= time.monotonic() + habr_api.HANDLER_DEADLINE
+
+
+def test_refresh_lock_wait_bounded_by_deadline(tmp_db, monkeypatch):
+    """No stored copy, refresh lock held elsewhere: HabrBusy at the deadline, not after 30 s."""
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 0.2)
+    fake = FakeCatalog()
+    monkeypatch.setattr(habr_api, 'fetch_hub_catalog', fake)
+    hubs._refresh_lock.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(habr_api.HabrBusy):
+            hubs.ensure_catalog()
+        assert 0.15 <= time.monotonic() - started < 2
+    finally:
+        hubs._refresh_lock.release()
+    assert fake.calls == []
+
+
+def test_slow_multi_page_catalog_gives_busy_within_budget(tmp_db, monkeypatch):
+    """Real habr_api pagination against a slow-but-answering fake Habr (security finding 2)."""
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 0.4)
+    monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
+    pages_requested: list[int] = []
+
+    class SlowPage:
+        status_code = 200
+        headers: dict = {}
+
+        def __init__(self, page):
+            ids = [f'hub_{page}_{i}' for i in range(habr_api.HUBS_PER_PAGE)]
+            refs = {a: {'alias': a, 'titleHtml': a, 'statistics': {'rating': 1}} for a in ids}
+            self.body = json.dumps({'pagesCount': 5, 'hubIds': ids, 'hubRefs': refs}).encode()
+
+        def iter_content(self, chunk_size=1):
+            time.sleep(0.15)          # Habr answers, but slowly
+            yield self.body
+
+        def close(self):
+            pass
+
+    def get(url, params=None, **kwargs):
+        pages_requested.append(params['page'])
+        return SlowPage(params['page'])
+
+    monkeypatch.setattr(habr_api.requests, 'get', get)
+    started = time.monotonic()
+    with pytest.raises(habr_api.HabrBusy):
+        hubs.ensure_catalog()                 # no stored copy: HabrBusy propagates
+    assert time.monotonic() - started < 1.5
+    assert 1 <= len(pages_requested) < 5
+    assert habr_store.catalog_fetched_at() is None

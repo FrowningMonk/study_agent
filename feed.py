@@ -2,16 +2,15 @@
 Feed logic shared by `/feed` (bot) and the daily digest (`digest.py`): no Telegram code.
 
 Contents:
-    - text cleaning: URL_RE, MENTION_RE, COMMAND_RE, strip_control_bidi, html_to_text,
-      fallback_description, sanitize_title;
+    - text cleaning: URL_RE, DOMAIN_RE, MENTION_RE, COMMAND_RE, UNSAFE_TEXT_PATTERNS,
+      has_bare_domain, is_unsafe_description (strict, LLM descriptions), strip_control_bidi, html_to_text, fallback_description, sanitize_title;
     - MSK time: MSK, msk_day_bounds, msk_date, format_date_ru;
     - 24 h fetch cache: fetch_recent (5-minute reuse, handler wait mode);
     - ranking (Decision 6): select_feed, select_digest_site, select_digest_hubs;
     - ranked-list persistence: create_list, load_page;
     - rendering (Decision 7): render_page / render_list_page -> (text, rows), where rows
       are `list[list[tuple[str, str]]]` of (button text, callback data);
-    - callback codec (Decision 5): encode_summary, encode_more, decode_list_callback,
-      resolve_summary_click;
+    - callback codec (Decision 5): encode_summary, encode_more, decode_list_callback;
     - InFlightRegistry (Decision 13) and the single module instance REGISTRY;
     - view_source(list_kind) for habr_store.record_view.
 
@@ -94,11 +93,68 @@ def _now() -> datetime:
 # Text cleaning (also used by summarizer and digest; names are a contract)
 # =============================================================================
 
-URL_RE = re.compile(r'(?:https?://|www\.)\S+', re.IGNORECASE)
+# Any scheme, not only http(s): tg://, ton:// and the like open things from plain text too
+URL_RE = re.compile(r'(?:(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,20}://|www\.)\S+', re.IGNORECASE)
 # Not preceded by a word char, dot or @: e-mail addresses are not mentions
 MENTION_RE = re.compile(r'(?<![\w.@])@\w+')
 # Not preceded by a word char or slash: path parts like "a/b" are not commands
 COMMAND_RE = re.compile(r'(?<![\w/])/[A-Za-z]\w*(?:@\w+)?')
+
+# Bare domains ("evil.ru/login", "t.me/x", "bit.ly/abc"): Telegram auto-links a bare
+# domain for any real TLD, even in plain text. Two strictness levels:
+#   - DOMAIN_RE (every filter, also the lead fallback): "name.tld" followed by a path
+#     or a port, for ANY TLD-looking suffix ("evil.icu/login", "evil.dev:8080/x"); or a
+#     bare "name.tld" for _LINK_TLDS, common link TLDs that are not file extensions.
+#     Loose on purpose: author text such as "Node.js" or "README.md" stays in the lead.
+#   - has_bare_domain() (LLM descriptions only): ANY bare "name.tld" except the tech
+#     names in _TECH_SUFFIXES / _TECH_NAMES ("Node.js", "config.yaml", "ASP.NET").
+#     A false positive there only swaps the description for the cleaned lead.
+_LINK_TLDS = (
+    'ru', 'su', 'рф', 'com', 'org', 'me', 'ly', 'ua', 'by', 'kz', 'uz', 'info', 'biz',
+    'xyz', 'top', 'site', 'online', 'club', 'shop', 'store', 'live', 'link', 'click',
+    'win', 'tk', 'ml', 'ga', 'cf', 'gq', 'pw', 'ws', 'gl', 'gd', 'gg', 'cx', 'tv',
+    'fm', 'uk', 'de', 'fr', 'cn', 'us', 'eu', 'pro', 'xn--[a-z0-9-]{1,59}',
+)
+_ANY_TLD = r'(?:[a-z]{2,24}|рф|xn--[a-z0-9-]{1,59})'
+_DOMAIN_LABEL = r'[^\W_](?:[\w-]{0,61}[^\W_])?'
+_DOMAIN_TAIL = r'(?:[/:][^\s]*)?'
+_DOMAIN_START = rf'(?<![\w@.\-])(?:{_DOMAIN_LABEL}\.)+'
+_DOMAIN_END = r'(?![\w\-]|\.\w)'
+DOMAIN_RE = re.compile(
+    rf'{_DOMAIN_START}'
+    rf'(?:{_ANY_TLD}(?=/|:\d){_DOMAIN_TAIL}'
+    rf'|(?:{"|".join(_LINK_TLDS)}){_DOMAIN_END}{_DOMAIN_TAIL})',
+    re.IGNORECASE,
+)
+_BARE_DOMAIN_RE = re.compile(rf'{_DOMAIN_START}({_ANY_TLD}){_DOMAIN_END}', re.IGNORECASE)
+# File extensions / language suffixes that are NOT delegated TLDs, plus .py (no open
+# second-level registration). Real TLDs that double as extensions (md, sh, rs, io,
+# net, ai, dev, app, zip, ...) are deliberately absent: anyone can register them.
+_TECH_SUFFIXES = frozenset({
+    'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'json', 'yaml', 'yml', 'toml', 'xml', 'csv',
+    'txt', 'ini', 'cfg', 'conf', 'env', 'lock', 'log', 'sql', 'html', 'htm', 'css', 'scss',
+    'vue', 'svelte', 'java', 'kt', 'kts', 'cs', 'cpp', 'hpp', 'rb', 'php', 'swift',
+    'dart', 'lua', 'exe', 'dll', 'dylib', 'jar', 'ipynb', 'proto', 'gradle', 'py',
+})
+# Whole names that are real domains but read as product names in tech text
+_TECH_NAMES = frozenset({'asp.net', 'ado.net', 'socket.io'})
+
+# Everything a broadcast description / fallback lead must not contain
+UNSAFE_TEXT_PATTERNS = (URL_RE, DOMAIN_RE, MENTION_RE, COMMAND_RE)
+
+
+def has_bare_domain(text: str) -> bool:
+    """Strict check for LLM descriptions: any "name.tld" that is not a known tech name."""
+    for match in _BARE_DOMAIN_RE.finditer(text):
+        if match.group(1).lower() in _TECH_SUFFIXES or match.group(0).lower() in _TECH_NAMES:
+            continue
+        return True
+    return False
+
+
+def is_unsafe_description(text: str) -> bool:
+    """A broadcast description must contain no link of any form, mention or command."""
+    return any(p.search(text) for p in UNSAFE_TEXT_PATTERNS) or has_bare_domain(text)
 
 # Bidi controls: LRM, RLM, ALM, embeddings/overrides, isolates
 _BIDI_CHARS = frozenset(
@@ -168,11 +224,11 @@ def _cut_on_word(text: str, limit: int) -> str:
 def fallback_description(lead_html: str, limit: int = 250) -> str:
     """
     Short plain-text description from the raw lead HTML: control/bidi characters,
-    URLs, @mentions and /commands removed, cut to <= `limit` chars on a word boundary.
+    URLs (also bare domains), @mentions and /commands removed, cut to <= `limit` chars on a word boundary.
     Empty lead -> ''.
     """
     text = strip_control_bidi(html_to_text(lead_html))
-    for pattern in (URL_RE, MENTION_RE, COMMAND_RE):
+    for pattern in UNSAFE_TEXT_PATTERNS:
         text = pattern.sub(' ', text)
     # Removed fragments leave "word , next": glue punctuation back
     return _cut_on_word(_SPACE_BEFORE_PUNCT_RE.sub(lambda m: m.group(1), _collapse_ws(text)), limit)
@@ -232,21 +288,25 @@ def fetch_recent(now: datetime | None = None) -> list[dict]:
     Normalized items of the last 24 h for `/feed`. A fetch younger than
     FETCH_CACHE_TTL is reused; otherwise habr_api.fetch_articles_since is called in
     handler mode and the metadata (with hubs and tags) is upserted.
-    Single-flight: concurrent callers wait for the running fetch (bounded by
-    HANDLER_WAIT_TIMEOUT, then HabrBusy). HabrBusy / HabrUnavailable propagate.
+    Single-flight: concurrent callers wait for the running fetch. One handler deadline
+    (habr_api.HANDLER_DEADLINE) bounds the whole call: this wait (also capped by
+    HANDLER_WAIT_TIMEOUT) plus every page of the fetch; then HabrBusy.
+    HabrBusy / HabrUnavailable propagate.
     """
     global _cache
     now = now or _now()
     cached = _fresh_cache(now)
     if cached is not None:
         return cached
-    if not _cache_lock.acquire(timeout=habr_api.HANDLER_WAIT_TIMEOUT):
+    deadline = habr_api.handler_deadline()
+    if not _cache_lock.acquire(timeout=habr_api.wait_budget(habr_api.HANDLER_WAIT_TIMEOUT, deadline)):
         raise habr_api.HabrBusy('feed fetch is already running')
     try:
         cached = _fresh_cache(now)
         if cached is not None:
             return cached
-        items = habr_api.fetch_articles_since(now - FEED_WINDOW, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT)
+        items = habr_api.fetch_articles_since(now - FEED_WINDOW, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                              deadline=deadline)
         # The network call is finished: only now is a DB transaction opened
         habr_store.upsert_habr_articles(items)
         _cache = (now, items)
@@ -556,16 +616,6 @@ def decode_list_callback(data: Any, user_id: int, now: datetime | None = None) -
     return ListCallback(action, list_id, value, kind, header['list_date'], total, habr_id)
 
 
-def resolve_summary_click(data: Any, user_id: int, now: datetime | None = None) -> ListCallback | None:
-    """Valid `hl:s` click (with habr_id) or None (stale, or not a summary click)."""
-    result = decode_list_callback(data, user_id, now)
-    if result is None or result.action != 's':
-        if result is not None:
-            _stale(user_id, data, 'not a summary click')
-        return None
-    return result
-
-
 # =============================================================================
 # In-flight summary registry (Decision 13)
 # =============================================================================
@@ -634,10 +684,6 @@ class InFlightRegistry:
         finally:
             waiters = self.finish(habr_id)
         return GenerationOutcome(result, error, waiters)
-
-    def is_running(self, habr_id: int) -> bool:
-        with self._lock:
-            return habr_id in self._entries
 
     def clear(self) -> None:
         with self._lock:

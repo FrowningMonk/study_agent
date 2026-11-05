@@ -2,6 +2,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,7 @@ import feed
 import habr_api
 import habr_store
 import hubs
+from conftest import SignallingLock
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
 DAY = date(2026, 11, 3)          # digest day D (MSK)
@@ -213,14 +215,14 @@ def test_render_feed_empty_states(tmp_db, monkeypatch):
 
     habr_store.add_subscription(1, 'python')
     monkeypatch.setattr(habr_api, 'fetch_articles_since',
-                        lambda since, *, wait_timeout=None: [item(1, hubs_=[('rust', 'collective')])])
+                        lambda since, *, wait_timeout=None, deadline=None: [item(1, hubs_=[('rust', 'collective')])])
     assert feed.build_feed(1, NOW) == ('За последние сутки в твоих хабах ничего нового', [])
 
 
 def test_build_feed_persists_list_and_renders_first_page(tmp_db, monkeypatch):
     habr_store.add_subscription(1, 'python')
     fetched = [item(i, NOW - timedelta(minutes=i), score=100 - i) for i in range(1, 13)]
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', lambda since, *, wait_timeout=None: fetched)
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', lambda since, *, wait_timeout=None, deadline=None: fetched)
     text, rows = feed.build_feed(1, NOW)
     assert len(text.split('\n')) == 10
     assert rows[-1][0][0] == 'Ещё 10 ▶'
@@ -346,10 +348,11 @@ def test_callback_out_of_range_rejected(tmp_db):
 
 def test_callback_valid_summary_returns_habr_id(tmp_db):
     list_id = _make_list(n=12)
-    click = feed.resolve_summary_click(f'hl:s:{list_id}:12', 1)
-    assert click.habr_id == 1012 and click.kind == 'feed'
-    assert feed.resolve_summary_click(f'hl:m:{list_id}:10', 1) is None
-    assert feed.resolve_summary_click('hl:s:x:1', 1) is None
+    click = feed.decode_list_callback(f'hl:s:{list_id}:12', 1)
+    assert click.action == 's' and click.habr_id == 1012 and click.kind == 'feed'
+    more = feed.decode_list_callback(f'hl:m:{list_id}:10', 1)
+    assert more.action == 'm' and more.habr_id is None
+    assert feed.decode_list_callback('hl:s:x:1', 1) is None
 
 
 def test_callback_data_max_64_bytes():
@@ -417,7 +420,7 @@ def test_callback_never_calls_habr_or_llm(tmp_db, monkeypatch):
     list_id = _make_list(n=25)
     assert feed.decode_list_callback('hl:s:١:1', 1) is None
     assert feed.decode_list_callback(f'hl:s:{list_id}:3', 2) is None
-    assert feed.resolve_summary_click(f'hl:s:{list_id}:3', 1).habr_id == 1003
+    assert feed.decode_list_callback(f'hl:s:{list_id}:3', 1).habr_id == 1003
     assert feed.decode_list_callback(f'hl:m:{list_id}:10', 1) is not None
     assert feed.render_list_page(list_id, 10) is not None
 
@@ -431,7 +434,7 @@ class FakeList:
     def __init__(self, items=None, error=None):
         self.items, self.error, self.calls = items or [item(1)], error, []
 
-    def __call__(self, since, *, wait_timeout=None):
+    def __call__(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append((since, wait_timeout))
         if self.error is not None:
             raise self.error
@@ -466,19 +469,25 @@ def test_feed_fetch_cache_concurrent_single_fetch(tmp_db, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = []
 
-    def blocking(since, *, wait_timeout=None):
+    def blocking(since, *, wait_timeout=None, deadline=None):
         calls.append(since)
         started.set()
         assert release.wait(5)
         return [item(1)]
 
     monkeypatch.setattr(habr_api, 'fetch_articles_since', blocking)
+    lock = SignallingLock()
+    monkeypatch.setattr(feed, '_cache_lock', lock)
     results = []
     threads = [threading.Thread(target=lambda: results.append(ids(feed.fetch_recent(NOW)))) for _ in range(2)]
     threads[0].start()
     assert started.wait(5)
     threads[1].start()
+    # Thread 2 passed the first cache check while the cache was still empty and is now
+    # waiting on the single-flight lock: only the re-check under the lock saves a fetch
+    assert lock.contended.wait(5)
     threads[1].join(0.2)
+    assert threads[1].is_alive() and len(calls) == 1
     release.set()
     for t in threads:
         t.join(5)
@@ -561,7 +570,7 @@ def test_registry_same_user_second_click_one_generation():
     assert not thread.is_alive()
     assert calls == [1]
     assert out['outcome'] == feed.GenerationOutcome('summary', None, set())
-    assert not registry.is_running(5)
+    assert len(registry) == 0
 
 
 def test_registry_other_user_becomes_waiter():
@@ -584,7 +593,7 @@ def test_registry_other_user_becomes_waiter():
     thread.join(5)
     assert out['outcome'].waiters == {200}
     assert out['outcome'].result == 'summary'
-    assert not registry.is_running(5) and len(registry) == 0
+    assert len(registry) == 0
     assert registry.finish(5) == set()
 
 
@@ -599,7 +608,7 @@ def test_registry_cleared_after_exception():
 
     outcome = registry.run(5, failing)
     assert outcome.error is error and outcome.result is None and outcome.waiters == {200}
-    assert not registry.is_running(5)
+    assert len(registry) == 0
     assert registry.click(5, 100).kind == feed.CLICK_STARTED
 
 
@@ -612,7 +621,7 @@ def test_registry_cleared_after_base_exception():
 
     with pytest.raises(KeyboardInterrupt):
         registry.run(5, interrupted)
-    assert not registry.is_running(5)
+    assert len(registry) == 0
 
 
 def test_registry_distinct_habr_ids_independent():
@@ -621,7 +630,7 @@ def test_registry_distinct_habr_ids_independent():
     assert registry.click(2, 100).kind == feed.CLICK_STARTED
     assert registry.click(2, 200).kind == feed.CLICK_WAITER
     assert registry.finish(1) == set()
-    assert registry.is_running(2) and not registry.is_running(1)
+    assert len(registry) == 1                     # only habr_id 2 is still in flight
     assert registry.finish(2) == {200}
 
 
@@ -631,7 +640,7 @@ def test_module_registry_is_single_instance():
     registry.click(9, 1)
     feed._reset_for_tests()
     assert feed.REGISTRY is registry
-    assert not registry.is_running(9)
+    assert len(registry) == 0
 
 
 # =============================================================================
@@ -649,6 +658,91 @@ def test_url_mention_command_patterns():
         assert not feed.URL_RE.search(plain), plain
         assert not feed.MENTION_RE.search(plain), plain
         assert not feed.COMMAND_RE.search(plain), plain
+
+
+@pytest.mark.parametrize('text, found', [
+    ('Перейдите на evil.ru/login и введите пароль', 'evil.ru/login'),
+    ('Смотрите t.me/scam', 't.me/scam'),
+    ('см. bit.ly/abc', 'bit.ly/abc'),
+    ('Сайт example.com, заходите', 'example.com'),
+    ('Пишите на sub.domain.org.', 'sub.domain.org'),
+    ('ссылка: EVIL.RU/Login', 'EVIL.RU/Login'),
+    ('домен сайт.рф/путь', 'сайт.рф/путь'),
+    ('punycode xn--80ak6aa92e.xn--p1ai тоже', 'xn--80ak6aa92e.xn--p1ai'),
+    # Any TLD-looking suffix counts when a path or a port follows
+    ('Код на evil.io/x', 'evil.io/x'),
+    ('Скачать: evil.net/payload', 'evil.net/payload'),
+    ('порт evil.dev:8080/x', 'evil.dev:8080/x'),
+    ('Войти: evil.icu/login', 'evil.icu/login'),
+    ('см. evil.vip/x', 'evil.vip/x'),
+    ('см. evil.space/x', 'evil.space/x'),
+    ('см. evil.page/x', 'evil.page/x'),
+])
+def test_domain_pattern_finds_bare_domains(text, found):
+    assert feed.DOMAIN_RE.search(text).group() == found
+
+
+@pytest.mark.parametrize('text', [
+    'Node.js и Vue.js против Next.js',
+    'Правим config.yaml и package.json',
+    'Миграция на ASP.NET Core',
+    'Запусти main.py и setup.py', 'README.md', 'deploy.sh', 'src/main.rs', 'libfoo.so',
+    'Python 3.12 и v1.2.3', 'Spring.io без ссылки', 'кластер на k8s.io',
+    'mail me at user@example.com', 'т.е. и т.д.', 'e.g. i.e.', 'U.S.A.',
+    'файл config.com.yaml',
+    'plain words only',
+])
+def test_domain_pattern_ignores_tech_names(text):
+    assert not feed.DOMAIN_RE.search(text), text
+
+
+@pytest.mark.parametrize('text', [
+    'tg://resolve?domain=x', 'открой ton://x', 'ftp://host/file', 'https://x.y/a', 'www.example.com',
+])
+def test_url_pattern_any_scheme(text):
+    assert feed.URL_RE.search(text)
+    assert feed.is_unsafe_description(text)
+
+
+@pytest.mark.parametrize('text', [
+    'evil.tg', 'evil.cloud', 'evil.io', 'evil.ai', 'evil.dev', 'evil.app', 'evil.net', 'evil.co',
+    'evil.md', 'evil.zip', 'evil.website', 'Заходи на evil.lol сегодня', 'sub.evil.asia.',
+])
+def test_strict_description_check_rejects_any_bare_domain(text):
+    assert feed.has_bare_domain(text), text
+    assert feed.is_unsafe_description(text), text
+
+
+@pytest.mark.parametrize('text', [
+    'Автор переводит Node.js и ASP.NET на config.yaml.',
+    'Сравнение Vue.js, package.json, main.py и socket.io.',
+    'ADO.NET, tsconfig.json, App.tsx, Main.java, settings.toml',
+    'Python 3.12, v1.2.3, т.е., e.g. и U.S.A.',
+    'Пишет на team@example.com, код в src/app.',
+])
+def test_strict_description_check_keeps_tech_names(text):
+    assert not feed.has_bare_domain(text), text
+    assert not feed.is_unsafe_description(text), text
+
+
+def test_lead_fallback_keeps_bare_tech_names_but_cuts_paths():
+    out = feed.fallback_description(
+        '<p>Node.js, README.md и main.py; ссылка evil.icu/login и tg://resolve?domain=x.</p>')
+    assert 'Node.js' in out and 'README.md' in out and 'main.py' in out
+    for bad in ('evil.icu', '/login', 'tg://', 'resolve'):
+        assert bad not in out
+
+
+def test_unsafe_text_patterns_include_bare_domains():
+    assert feed.DOMAIN_RE in feed.UNSAFE_TEXT_PATTERNS
+    assert {feed.URL_RE, feed.MENTION_RE, feed.COMMAND_RE} <= set(feed.UNSAFE_TEXT_PATTERNS)
+
+
+def test_fallback_description_strips_bare_domains():
+    out = feed.fallback_description('<p>Идите на evil.ru/login, t.me/scam и bit.ly/abc. Node.js рулит.</p>')
+    for bad in ('evil.ru', 't.me', 'bit.ly', '/login', '/scam', '/abc'):
+        assert bad not in out
+    assert 'Node.js рулит.' in out
 
 
 def test_strip_control_bidi():
@@ -695,3 +789,38 @@ def test_html_to_text_inline_and_script():
     assert feed.html_to_text('<p><b>Py</b>thon and <i>Ru</i>st</p>') == 'Python and Rust'
     assert feed.html_to_text('<p>one</p><p>two</p>line<br>break') == 'one two line break'
     assert feed.html_to_text('<script>alert(1)</script><style>p{}</style><p>text</p>') == 'text'
+
+
+# =============================================================================
+# Handler deadline (audit CA-1): one end-to-end budget per /feed fetch
+# =============================================================================
+
+
+def test_feed_fetch_passes_one_handler_deadline(tmp_db, monkeypatch):
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 45)
+    seen = []
+
+    def fetch(since, *, wait_timeout=None, deadline=None):
+        seen.append((wait_timeout, deadline))
+        return [item(1)]
+
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', fetch)
+    before = time.monotonic()
+    feed.fetch_recent(NOW)
+    (wait_timeout, deadline), = seen
+    assert wait_timeout == habr_api.HANDLER_WAIT_TIMEOUT
+    assert before + 45 <= deadline <= time.monotonic() + 45
+
+
+def test_feed_cache_lock_wait_bounded_by_deadline(tmp_db, monkeypatch):
+    """The single-flight wait counts against the same deadline as the fetch."""
+    monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 0.2)
+    monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList())
+    feed._cache_lock.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(habr_api.HabrBusy):
+            feed.fetch_recent(NOW)
+        assert 0.15 <= time.monotonic() - started < 2       # not HANDLER_WAIT_TIMEOUT (30 s)
+    finally:
+        feed._cache_lock.release()

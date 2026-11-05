@@ -256,7 +256,8 @@ def get_viewed_ids(user_id: int) -> set[int]:
 
 def _write_article(conn: sqlite3.Connection, item: dict, fetched_at: str) -> None:
     habr_id = item['habr_id']
-    # short_description and unavailable_at are deliberately not in the UPDATE set
+    # A successful fetch proves the article is available again (e.g. moved back from
+    # drafts): unavailable_at is cleared. short_description is deliberately kept.
     conn.execute(
         """
         INSERT INTO habr_articles (
@@ -269,7 +270,8 @@ def _write_article(conn: sqlite3.Connection, item: dict, fetched_at: str) -> Non
             score = excluded.score,
             comments_count = excluded.comments_count,
             lead_text = excluded.lead_text,
-            fetched_at = excluded.fetched_at
+            fetched_at = excluded.fetched_at,
+            unavailable_at = NULL
         """,
         (
             habr_id,
@@ -298,8 +300,8 @@ def upsert_habr_articles(items: Iterable[dict]) -> None:
     """
     Upserts normalized habr_api items (habr_id, title, url, published_at, score,
     comments, hubs [(alias, type)], tags, lead_text) in one transaction.
-    Hub and tag sets of each habr_id are replaced; short_description and
-    unavailable_at are kept.
+    Hub and tag sets of each habr_id are replaced; short_description is kept and
+    unavailable_at is cleared (the items come from a successful fetch).
     """
     fetched_at = _now()
     conn = database._get_connection()
@@ -364,6 +366,45 @@ def mark_unavailable(habr_id: int) -> None:
                 """,
                 (habr_id, _now()),
             )
+    finally:
+        conn.close()
+
+
+def needs_metadata_fetch(habr_id: int) -> bool:
+    """True if the article has neither `fetched_at` nor `unavailable_at` (or no row at all)."""
+    conn = database._get_connection()
+    try:
+        row = conn.execute(
+            'SELECT 1 FROM habr_articles WHERE habr_id = ? '
+            'AND (fetched_at IS NOT NULL OR unavailable_at IS NOT NULL)',
+            (habr_id,),
+        ).fetchone()
+        return row is None
+    finally:
+        conn.close()
+
+
+def list_backfill_candidates() -> list[int]:
+    """
+    Distinct `articles.habr_id` values (NULLs skipped) whose metadata has neither
+    `fetched_at` nor `unavailable_at`, ascending. Duplicate article rows give one id
+    and are never modified (Decision 18).
+    """
+    conn = database._get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT a.habr_id FROM articles a
+            WHERE a.habr_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM habr_articles h
+                  WHERE h.habr_id = a.habr_id
+                    AND (h.fetched_at IS NOT NULL OR h.unavailable_at IS NOT NULL)
+              )
+            ORDER BY a.habr_id
+            """
+        )
+        return [r[0] for r in rows]
     finally:
         conn.close()
 
@@ -695,6 +736,19 @@ def list_deliveries(run_id: str, status: str | None = None) -> list[dict]:
                 (run_id, status),
             )
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def is_delivery_pending(digest_date: str, user_id: int) -> bool:
+    """Cheap read: is the delivery row still 'pending'? (Not a claim: see claim_delivery.)"""
+    conn = database._get_connection()
+    try:
+        row = conn.execute(
+            'SELECT 1 FROM digest_deliveries WHERE digest_date = ? AND user_id = ? AND status = ?',
+            (digest_date, user_id, 'pending'),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

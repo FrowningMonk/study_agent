@@ -240,35 +240,31 @@ def _extract_habr_content(soup: BeautifulSoup) -> str:
     return _truncate_content(content)
 
 
-_HABR_ARTICLE_ID_RE = re.compile(r'/(?:articles|news|post)/(\d+)')
-HABR_COMMENTS_API: str = 'https://habr.com/kek/v2/articles/{article_id}/comments/?fl=ru&hl=ru'
-
-
 def _fetch_habr_comments(url: str) -> list[dict]:
     """
     Загружает комментарии статьи через JSON API Хабра (тот же, что использует сайт).
+    Запрос идёт через habr_api.fetch_comments: общий троттлинг, без редиректов,
+    лимит размера ответа. Ожидание ограничено handler-дедлайном: скрапер вызывается
+    и из обработчиков, а комментарии необязательны.
 
     Returns:
         Комментарии в порядке дерева обсуждения (формат — см. _make_comment).
         Пустой список, если комментариев нет или API недоступен.
     """
-    match = _HABR_ARTICLE_ID_RE.search(url)
-    if not match:
+    # Lazy import: habr_api imports USER_AGENT from this module
+    import habr_api
+
+    habr_id = habr_api.parse_article_id(url)
+    if habr_id is None:
         return []
 
     try:
-        response = requests.get(
-            HABR_COMMENTS_API.format(article_id=match.group(1)),
-            headers={'User-Agent': USER_AGENT},
-            timeout=TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        logger.warning('Habr comments fetch failed: url=%s, error=%s', url, e)
+        raw = habr_api.fetch_comments(habr_id, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                      deadline=habr_api.handler_deadline())
+    except (habr_api.HabrUnavailable, habr_api.HabrBusy):
+        # Already logged by habr_api (type/kind/status only; INFO for an oversized tree)
         return []
 
-    raw = data.get('comments') or {}
     roots = [cid for cid, c in raw.items() if not c.get('parentId')]
 
     # Обход дерева в глубину: порядок как на странице
@@ -282,19 +278,24 @@ def _fetch_habr_comments(url: str) -> list[dict]:
             continue
         visited.add(cid)
         ordered.append((cid, c))
-        stack.extend(reversed(c.get('children') or []))
+        children = c.get('children')
+        # Only string ids are followed: a malformed children list never breaks the walk
+        if isinstance(children, list):
+            stack.extend(reversed([child for child in children if isinstance(child, str)]))
 
     number_by_id = {cid: i for i, (cid, _) in enumerate(ordered, 1)}
     comments = []
     for cid, c in ordered:
         if c.get('status') != 'published' or c.get('isSuspended'):
             continue
-        text = BeautifulSoup(c.get('message') or '', 'html.parser').get_text(' ', strip=True)
+        message = c.get('message')
+        text = BeautifulSoup(message, 'html.parser').get_text(' ', strip=True) if isinstance(message, str) else ''
         if not text:
             continue
+        author = c.get('author')
         comments.append(_make_comment(
             number=number_by_id[cid],
-            author=(c.get('author') or {}).get('alias') or 'аноним',
+            author=(author.get('alias') if isinstance(author, dict) else None) or 'аноним',
             text=text,
             reply_to=number_by_id.get(c.get('parentId')),
             is_post_author=bool(c.get('isPostAuthor')),

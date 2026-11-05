@@ -7,17 +7,23 @@ Bot tests run through real telebot dispatch (`tg`); `process_article` and
 autouse guard in conftest.
 """
 
+import logging
 import sqlite3
+import time
+from datetime import date, datetime, timezone
 
 import pytest
 
 import bot as bot_module
+import feed
+import habr_api
 import habr_store
 import pipeline
-from conftest import FRIEND, _buttons, _callback_update, _message_update, _sent_to
+from conftest import IN_DRAFTS_ENVELOPE, KekResponse, FRIEND, _buttons, _callback_update, _message_update, _sent_to
 
 OWNER = bot_module.OWNER_ID
 CANONICAL_123 = 'https://habr.com/ru/articles/123/'
+_REAL_FETCH_ARTICLE = habr_api.fetch_article     # saved before the autouse `kek` fixture patches it
 
 
 def _query(db, sql, params=()):
@@ -77,6 +83,38 @@ def fake(monkeypatch):
     monkeypatch.setattr(bot_module, 'check_model_availability', check)
     process.model_checks = model_checks
     return process
+
+
+class FakeKek:
+    """Stand-in for habr_api.fetch_article: records calls and how many bot calls preceded each."""
+
+    def __init__(self, sent, error=None):
+        self.sent = sent
+        self.error = error
+        self.calls: list[tuple[int, object, int]] = []
+        self.deadlines: list[object] = []
+
+    def __call__(self, habr_id, *, wait_timeout=None, deadline=None):
+        self.calls.append((habr_id, wait_timeout, len(self.sent)))
+        self.deadlines.append(deadline)
+        if self.error is not None:
+            raise self.error
+        return {
+            'habr_id': habr_id, 'title': 'T', 'url': habr_api.canonical_url(habr_id),
+            'published_at': datetime(2026, 1, 1, tzinfo=timezone.utc), 'score': 1, 'comments': 0,
+            'hubs': [('python', 'collective'), ('bitrix', 'corporative')], 'tags': ['tag1'],
+            'lead_text': '', 'post_type': 'article',
+        }
+
+
+@pytest.fixture(autouse=True)
+def kek(request, monkeypatch):
+    """Default kek fake for every test here: handle_url fetches hubs/tags after the summary,
+    so older link tests take the explicit success path instead of the network blocker."""
+    sent = request.getfixturevalue('tg') if 'tg' in request.fixturenames else []
+    fake_kek = FakeKek(sent)
+    monkeypatch.setattr(habr_api, 'fetch_article', fake_kek)
+    return fake_kek
 
 
 def _send(user_id, text, update_id=1):
@@ -274,16 +312,26 @@ def test_text_with_url_still_handled(tg, tmp_db, fake):
 # --- "Не привязывать" (Decision 20) --------------------------------------------
 
 
-def test_link_skip_keeps_row_created_by_other_user(tg, tmp_db, fake):
+def test_link_skip_keeps_row_created_by_other_user(tg, tmp_db, fake, kek, monkeypatch):
+    """Through dispatch: FRIEND's «Саммари» on OWNER's cached row, then «Не привязывать»."""
     article_id = _save_habr(tmp_db, CANONICAL_123, 123, user_id=OWNER)
     tmp_db.create_idea('Idea', None, FRIEND)
-    bot_module._summarize_for_user(FRIEND, FRIEND, 123, 'feed')
-    assert bot_module.pending_article_links[FRIEND]['created_now'] is False
+    habr_store.upsert_habr_article(kek(123))
+    kek.calls.clear()
+    list_id = feed.create_list(FRIEND, 'feed', date(2026, 11, 4), [123])
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())     # worker runs inline
 
-    _press(FRIEND, f'link_skip:{article_id}')
+    _press(FRIEND, f'hl:s:{list_id}:1')
+
+    session = bot_module.pending_article_links[FRIEND]
+    assert session['article_id'] == article_id and session['created_now'] is False
+    assert fake.calls == []                                # cached: no new generation
+
+    _press(FRIEND, f'link_skip:{article_id}', update_id=3)
 
     assert tmp_db.get_article_by_id(article_id) is not None
     assert FRIEND not in bot_module.pending_article_links
+    assert any(s[0] == 'edit_message_text' and s[1][0] == bot_module.MSG_LINK_SKIPPED for s in tg)
 
 
 def test_link_skip_deletes_own_newly_created_row(tg, tmp_db, fake):
@@ -544,3 +592,101 @@ def test_is_article_linked_to_other_users_idea(tmp_db):
     tmp_db.link_article_to_idea(article_id, own, FRIEND)
     assert tmp_db.is_article_linked_to_other_users_idea(article_id, FRIEND) is False
     assert tmp_db.is_article_linked_to_other_users_idea(article_id, OWNER) is True
+
+
+# --- hubs/tags for linked articles (Task 14) -----------------------------------
+
+
+def test_link_flow_drafted_article_marked_unavailable(tg, tmp_db, fake, monkeypatch):
+    """QA-1 in the link flow: the summary is delivered as usual, then the hubs/tags fetch
+    gets 403 IN_DRAFTS (real habr_api) and marks the article unavailable, silently."""
+    monkeypatch.setattr(habr_api, 'fetch_article', _REAL_FETCH_ARTICLE)
+    kek_urls = []
+
+    def kek(url, **kw):
+        kek_urls.append(url)
+        return KekResponse(403, IN_DRAFTS_ENVELOPE)
+
+    monkeypatch.setattr(habr_api.requests, 'get', kek)
+    tmp_db.create_idea('Idea', None, FRIEND)
+
+    _send(FRIEND, 'https://habr.com/ru/articles/88/')
+
+    assert kek_urls == ['https://habr.com/kek/v2/articles/88/']     # one canonical request
+
+    texts = [s[1][1] for s in _sent_to(tg, FRIEND)]
+    assert any('NEW SUMMARY' in t for t in texts)
+    assert bot_module.MSG_HABR_ARTICLE_GONE not in texts
+    assert habr_store.get_habr_article(88)['unavailable_at'] is not None
+    assert habr_store.needs_metadata_fetch(88) is False      # never requested again
+
+
+def test_link_flow_stores_hubs_tags_for_new_article(tg, tmp_db, fake, kek):
+    _send(FRIEND, 'https://habr.com/ru/companies/x/articles/77/?utm_source=tg')
+
+    assert [(c[0], c[1]) for c in kek.calls] == [(77, habr_api.HANDLER_WAIT_TIMEOUT)]
+    # Handler mode: one end-to-end deadline (audit CA-1)
+    assert kek.deadlines[0] is not None and kek.deadlines[0] <= time.monotonic() + habr_api.HANDLER_DEADLINE
+    meta = habr_store.get_habr_article(77)
+    assert meta['fetched_at'] is not None
+    assert meta['hubs'] == [{'alias': 'bitrix', 'hub_type': 'corporative'},
+                            {'alias': 'python', 'hub_type': 'collective'}]
+    assert meta['tags'] == ['tag1']
+
+
+def test_link_flow_summary_sent_before_kek_fetch(tg, tmp_db, fake, kek):
+    tmp_db.create_idea('Idea', None, FRIEND)
+    kek.error = RuntimeError('kek exploded')
+
+    _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    texts = _texts(tg, FRIEND)
+    assert texts[-2].startswith('Готово!') and texts[-1] == bot_module.MSG_LINK_SELECT_IDEAS
+    # The kek call starts only after every bot message of the flow was sent
+    ((_, _, sent_before),) = kek.calls
+    assert sent_before == len(tg)
+    assert habr_store.get_habr_article(77) is None
+
+
+@pytest.mark.parametrize('error', [
+    habr_api.HabrUnavailable('http', 503),
+    habr_api.HabrBusy('busy'),
+    habr_api.HabrNotFound('NOT_FOUND'),
+    ValueError('boom'),
+], ids=['unavailable', 'busy', 'not_found', 'generic'])
+def test_link_flow_kek_errors_logged_not_shown(tg, tmp_db, fake, kek, caplog, error):
+    tmp_db.create_idea('Idea', None, FRIEND)
+    kek.error = error
+
+    with caplog.at_level(logging.WARNING, logger='bot'):
+        _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    texts = _texts(tg, FRIEND)
+    assert texts == [bot_module.MSG_PROCESSING, texts[1], bot_module.MSG_LINK_SELECT_IDEAS]
+    assert texts[1].startswith('Готово!')
+    assert [s[0] for s in tg if s[0] in ('reply_to', 'edit_message_text')] == []
+    assert any(r.name == 'bot' and r.levelno >= logging.WARNING and '77' in r.getMessage()
+               for r in caplog.records)
+    if isinstance(error, habr_api.HabrNotFound):
+        assert habr_store.get_habr_article(77)['unavailable_at'] is not None
+
+
+@pytest.mark.parametrize('state', ['fetched', 'unavailable'])
+def test_link_flow_skips_fetch_when_already_fetched(tg, tmp_db, fake, kek, state):
+    if state == 'fetched':
+        habr_store.upsert_habr_article(kek(77))
+        kek.calls.clear()
+    else:
+        habr_store.mark_unavailable(77)
+
+    _send(FRIEND, 'https://habr.com/ru/articles/77/')
+
+    assert any(t.startswith('Готово!') for t in _texts(tg, FRIEND))
+    assert kek.calls == []
+
+
+def test_link_flow_non_habr_link_makes_no_kek_call(tg, tmp_db, fake, kek):
+    _send(FRIEND, 'https://github.com/a/b')
+
+    assert any(t.startswith('Готово!') for t in _texts(tg, FRIEND))
+    assert kek.calls == []

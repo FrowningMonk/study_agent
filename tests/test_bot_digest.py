@@ -10,16 +10,19 @@ and no LLM call is ever made.
 """
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
+import access
 import bot as bot_module
 import digest
 import feed
 import habr_api
+import habr_backfill
 import habr_store
 import summarizer
 from conftest import FRIEND, STRANGER, _callback_update, _message_update
@@ -41,17 +44,17 @@ class FakeHabr:
         self.list_error: Exception | None = None
         self.calls: list[tuple] = []
 
-    def fetch_articles_since(self, since, *, wait_timeout=None):
+    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
         self.calls.append(('list', since))
         if self.list_error:
             raise self.list_error
         return list(self.items)
 
-    def fetch_article(self, habr_id, *, wait_timeout=None):
+    def fetch_article(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append(('article', habr_id))
         return next(i for i in self.items if i['habr_id'] == habr_id)
 
-    def fetch_hub_catalog(self, *, wait_timeout=None):
+    def fetch_hub_catalog(self, *, wait_timeout=None, deadline=None):
         self.calls.append(('catalog',))
         return []
 
@@ -148,7 +151,7 @@ def sync_spawn(monkeypatch):
         calls.append(fn)
         fn()
     monkeypatch.setattr(digest, '_spawn', spawn)
-    monkeypatch.setattr(bot_module, '_spawn', lambda fn: fn())
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: fn())
     return calls
 
 
@@ -351,6 +354,22 @@ def test_digest_now_owner_runs_in_spawn(tg, tmp_db, habr, jobs, describe, now):
     assert describe.calls                       # the injected fake, not the real LLM
 
 
+def test_digest_part_sends_cleaned_fallback_lead(tg, tmp_db, habr, sync_spawn, now, monkeypatch):
+    """The text actually sent: no-describe fallback lead without links, mentions, commands."""
+    monkeypatch.setattr(digest, '_DEFAULT_DESCRIBE', lambda title, lead: None)   # LLM gives nothing
+    habr.fill(digest.digest_day(now), site=1)
+    habr.items[0]['lead_text'] = ('<p>см. https://evil.example/x и evil.ru/login, пиши @admin, '
+                                  'жми /start ' + chr(0x202E) + 'текст анонса</p>')
+
+    _send(OWNER, '/digest_now')
+
+    ((text, _),) = _digest_parts(tg)
+    for bad in ('http', 'evil', '@admin', '/start', chr(0x202E)):
+        assert bad not in text, bad
+    assert 'текст анонса' in text
+    assert habr_store.get_habr_article(100)['short_description'] is None
+
+
 def test_digest_now_does_not_touch_run_rows(tg, tmp_db, habr, sync_spawn, now):
     habr.fill(digest.digest_day(now))
 
@@ -459,7 +478,7 @@ def test_digest_now_after_revoked_user_settings_inert(tg, tmp_db, habr, sync_spa
 
     assert _settings(tmp_db, FRIEND) == (0, None)
     assert bot_module.is_allowed(FRIEND) is False
-    assert FRIEND not in digest._recipients(OWNER)
+    assert FRIEND not in digest._recipients(OWNER, bot_module.is_allowed)
     assert _replies(tg, FRIEND) == []
     assert [d['user_id'] for d in habr_store.list_deliveries(now.date().isoformat())] == [OWNER]
 
@@ -594,7 +613,7 @@ def main_env(tg, tmp_db, monkeypatch):
     monkeypatch.setattr(bot_module, 'ensure_directories', lambda: None)
     monkeypatch.setattr(bot_module, 'check_providers_status', lambda: {})
     monkeypatch.setattr(bot_module, 'check_model_availability', lambda model, provider: (True, ''))
-    monkeypatch.setattr(bot_module, '_spawn', calls['bot_spawn'].append)
+    monkeypatch.setattr(bot_module, '_spawn', lambda fn, name: calls['bot_spawn'].append((fn, name)))
 
     def polling(*a, **kw):
         calls['polling'] += 1
@@ -611,8 +630,12 @@ def test_main_starts_scheduler_thread(main_env, tg, monkeypatch, caplog):
         bot_module.main()
 
     assert main_env['polling'] == 1
-    assert len(main_env['digest_spawn']) == 1
-    main_env['digest_spawn'][0]()
+    # One spawn helper (bot._spawn, patched by main_env, so no real threads run) starts the
+    # named scheduler and backfill threads; digest._spawn is only for /digest_now (CA-4)
+    assert main_env['digest_spawn'] == []
+    assert main_env['bot_spawn'] == [(bot_module._run_digest_scheduler, 'digest-scheduler'),
+                                     (habr_backfill.run_safely, 'habr-backfill')]
+    main_env['bot_spawn'][0][0]()
     ((send, owner_id, is_allowed),) = scheduler_args
     assert send is bot_module.digest_send and owner_id == OWNER
     assert is_allowed(OWNER) and is_allowed(FRIEND) and not is_allowed(STRANGER)
@@ -624,31 +647,53 @@ def test_main_starts_scheduler_thread(main_env, tg, monkeypatch, caplog):
 
 
 def test_main_scheduler_start_failure_does_not_stop_polling(main_env, monkeypatch, caplog):
-    def broken(fn):
-        raise RuntimeError('no threads')
-    monkeypatch.setattr(digest, '_spawn', broken)
+    started = []
+
+    def broken_for_scheduler(fn, name):
+        if name == 'digest-scheduler':
+            raise RuntimeError('no threads')
+        started.append(name)
+    monkeypatch.setattr(bot_module, '_spawn', broken_for_scheduler)
 
     with caplog.at_level(logging.ERROR, logger='bot'):
         bot_module.main()
 
     assert main_env['polling'] == 1
+    assert started == ['habr-backfill']          # the backfill still starts
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
-def test_digest_scheduler_spawn_is_daemon(monkeypatch):
+@pytest.mark.parametrize('module', [bot_module, digest], ids=['bot', 'digest'])
+def test_spawn_helpers_start_named_daemon_threads(monkeypatch, module):
     started = []
 
     class FakeThread:
         def __init__(self, target, daemon, name=None):
-            started.append(daemon)
+            started.append((daemon, name))
 
         def start(self):
             pass
-    monkeypatch.setattr(digest.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(module.threading, 'Thread', FakeThread)
 
-    digest._spawn(lambda: None)
+    if module is bot_module:
+        bot_module._spawn(lambda: None, 'habr-backfill')
+        assert started == [(True, 'habr-backfill')]
+    else:
+        digest._spawn(lambda: None)
+        assert started == [(True, 'digest-now')]
 
-    assert started == [True]
+
+def test_spawn_real_thread_is_named(monkeypatch):
+    names = []
+    done = threading.Event()
+
+    def job():
+        names.append(threading.current_thread().name)
+        done.set()
+
+    bot_module._spawn(job, 'summary-42')
+    assert done.wait(5)
+    assert names == ['summary-42']
 
 
 def test_send_adapter_converts_rows_to_markup(monkeypatch):
@@ -694,3 +739,17 @@ def test_owner_menu_includes_digest_now(tg, monkeypatch):
     ((name, args, kwargs),) = [s for s in tg if s[0] == 'set_my_commands']
     assert 'digest_now' in [c.command for c in args[0]]
     assert isinstance(kwargs['scope'], types.BotCommandScopeChat)
+
+
+def test_bot_is_allowed_delegates_to_access_rule(tmp_db, monkeypatch):
+    """bot.is_allowed is a one-line delegate of access.is_allowed (audit CA-3)."""
+    calls = []
+
+    def rule(user_id, owner_id):
+        calls.append((user_id, owner_id))
+        return user_id == 42
+
+    monkeypatch.setattr(access, 'is_allowed', rule)
+    assert bot_module.is_allowed(42) is True
+    assert bot_module.is_allowed(OWNER) is False
+    assert calls == [(42, OWNER), (OWNER, OWNER)]

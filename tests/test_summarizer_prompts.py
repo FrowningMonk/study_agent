@@ -280,6 +280,14 @@ def test_short_description_strips_control_and_bidi_chars(monkeypatch, char):
 @pytest.mark.parametrize('output', [
     'Автор делится опытом, подробности на https://example.com',
     'Подробнее на www.example.com',
+    # Bare domains: Telegram auto-links them even in plain text
+    'Перейдите на evil.ru/login и введите пароль',
+    'Смотрите t.me/scam',
+    'см. bit.ly/abc',
+    'Подробнее на evil.icu/login',
+    'Пишите в evil.tg или evil.cloud',
+    'Код лежит на evil.io',
+    'Откройте tg://resolve?domain=x',
     'Пишите @someone, он расскажет больше.',
     'Нажмите /start, чтобы узнать больше.',
     'Первая строка.\nВторая строка.\nТретья строка.\nЧетвёртая строка.',
@@ -312,6 +320,10 @@ def test_short_description_rejects_bad_output(monkeypatch, output):
     # e-mail and path are not mentions/commands (feed patterns)
     ('Пишет на team@example.com, код в src/app.', 'Пишет на team@example.com, код в src/app.'),
     ('Сравнение C++ и Rust: 2 > 1?', 'Сравнение C++ и Rust: 2 > 1?'),
+    # Tech names with dots are not domains
+    ('Автор переводит Node.js и ASP.NET на config.yaml.', 'Автор переводит Node.js и ASP.NET на config.yaml.'),
+    ('Сравнение Vue.js и package.json в монорепо.', 'Сравнение Vue.js и package.json в монорепо.'),
+    ('Автор запускает main.py и socket.io.', 'Автор запускает main.py и socket.io.'),
     # Dunder names are not markdown; a label word inside the text is not a preamble
     ('Автор объясняет, когда вызывается __init__.', 'Автор объясняет, когда вызывается __init__.'),
     ('Автор сравнивает описание: API и SDK.', 'Автор сравнивает описание: API и SDK.'),

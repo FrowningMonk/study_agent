@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from telebot.apihelper import ApiTelegramException
 
+import access
 import database
 import digest
 import feed
@@ -186,8 +187,7 @@ def approve(uid):
 
 
 def allowed(uid):
-    user = database.get_user(uid)
-    return uid == OWNER or (user is not None and user['status'] == 'approved')
+    return access.is_allowed(uid, OWNER)        # the production rule (bot.is_allowed delegates)
 
 
 def tick(now, send, describe=None):
@@ -233,6 +233,29 @@ def test_digest_time_parsing(monkeypatch, caplog):
         assert any('DIGEST_TIME' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING), bad
 
 
+def test_digest_time_at_or_after_skip_time_falls_back(monkeypatch, caplog):
+    """DIGEST_TIME=23:59 would start at SKIP_TIME and never create a run (CA-6)."""
+    assert digest.SKIP_TIME.strftime('%H:%M') == '23:59'
+    monkeypatch.setenv('DIGEST_TIME', '23:59')
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        assert digest.digest_time().strftime('%H:%M') == '18:00'
+    assert any('DIGEST_TIME' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    # The last minute before the skip time is still accepted
+    caplog.clear()
+    monkeypatch.setenv('DIGEST_TIME', '23:58')
+    with caplog.at_level(logging.WARNING, logger='digest'):
+        assert digest.digest_time().strftime('%H:%M') == '23:58'
+    assert not caplog.records
+
+
+def test_digest_time_2359_still_creates_run_at_default(tmp_db, habr, send, sleeps, monkeypatch):
+    monkeypatch.setenv('DIGEST_TIME', '23:59')
+    fill_day(habr)
+    tick(at(18, 0), send)
+    assert habr_store.get_run(TODAY.isoformat()) is not None
+    assert len(send.to(OWNER)) == 1
+
+
 def test_digest_time_from_env_moves_the_run(tmp_db, habr, send, sleeps, monkeypatch):
     fill_day(habr, site=2)
     monkeypatch.setenv('DIGEST_TIME', '09:30')
@@ -262,6 +285,58 @@ def test_tick_at_digest_time_creates_run_and_snapshots_recipients(tmp_db, habr, 
     run = habr_store.get_run(TODAY.isoformat())
     assert run['status'] == 'pending'
     assert statuses() == {OWNER: 'pending', USER: 'pending'}
+
+
+def test_recipients_follow_the_injected_access_rule(tmp_db):
+    """The snapshot uses the same is_allowed as the send-time re-check (CA-3), not its own copy."""
+    approve(USER)
+    approve(OTHER)
+    database.create_access_request(601, 'p', 'P')       # pending
+    assert digest._recipients(OWNER, allowed) == [OWNER, USER, OTHER]
+    # A different rule changes the snapshot: nothing in digest re-implements the status check
+    assert digest._recipients(OWNER, lambda uid: uid in (OWNER, 601)) == [OWNER, 601]
+    habr_store.set_digest_enabled(OTHER, False)
+    assert digest._recipients(OWNER, allowed) == [OWNER, USER]
+
+
+@pytest.mark.parametrize('broken', ['is_allowed', 'digest_setting'])
+def test_snapshot_db_error_aborts_tick_and_is_retried(tmp_db, habr, send, sleeps, monkeypatch, broken):
+    """A DB error while building the recipient list never silently drops a user (CAR-3):
+    no run is created, and the next tick snapshots everybody."""
+    approve(USER)
+    fill_day(habr)
+    real_enabled = habr_store.get_digest_enabled
+
+    def locked(uid):
+        if uid == USER:
+            raise sqlite3.OperationalError('database is locked')
+        return allowed(uid) if broken == 'is_allowed' else real_enabled(uid)
+
+    if broken == 'is_allowed':
+        with pytest.raises(sqlite3.OperationalError):
+            digest.tick(at(18, 0), send=send, owner_id=OWNER, is_allowed=locked, describe=None)
+    else:
+        monkeypatch.setattr(habr_store, 'get_digest_enabled', locked)
+        with pytest.raises(sqlite3.OperationalError):
+            tick(at(18, 0), send)
+        monkeypatch.setattr(habr_store, 'get_digest_enabled', real_enabled)
+    assert habr_store.get_run(TODAY.isoformat()) is None and statuses() == {}
+
+    tick(at(18, 1), send)
+    assert statuses() == {OWNER: 'sent', USER: 'sent'}
+
+
+def test_recipients_match_access_rule_for_every_status(tmp_db):
+    """Ties digest recipients to access.is_allowed / gate for each user status."""
+    ids = {'approved': 701, 'pending': 702, 'rejected': 703}
+    for status, uid in ids.items():
+        database.create_access_request(uid, f'u{uid}', 'U')
+        if status != 'pending':
+            database.set_user_status(uid, status)
+    recipients = set(digest._recipients(OWNER, allowed))
+    for uid in [OWNER, *ids.values()]:
+        passes_gate = access.gate(uid, 'private', None, OWNER) == access.Gate.PASS
+        assert (uid in recipients) is access.is_allowed(uid, OWNER) is passes_gate, uid
 
 
 def test_failed_attempt_schedules_retry_in_15_minutes(tmp_db, habr, send, sleeps):
@@ -599,6 +674,91 @@ def test_one_recipient_build_error_does_not_block_others(tmp_db, habr, send, sle
     run = habr_store.get_run(TODAY.isoformat())
     assert run['status'] == 'done' and run['last_error'] is None
     assert any(str(USER) in r.getMessage() for r in caplog.records)
+
+
+def test_no_build_for_delivery_no_longer_pending(tmp_db, habr, send, sleeps, monkeypatch):
+    """A row that stopped being pending (e.g. /digest_now final) costs no build/LLM work (CA-5)."""
+    approve(USER)
+    fill_day(habr)
+    built = []
+    real_build = digest.build_user_digest
+    real_can_receive = digest._can_receive
+
+    def build(user_id, *a, **kw):
+        built.append(user_id)
+        return real_build(user_id, *a, **kw)
+
+    def can_receive(user_id, is_allowed):
+        if user_id == OWNER:          # /digest_now final took the owner's row after the listing
+            habr_store.set_delivery_status(TODAY.isoformat(), OWNER, 'sent')
+        return real_can_receive(user_id, is_allowed)
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    monkeypatch.setattr(digest, '_can_receive', can_receive)
+    tick(at(18, 0), send, describe=Describe())
+
+    assert built == [USER]                                       # owner: no build at all
+    assert send.to(OWNER) == [] and len(send.to(USER)) == 1
+    assert statuses() == {OWNER: 'sent', USER: 'sent'}
+
+
+def test_crash_during_build_leaves_delivery_pending_and_retried(tmp_db, habr, send, sleeps, monkeypatch):
+    """The row is claimed only after the build: a crash/restart mid-build (CAR-2) never
+    leaves it 'sending' (= treated as sent), so the user still gets today's digest."""
+    fill_day(habr)
+    seen = []
+    real_build = digest.build_user_digest
+
+    def crashing_build(user_id, *a, **kw):
+        seen.append(statuses()[user_id])
+        raise KeyboardInterrupt                  # process dies mid-build (not an Exception)
+
+    monkeypatch.setattr(digest, 'build_user_digest', crashing_build)
+    with pytest.raises(KeyboardInterrupt):
+        tick(at(18, 0), send)
+    assert seen == ['pending']
+    assert statuses() == {OWNER: 'pending'} and send.attempts == []
+
+    monkeypatch.setattr(digest, 'build_user_digest', real_build)     # "restart"
+    tick(at(18, 1), send)
+    assert statuses() == {OWNER: 'sent'} and len(send.to(OWNER)) == 1
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
+
+
+def test_claim_lost_after_build_sends_nothing(tmp_db, habr, send, sleeps, monkeypatch, caplog):
+    """/digest_now final finishes while the scheduled build runs: the late claim fails and the
+    built digest is dropped, never sent twice."""
+    fill_day(habr)
+    real_build = digest.build_user_digest
+
+    def build(user_id, *a, **kw):
+        result = real_build(user_id, *a, **kw)
+        habr_store.set_delivery_status(TODAY.isoformat(), user_id, 'sent')
+        return result
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    with caplog.at_level(logging.INFO, logger='digest'):
+        tick(at(18, 0), send)
+    assert send.attempts == []
+    assert statuses() == {OWNER: 'sent'}
+    assert any('taken while building' in r.getMessage() for r in caplog.records)
+
+
+def test_build_error_marks_failed(tmp_db, habr, send, sleeps, monkeypatch):
+    """A build failure (row still pending) ends as 'failed', not stuck."""
+    fill_day(habr)
+    seen = []
+
+    def build(user_id, *a, **kw):
+        seen.append(statuses()[user_id])     # recorded, not asserted: _attempt swallows errors
+        raise RuntimeError('build broke')
+
+    monkeypatch.setattr(digest, 'build_user_digest', build)
+    tick(at(18, 0), send)
+    assert seen == ['pending']
+    assert statuses() == {OWNER: 'failed'}
+    assert send.attempts == []
+    assert habr_store.get_run(TODAY.isoformat())['status'] == 'done'
 
 
 @pytest.mark.parametrize('error', [tg_error(500, 'Internal Server Error'), RuntimeError('network down')],
