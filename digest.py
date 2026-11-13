@@ -17,9 +17,10 @@ Build API:
     day_bounds(day) -> (start_utc, end_utc)
         UTC window [D 00:00 MSK, D+1 00:00 MSK) of the digest day (feed.msk_day_bounds).
     fetch_day_articles(day, wait_timeout=None) -> list[dict]
-        Network step, run ONCE per digest for all recipients: fetches the day through
-        habr_api (boundary-based), keeps the items inside the window and upserts their
-        metadata. HabrUnavailable / HabrBusy propagate.
+        Network step, run ONCE per digest for all recipients: candidates of the day from
+        the Habr RSS feeds (site top + all subscribed hubs), full metadata per article via
+        kek, keeps the items inside the window and upserts their metadata.
+        HabrUnavailable / HabrBusy propagate.
     build_user_digest(user_id, day_articles, digest_date, describe=_USE_DEFAULT) -> dict
         Pure DB + injected describe: builds the user's site and hubs lists (Decision 6),
         fills top-5 descriptions (Decision 8), persists the full lists (`digest_site`,
@@ -117,7 +118,10 @@ def fetch_day_articles(day: date, wait_timeout: float | None = None) -> list[dic
     `day`, metadata upserted after the network call has finished.
     """
     start, end = day_bounds(day)
-    items = habr_api.fetch_articles_since(start, wait_timeout=wait_timeout)
+    # Candidates: the site top feeds (site list) + every subscribed hub's feed (hubs lists)
+    items = habr_api.fetch_articles_since(start, until=end, hubs=habr_store.list_all_subscribed_hubs(),
+                                          top=True, wait_timeout=wait_timeout)
+    # kek published_at may differ from the RSS pubDate: the window is re-checked on kek data
     day_items = [i for i in items if start <= i['published_at'] < end]
     habr_store.upsert_habr_articles(day_items)
     return day_items

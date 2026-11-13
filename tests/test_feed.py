@@ -35,6 +35,13 @@ def item(habr_id, published=NOW, score=0, comments=0, hubs_=(('python', 'collect
     }
 
 
+def _light(habr_id, published=NOW, hubs_=(('python', 'collective'),), title=None):
+    """An RSS item as habr_api.fetch_rss_since returns it: no score/comments/post_type."""
+    light = item(habr_id, published, hubs_=hubs_, title=title)
+    del light['score'], light['comments'], light['post_type']
+    return light
+
+
 def ids(items):
     return [i['habr_id'] for i in items]
 
@@ -210,19 +217,19 @@ def test_render_feed_empty_states(tmp_db, monkeypatch):
     def no_fetch(*a, **k):
         pytest.fail('Habr must not be called without subscriptions')
 
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', no_fetch)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', no_fetch)
     assert feed.build_feed(1, NOW) == ('Подписок пока нет — /subscribe', [])
 
     habr_store.add_subscription(1, 'python')
-    monkeypatch.setattr(habr_api, 'fetch_articles_since',
-                        lambda since, *, wait_timeout=None, deadline=None: [item(1, hubs_=[('rust', 'collective')])])
+    monkeypatch.setattr(habr_api, 'fetch_rss_since',
+                        lambda since, *, wait_timeout=None, deadline=None, **kw: [_light(1, hubs_=[('rust', 'collective')])])
     assert feed.build_feed(1, NOW) == ('За последние сутки в твоих хабах ничего нового', [])
 
 
 def test_build_feed_persists_list_and_renders_first_page(tmp_db, monkeypatch):
     habr_store.add_subscription(1, 'python')
-    fetched = [item(i, NOW - timedelta(minutes=i), score=100 - i) for i in range(1, 13)]
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', lambda since, *, wait_timeout=None, deadline=None: fetched)
+    fetched = [_light(i, NOW - timedelta(minutes=i)) for i in range(1, 13)]
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', lambda since, *, wait_timeout=None, deadline=None, **kw: fetched)
     text, rows = feed.build_feed(1, NOW)
     assert len(text.split('\n')) == 10
     assert rows[-1][0][0] == 'Ещё 10 ▶'
@@ -410,7 +417,7 @@ def test_callback_never_calls_habr_or_llm(tmp_db, monkeypatch):
     def boom(*a, **k):
         pytest.fail('network/LLM must not be called by the codec')
 
-    for name in ('fetch_articles_since', 'fetch_article', 'fetch_hub_catalog', '_request'):
+    for name in ('fetch_rss_since', 'fetch_article', 'fetch_hub_catalog', '_request'):
         monkeypatch.setattr(habr_api, name, boom)
     # the single LLM entry point used by every generator, patched explicitly
     monkeypatch.setattr(summarizer, '_generate', boom)
@@ -432,9 +439,9 @@ def test_callback_never_calls_habr_or_llm(tmp_db, monkeypatch):
 
 class FakeList:
     def __init__(self, items=None, error=None):
-        self.items, self.error, self.calls = items or [item(1)], error, []
+        self.items, self.error, self.calls = items or [_light(1)], error, []
 
-    def __call__(self, since, *, wait_timeout=None, deadline=None):
+    def __call__(self, since, *, wait_timeout=None, deadline=None, **kw):
         self.calls.append((since, wait_timeout))
         if self.error is not None:
             raise self.error
@@ -443,25 +450,25 @@ class FakeList:
 
 def test_feed_fetch_cache_reuses_within_5_min(tmp_db, monkeypatch):
     fake = FakeList()
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', fake)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fake)
     clock = [NOW]
     monkeypatch.setattr(feed, '_now', lambda: clock[0])
-    feed.fetch_recent()
+    feed.fetch_recent(['python'])
     clock[0] = NOW + timedelta(minutes=4, seconds=59)
-    feed.fetch_recent()
+    feed.fetch_recent(['python'])
     assert len(fake.calls) == 1
     clock[0] = NOW + timedelta(minutes=5, seconds=1)
-    feed.fetch_recent()
+    feed.fetch_recent(['python'])
     assert len(fake.calls) == 2
     assert fake.calls[1][0] == clock[0] - timedelta(hours=24)
 
 
 def test_feed_fetch_cache_ttl_patchable(tmp_db, monkeypatch):
     fake = FakeList()
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', fake)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fake)
     monkeypatch.setattr(feed, 'FETCH_CACHE_TTL', timedelta(seconds=1))
-    feed.fetch_recent(NOW)
-    feed.fetch_recent(NOW + timedelta(seconds=2))
+    feed.fetch_recent(['python'], NOW)
+    feed.fetch_recent(['python'], NOW + timedelta(seconds=2))
     assert len(fake.calls) == 2
 
 
@@ -469,17 +476,17 @@ def test_feed_fetch_cache_concurrent_single_fetch(tmp_db, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = []
 
-    def blocking(since, *, wait_timeout=None, deadline=None):
+    def blocking(since, *, wait_timeout=None, deadline=None, **kw):
         calls.append(since)
         started.set()
         assert release.wait(5)
         return [item(1)]
 
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', blocking)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', blocking)
     lock = SignallingLock()
     monkeypatch.setattr(feed, '_cache_lock', lock)
     results = []
-    threads = [threading.Thread(target=lambda: results.append(ids(feed.fetch_recent(NOW)))) for _ in range(2)]
+    threads = [threading.Thread(target=lambda: results.append(ids(feed.fetch_recent(['python'], NOW)))) for _ in range(2)]
     threads[0].start()
     assert started.wait(5)
     threads[1].start()
@@ -495,44 +502,110 @@ def test_feed_fetch_cache_concurrent_single_fetch(tmp_db, monkeypatch):
     assert len(calls) == 1 and results == [[1], [1]]
 
 
-def test_feed_fetch_upserts_metadata(tmp_db, monkeypatch):
-    fetched = [item(1, score=7, comments=3, hubs_=[('python', 'collective'), ('bitrix', 'corporative')],
-                    tags=('ai', 'ml'))]
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList(fetched))
-    feed.fetch_recent(NOW)
+def test_feed_fetch_stores_light_items_for_new_ids(tmp_db, monkeypatch):
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList([_light(1)]))
+    feed.fetch_recent(['python'], NOW)
     stored = habr_store.get_habr_article(1)
-    assert stored['title'] == 'Article 1' and stored['score'] == 7 and stored['comments_count'] == 3
-    assert stored['hubs'] == [{'alias': 'bitrix', 'hub_type': 'corporative'},
-                              {'alias': 'python', 'hub_type': 'collective'}]
-    assert stored['tags'] == ['ai', 'ml']
+    assert stored['title'] == 'Article 1' and stored['url'] == habr_api.canonical_url(1)
+    assert stored['score'] is None and stored['comments_count'] is None and stored['lead_text'] is None
+    assert stored['hubs'] == [] and stored['tags'] == []          # RSS has no hub types / kek tags
+    assert habr_store.needs_metadata_fetch(1) is True             # the full kek fetch happens later
+
+
+def test_build_feed_with_light_items_ranks_by_stored_score(tmp_db, monkeypatch):
+    habr_store.add_subscription(1, 'python')
+    habr_store.upsert_habr_article(item(1, score=50, comments=4))      # e.g. stored by the digest
+    monkeypatch.setattr(habr_api, 'fetch_rss_since',
+                        FakeList([_light(2, NOW - timedelta(minutes=1)), _light(1, NOW - timedelta(minutes=2))]))
+    text, _ = feed.build_feed(1, NOW)
+    lines = text.split('\n')
+    assert lines[0] == '1. Article 1 — рейтинг 50, комментарии 4'
+    assert lines[1] == '2. Article 2 — рейтинг —, комментарии —'
+
+
+def test_feed_uses_stored_metadata_and_keeps_it(tmp_db, monkeypatch):
+    habr_store.upsert_habr_article(item(1, score=50, comments=4))        # e.g. stored by the digest
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList([_light(1), _light(2, NOW - timedelta(hours=1))]))
+
+    items = {i['habr_id']: i for i in feed.fetch_recent(['python'], NOW)}
+
+    assert (items[1]['score'], items[1]['comments']) == (50, 4)
+    assert (items[2]['score'], items[2]['comments']) == (None, None)
+    assert habr_store.get_habr_article(1)['score'] == 50                 # not overwritten by RSS
+    assert habr_store.get_habr_article(2)['title'] == 'Article 2'       # new article stored for paging
+
+
+def test_feed_fetch_one_request_per_hub_cached_per_hub(tmp_db, monkeypatch):
+    calls = []
+
+    def fetch(since, *, hubs=(), wait_timeout=None, deadline=None, **kw):
+        calls.append((since, tuple(hubs), kw.get('top', False)))
+        alias = hubs[0]
+        # article 1 is in both hubs, 2 only in Python, 3 only in go
+        own = {'Python': 2, 'go': 3, 'rust': 4}[alias]
+        return [_light(1, hubs_=[(alias, 'collective')]), _light(own, hubs_=[(alias, 'collective')])]
+
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fetch)
+    items = feed.fetch_recent(['Python', 'go', 'python'], NOW)
+    assert calls == [(NOW - timedelta(hours=24), ('Python',), False),     # own case kept in the URL
+                     (NOW - timedelta(hours=24), ('go',), False)]
+    by_id = {i['habr_id']: i for i in items}
+    assert set(by_id) == {1, 2, 3}
+    assert by_id[1]['hubs'] == [('Python', 'collective'), ('go', 'collective')]
+
+    feed.fetch_recent(['go', 'rust'], NOW + timedelta(minutes=1))     # go cached, rust fetched
+    assert [c[1] for c in calls[2:]] == [('rust',)]
+
+
+def test_feed_cache_evicts_stale_hubs(tmp_db, monkeypatch):
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList())
+    feed.fetch_recent(['python'], NOW)
+    feed.fetch_recent(['go'], NOW + feed.FETCH_CACHE_TTL + timedelta(seconds=1))
+    assert set(feed._cache) == {'go'}
+
+
+def test_feed_deadline_keeps_hubs_fetched_so_far(tmp_db, monkeypatch):
+    calls = []
+
+    def fetch(since, *, hubs=(), **kw):
+        calls.append(hubs[0])
+        if hubs[0] == 'go' and calls.count('go') == 1:
+            raise habr_api.HabrBusy('deadline')
+        return [_light(1, hubs_=[(hubs[0], 'collective')])]
+
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fetch)
+    with pytest.raises(habr_api.HabrBusy):
+        feed.fetch_recent(['python', 'go'], NOW)
+    feed.fetch_recent(['python', 'go'], NOW + timedelta(seconds=10))
+    assert calls == ['python', 'go', 'go']                    # python reused from the cache
 
 
 def test_feed_fetch_passes_handler_wait_timeout_and_propagates_busy(tmp_db, monkeypatch):
     monkeypatch.setattr(habr_api, 'HANDLER_WAIT_TIMEOUT', 7.0)
     fake = FakeList()
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', fake)
-    feed.fetch_recent(NOW)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fake)
+    feed.fetch_recent(['python'], NOW)
     assert fake.calls[0][1] == 7.0
     feed._reset_for_tests()
     for error in (habr_api.HabrBusy('busy'), habr_api.HabrUnavailable('network')):
-        monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList(error=error))
+        monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList(error=error))
         with pytest.raises(type(error)):
-            feed.fetch_recent(NOW)
+            feed.fetch_recent(['python'], NOW)
     habr_store.add_subscription(1, 'python')
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList(error=habr_api.HabrBusy('busy')))
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList(error=habr_api.HabrBusy('busy')))
     with pytest.raises(habr_api.HabrBusy):
         feed.build_feed(1, NOW)
 
 
 def test_reset_for_tests_clears_cache_and_registry(tmp_db, monkeypatch):
     fake = FakeList()
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', fake)
-    feed.fetch_recent(NOW)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fake)
+    feed.fetch_recent(['python'], NOW)
     feed.REGISTRY.click(1, 10)
     registry = feed.REGISTRY
     feed._reset_for_tests()
     assert feed.REGISTRY is registry and len(registry) == 0
-    feed.fetch_recent(NOW)
+    feed.fetch_recent(['python'], NOW)
     assert len(fake.calls) == 2
 
 
@@ -800,13 +873,13 @@ def test_feed_fetch_passes_one_handler_deadline(tmp_db, monkeypatch):
     monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 45)
     seen = []
 
-    def fetch(since, *, wait_timeout=None, deadline=None):
+    def fetch(since, *, wait_timeout=None, deadline=None, **kw):
         seen.append((wait_timeout, deadline))
         return [item(1)]
 
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', fetch)
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', fetch)
     before = time.monotonic()
-    feed.fetch_recent(NOW)
+    feed.fetch_recent(['python'], NOW)
     (wait_timeout, deadline), = seen
     assert wait_timeout == habr_api.HANDLER_WAIT_TIMEOUT
     assert before + 45 <= deadline <= time.monotonic() + 45
@@ -815,12 +888,12 @@ def test_feed_fetch_passes_one_handler_deadline(tmp_db, monkeypatch):
 def test_feed_cache_lock_wait_bounded_by_deadline(tmp_db, monkeypatch):
     """The single-flight wait counts against the same deadline as the fetch."""
     monkeypatch.setattr(habr_api, 'HANDLER_DEADLINE', 0.2)
-    monkeypatch.setattr(habr_api, 'fetch_articles_since', FakeList())
+    monkeypatch.setattr(habr_api, 'fetch_rss_since', FakeList())
     feed._cache_lock.acquire()
     try:
         started = time.monotonic()
         with pytest.raises(habr_api.HabrBusy):
-            feed.fetch_recent(NOW)
+            feed.fetch_recent(['python'], NOW)
         assert 0.15 <= time.monotonic() - started < 2       # not HANDLER_WAIT_TIMEOUT (30 s)
     finally:
         feed._cache_lock.release()

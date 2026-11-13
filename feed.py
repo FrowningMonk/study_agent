@@ -5,7 +5,7 @@ Contents:
     - text cleaning: URL_RE, DOMAIN_RE, MENTION_RE, COMMAND_RE, UNSAFE_TEXT_PATTERNS,
       has_bare_domain, is_unsafe_description (strict, LLM descriptions), strip_control_bidi, html_to_text, fallback_description, sanitize_title;
     - MSK time: MSK, msk_day_bounds, msk_date, format_date_ru;
-    - 24 h fetch cache: fetch_recent (5-minute reuse, handler wait mode);
+    - 24 h fetch cache: fetch_recent (hub RSS feeds, 5-minute reuse per hub, handler wait mode);
     - ranking (Decision 6): select_feed, select_digest_site, select_digest_hubs;
     - ranked-list persistence: create_list, load_page;
     - rendering (Decision 7): render_page / render_list_page -> (text, rows), where rows
@@ -280,43 +280,82 @@ def view_source(list_kind: str) -> str:
 # =============================================================================
 
 _cache_lock = threading.Lock()
-_cache: tuple[datetime, list[dict]] | None = None
+# lower-case hub alias -> (fetched at, light RSS items of that hub's feed)
+_cache: dict[str, tuple[datetime, list[dict]]] = {}
 
 
-def fetch_recent(now: datetime | None = None) -> list[dict]:
+def _unique_aliases(subscriptions) -> list[str]:
+    """Subscribed aliases in their own case, deduplicated case-insensitively."""
+    result, seen = [], set()
+    for alias in subscriptions:
+        if isinstance(alias, str) and alias.lower() not in seen:
+            seen.add(alias.lower())
+            result.append(alias)
+    return result
+
+
+def fetch_recent(subscriptions, now: datetime | None = None) -> list[dict]:
     """
-    Normalized items of the last 24 h for `/feed`. A fetch younger than
-    FETCH_CACHE_TTL is reused; otherwise habr_api.fetch_articles_since is called in
-    handler mode and the metadata (with hubs and tags) is upserted.
+    Items of the last 24 h from the RSS feeds of the `subscriptions` hubs for `/feed`.
+    Each hub feed is cached separately for FETCH_CACHE_TTL, so users with overlapping
+    hubs share requests and a deadline hit keeps the feeds fetched so far. Missing
+    feeds are fetched with habr_api.fetch_rss_since in handler mode, one request per
+    hub. RSS carries no score/comments: known metadata from habr_store (e.g. filled by
+    the digest) is merged in, and new articles are stored without overwriting rows.
     Single-flight: concurrent callers wait for the running fetch. One handler deadline
     (habr_api.HANDLER_DEADLINE) bounds the whole call: this wait (also capped by
-    HANDLER_WAIT_TIMEOUT) plus every page of the fetch; then HabrBusy.
+    HANDLER_WAIT_TIMEOUT) plus every feed request; then HabrBusy.
     HabrBusy / HabrUnavailable propagate.
     """
-    global _cache
     now = now or _now()
-    cached = _fresh_cache(now)
-    if cached is not None:
-        return cached
-    deadline = habr_api.handler_deadline()
-    if not _cache_lock.acquire(timeout=habr_api.wait_budget(habr_api.HANDLER_WAIT_TIMEOUT, deadline)):
-        raise habr_api.HabrBusy('feed fetch is already running')
-    try:
-        cached = _fresh_cache(now)
-        if cached is not None:
-            return cached
-        items = habr_api.fetch_articles_since(now - FEED_WINDOW, wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
-                                              deadline=deadline)
-        # The network call is finished: only now is a DB transaction opened
-        habr_store.upsert_habr_articles(items)
-        _cache = (now, items)
-        return items
-    finally:
-        _cache_lock.release()
+    aliases = _unique_aliases(subscriptions)
+    lists = {a.lower(): _fresh_cache(a.lower(), now) for a in aliases}
+    if any(items is None for items in lists.values()):
+        deadline = habr_api.handler_deadline()
+        if not _cache_lock.acquire(timeout=habr_api.wait_budget(habr_api.HANDLER_WAIT_TIMEOUT, deadline)):
+            raise habr_api.HabrBusy('feed fetch is already running')
+        try:
+            for stale in [k for k in _cache if _fresh_cache(k, now) is None]:
+                del _cache[stale]
+            for alias in aliases:
+                key = alias.lower()
+                if lists[key] is None:
+                    lists[key] = _fresh_cache(key, now)          # fetched by the call we waited for
+                if lists[key] is None:
+                    light = habr_api.fetch_rss_since(now - FEED_WINDOW, hubs=[alias],
+                                                     wait_timeout=habr_api.HANDLER_WAIT_TIMEOUT,
+                                                     deadline=deadline)
+                    # The network call is finished: only now is a DB transaction opened
+                    habr_store.insert_missing_habr_articles(light)
+                    _cache[key] = (now, light)
+                    lists[key] = light
+        finally:
+            _cache_lock.release()
+    return _with_stored_metadata(_merge_hub_items(lists.values()))
 
 
-def _fresh_cache(now: datetime) -> list[dict] | None:
-    cache = _cache
+def _merge_hub_items(lists) -> list[dict]:
+    """Per-hub light lists -> one item per habr_id with the union of their hubs, newest first."""
+    merged: dict[int, dict] = {}
+    for items in lists:
+        for item in items:
+            kept = merged.setdefault(item['habr_id'], {**item, 'hubs': []})
+            kept['hubs'] += [h for h in item.get('hubs') or () if h not in kept['hubs']]
+    return sorted(merged.values(), key=lambda i: i['published_at'], reverse=True)
+
+
+def _with_stored_metadata(light: list[dict]) -> list[dict]:
+    """Light RSS items with score/comments taken from habr_store when a full fetch stored them."""
+    stored = habr_store.get_habr_articles(i['habr_id'] for i in light)
+    result = []
+    for item in light:
+        meta = stored.get(item['habr_id']) or {}
+        result.append({**item, 'score': meta.get('score'), 'comments': meta.get('comments_count')})
+    return result
+
+
+def _fresh_cache(key: str, now: datetime) -> list[dict] | None:
+    cache = _cache.get(key)
     if cache is None:
         return None
     age = now - cache[0]
@@ -520,7 +559,7 @@ def build_feed(user_id: int, now: datetime | None = None) -> tuple[str, Rows]:
     subscriptions = habr_store.list_subscriptions(user_id)
     if not subscriptions:
         return TEXT_NO_SUBSCRIPTIONS, []
-    items = fetch_recent(now)
+    items = fetch_recent(subscriptions, now)
     selected = select_feed(items, subscriptions, habr_store.get_viewed_ids(user_id), now)
     if not selected:
         return TEXT_FEED_EMPTY, []
@@ -699,8 +738,8 @@ REGISTRY = InFlightRegistry()
 
 def _reset_for_tests() -> None:
     """Clears the fetch cache and the module REGISTRY (same object kept)."""
-    global _cache, _cache_lock
+    global _cache_lock
     # A fresh lock: a test that failed mid-fetch must not leave the next one blocked
     _cache_lock = threading.Lock()
-    _cache = None
+    _cache.clear()
     REGISTRY.clear()

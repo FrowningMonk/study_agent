@@ -63,6 +63,7 @@ class FakeHabr:
         self.article: dict | None = None
         self.catalog_error = self.list_error = self.article_error = None
         self.calls: list[tuple] = []
+        self.feed_requests: list[tuple] = []
 
     def fetch_hub_catalog(self, *, wait_timeout=None, deadline=None):
         self.calls.append(('catalog', wait_timeout))
@@ -70,11 +71,21 @@ class FakeHabr:
             raise self.catalog_error
         return list(self.catalog)
 
-    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
+    def fetch_rss_since(self, since, *, hubs=(), wait_timeout=None, deadline=None, **kw):
         self.calls.append(('list', wait_timeout))
+        self.feed_requests.append(tuple(hubs))
         if self.list_error:
             raise self.list_error
-        return list(self.items)
+        # Like the real RSS fetch: only items of the requested hub feeds, tagged with those
+        # hubs; no score/comments/post_type
+        result = []
+        for i in self.items:
+            found = [(alias, 'collective') for alias in hubs
+                     if any(h[0].lower() == alias.lower() and h[1] == 'collective' for h in i['hubs'])]
+            if found:
+                light = {k: v for k, v in i.items() if k not in ('score', 'comments', 'post_type')}
+                result.append({**light, 'hubs': found})
+        return result
 
     def fetch_article(self, habr_id, *, wait_timeout=None, deadline=None):
         self.calls.append(('article', habr_id, wait_timeout))
@@ -103,7 +114,7 @@ class FakeProcess:
 @pytest.fixture
 def habr(tg, monkeypatch):
     fake = FakeHabr()
-    for name in ('fetch_hub_catalog', 'fetch_articles_since', 'fetch_article'):
+    for name in ('fetch_hub_catalog', 'fetch_rss_since', 'fetch_article'):
         monkeypatch.setattr(habr_api, name, getattr(fake, name))
     return fake
 
@@ -493,6 +504,7 @@ def test_feed_empty_after_filter(tg, habr):
 def test_feed_with_data_first_page(tg, habr, llm, tmp_db):
     habr_store.add_subscription(FRIEND, 'python')
     habr.items = [_item(i, score=100 - i) for i in range(1, 13)]
+    habr_store.upsert_habr_articles(habr.items)          # full metadata already stored (digest)
 
     _send(FRIEND, '/feed')
 
@@ -561,6 +573,7 @@ def test_feed_more_10_to_the_end(tg, habr):
 def test_feed_cached_fetch_and_summarized_article_excluded(tg, habr, llm, sync_spawn):
     habr_store.add_subscription(FRIEND, 'python')
     habr.items = [_item(1, score=10), _item(2, score=5)]
+    habr_store.upsert_habr_articles(habr.items)
     _send(FRIEND, '/feed')
     first = _rows_of(_sent_to(tg, FRIEND)[0])[0][0]
 

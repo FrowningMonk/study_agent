@@ -23,6 +23,7 @@ import feed
 import habr_api
 import habr_store
 import summarizer
+from conftest import kek_article_id, rss_body
 
 UTC = timezone.utc
 TODAY = date(2026, 11, 4)
@@ -49,7 +50,7 @@ class _Resp:
     def __init__(self, status, body):
         self.status_code = status
         self.headers = {}
-        self._body = json.dumps(body).encode('utf-8')
+        self._body = (body if isinstance(body, str) else json.dumps(body)).encode('utf-8')
 
     def iter_content(self, chunk_size=1):
         yield self._body
@@ -59,14 +60,17 @@ class _Resp:
 
 
 class FakeHabr:
-    """Serves kek list pages built from the trimmed real fixture; habr_api parses them."""
+    """Serves the Habr RSS feeds and kek article pages (built from the trimmed real fixture);
+    habr_api parses them. `log` holds one entry per list fetch (the first top feed request),
+    `requests` every request."""
 
     def __init__(self, template):
         self.template = template
         self.articles = []          # (habr_id, published, score, hubs, lead, title)
         self.status = 200
-        self.partial = False
+        self.partial = False        # every kek article fetch fails -> 'partial'
         self.log = []
+        self.requests = []
 
     def add(self, habr_id, score=0, hubs=('other',), day=DAY, minute=0, lead=LEAD, title=None):
         published = datetime(day.year, day.month, day.day, 12, 0, tzinfo=feed.MSK) - timedelta(minutes=minute)
@@ -83,20 +87,25 @@ class FakeHabr:
         ref['leadData']['textHtml'] = lead
         return ref
 
-    def body(self):
+    def rss(self):
         rows = sorted(self.articles, key=lambda a: a[1], reverse=True)
-        # One old item ends the boundary pagination
+        # One old item outside the digest day
         rows.append((999, datetime(2026, 10, 1, 12, 0, tzinfo=feed.MSK), 0, ('other',), LEAD, 'Старая'))
-        refs = [self._ref(*r) for r in rows]
-        return {'pagesCount': 3 if self.partial else 1,     # short page 1 of 3 -> partial
-                'publicationIds': [r['id'] for r in refs],
-                'publicationRefs': {r['id']: r for r in refs}}
+        return rss_body([(r[0], r[1], r[5]) for r in rows])
 
     def get(self, url, params=None, **kw):
-        self.log.append((url, dict(params or {})))
+        self.requests.append((url, dict(params or {})))
+        if url == habr_api.RSS_BASE + habr_api.RSS_TOP_FEEDS[0]:
+            self.log.append((url, dict(params or {})))
         if self.status != 200:
             return _Resp(self.status, {'error': 'x'})
-        return _Resp(200, self.body())
+        if url.startswith(habr_api.RSS_BASE):
+            return _Resp(200, self.rss())
+        habr_id = kek_article_id(url)
+        row = next((r for r in self.articles if r[0] == habr_id), None)
+        if row is None or self.partial:
+            return _Resp(503, {'error': 'x'})
+        return _Resp(200, self._ref(*row))
 
 
 class FakeSend:

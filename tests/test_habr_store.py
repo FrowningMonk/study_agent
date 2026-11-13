@@ -452,6 +452,36 @@ def test_subscriptions_idempotent_per_user(tmp_db):
     assert habr_store.list_subscriptions(owner_id) == ['python']
 
 
+def test_list_all_subscribed_hubs_distinct_sorted(tmp_db):
+    assert habr_store.list_all_subscribed_hubs() == []
+    habr_store.add_subscription(1, 'python')
+    habr_store.add_subscription(1, 'go')
+    habr_store.add_subscription(2, 'python')
+    habr_store.add_subscription(3, 'Python')                  # same Habr hub, other case
+    assert habr_store.list_all_subscribed_hubs() == ['go', 'Python']
+    habr_store.remove_subscription(1, 'go')
+    assert habr_store.list_all_subscribed_hubs() == ['Python']
+    for user_id, alias in ((1, 'python'), (2, 'python'), (3, 'Python')):
+        habr_store.remove_subscription(user_id, alias)
+    assert habr_store.list_all_subscribed_hubs() == []
+
+
+def test_insert_missing_never_overwrites_full_metadata(tmp_db):
+    habr_store.upsert_habr_article(_item(1, score=42))
+    light = {**_item(1, hubs=(('go', 'collective'),), tags=()), 'score': None, 'comments': None, 'title': 'RSS'}
+    new = {**_item(2), 'score': None, 'comments': None}
+    habr_store.insert_missing_habr_articles([light, new])
+
+    stored = habr_store.get_habr_articles([1, 2])
+    assert stored[1]['score'] == 42 and stored[1]['title'] == 'Title 1'
+    assert stored[1]['hubs'] == [{'alias': 'python', 'hub_type': 'collective'}]
+    assert stored[2]['score'] is None and stored[2]['title'] == 'Title 2'
+    assert stored[2]['hubs'] == [] and stored[2]['tags'] == [] and stored[2]['lead_text'] is None
+    # a light row still counts as "no metadata yet": the full kek fetch happens later
+    assert habr_store.needs_metadata_fetch(2) is True
+    assert habr_store.needs_metadata_fetch(1) is False
+
+
 # --- ranked lists -----------------------------------------------------------
 
 

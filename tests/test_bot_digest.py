@@ -44,7 +44,7 @@ class FakeHabr:
         self.list_error: Exception | None = None
         self.calls: list[tuple] = []
 
-    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None):
+    def fetch_articles_since(self, since, *, wait_timeout=None, deadline=None, **kw):
         self.calls.append(('list', since))
         if self.list_error:
             raise self.list_error

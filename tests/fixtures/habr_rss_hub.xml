@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" >
+
+  <channel>
+    <title><![CDATA[Все статьи подряд / Python / Хабр]]></title>
+    <link>https://habr.com/ru/hubs/python/articles/</link>
+    <description><![CDATA[Python – высокоуровневый язык программирования]]></description>
+    <language>ru</language>
+    <managingEditor>editor@habr.com</managingEditor>
+    <generator>habr.com</generator>
+    <pubDate>Fri, 13 Nov 2026 14:41:33 GMT</pubDate>
+    
+    
+      <image>
+        <link>https://habr.com/ru/</link>
+        <url>https://habrastorage.org/webt/ym/el/wk/ymelwk3zy1gawz4nkejl_-ammtc.png</url>
+        <title>Хабр</title>
+      </image>
+    
+
+    
+      
+        
+    
+    <item>
+      <title><![CDATA[Сметчик завода считал КП целый рабочий день. Мы свели это к 30 секундам: почему ChatGPT тут бесполезен]]></title>
+      <guid isPermaLink="true">https://habr.com/ru/articles/1107610/</guid>
+      <link>https://habr.com/ru/articles/1107610/?utm_campaign=1107610&amp;utm_source=habrahabr&amp;utm_medium=rss</link>
+      <description><![CDATA[<img src="https://habrastorage.org/extt/fc/b4/ab/fcb4ab010d67e1b6e704ea38ebc9ffe1.png" /><p>Снабженец строительного объекта отправляет ведомость металлопроката одновременно в 4-5 заводов и заказывает у того, кто первым прислал точный расчет. На производстве инженер-сметчик тратит от 4 до 8 часов на ручной перенос номенклатуры и сверку коэффициентов по бумажным справочникам ГОСТ.</p><p>Популярная идея «скормить скан ведомости в ChatGPT» на реальном заказе ведет к прямому кассовому разрыву: при расчете партии швеллера 16П модель ошиблась в массе на 41% в минус, что дает 126 720 рублей чистого убытка на одной строке.</p><p>В статье разбираем трехслойную архитектуру решения: как подружить нечеткий семантический парсинг сканов (OpenCV + Vision API) с детерминированным расчетным ядром на Python </p> <a href="https://habr.com/ru/articles/1107610/?utm_campaign=1107610&amp;utm_source=habrahabr&amp;utm_medium=rss#habracut">Читать далее</a>]]></description>
+      
+      <pubDate>Fri, 13 Nov 2026 14:13:59 GMT</pubDate>
+      <dc:creator><![CDATA[a_samartsev]]></dc:creator>
+      
+      <category><![CDATA[chatgpt]]></category><category><![CDATA[llm]]></category><category><![CDATA[компьютерное зрение]]></category><category><![CDATA[python]]></category><category><![CDATA[автоматизация предприятий]]></category><category><![CDATA[1с]]></category><category><![CDATA[коммерческое предложение]]></category><category><![CDATA[гост]]></category><category><![CDATA[расчет смет]]></category><category><![CDATA[галлюцинации ии]]></category>
+    </item>
+  
+
+  
+
+  
+
+	
+  
+
+  
+
+  
+
+    
+    <item>
+      <title><![CDATA[Значимый A/B‑тест завышает рост. Считаем, во сколько раз]]></title>
+      <guid isPermaLink="true">https://habr.com/ru/companies/otus/articles/1101894/</guid>
+      <link>https://habr.com/ru/companies/otus/articles/1101894/?utm_campaign=1101894&amp;utm_source=habrahabr&amp;utm_medium=rss</link>
+      <description><![CDATA[<img src="https://habrastorage.org/extt/83/7b/62/837b621fbd5d57a2f90b71dc7c5a5ffd.png" /><p>A/B‑тест показал +6% к&nbsp;конверсии при&nbsp;p‑value 0,03, и команда закладывает результат в&nbsp;бизнес‑прогноз. Но&nbsp;при&nbsp;низкой мощности эксперимента случайный шум может существенно завышать оценку эффекта. В&nbsp;статье разбираем, как&nbsp;работает проклятие победителя, насколько сильно оно искажает результаты и какие методы помогают получить более реалистичную оценку. </p> <a href="https://habr.com/ru/articles/1101894/?utm_campaign=1101894&amp;utm_source=habrahabr&amp;utm_medium=rss#habracut">Разбираем A/B-тесты</a>]]></description>
+      
+      <pubDate>Fri, 13 Nov 2026 13:50:04 GMT</pubDate>
+      <dc:creator><![CDATA[sproshchaev (OTUS)]]></dc:creator>
+      
+      <category><![CDATA[A B-тестирование]]></category><category><![CDATA[продуктовая аналитика]]></category><category><![CDATA[статистическая значимость]]></category><category><![CDATA[мощность теста]]></category><category><![CDATA[проклятие победителя]]></category><category><![CDATA[проверка гипотез]]></category><category><![CDATA[статистические методы]]></category><category><![CDATA[конверсия]]></category><category><![CDATA[байесовская статистика]]></category><category><![CDATA[симуляция экспериментов]]></category>
+    </item>
+  
+
+  
+
+  
+
+	
+  
+
+  
+
+  
+
+    
+    <item>
+      <title><![CDATA[Когда ИИ-агенту нужен MCP, а когда достаточно обычного API]]></title>
+      <guid isPermaLink="true">https://habr.com/ru/companies/runity/articles/1107568/</guid>
+      <link>https://habr.com/ru/companies/runity/articles/1107568/?utm_campaign=1107568&amp;utm_source=habrahabr&amp;utm_medium=rss</link>
+      <description><![CDATA[<img src="https://habrastorage.org/extt/d2/aa/e4/d2aae4d941439567e36be4e207341e87.png" /><p>Допустим, вы разрабатываете ИИ-агента, который проверяет статусы заказов. Для этого ему нужно обратиться к учетной системе, найти заказ по номеру и вернуть пользователю результат.</p><p>Можно подключить агента напрямую через API. А можно создать MCP-сервер, который предоставит ту же операцию в виде инструмента. Какой вариант выбрать?</p> <a href="https://habr.com/ru/articles/1107568/?utm_campaign=1107568&amp;utm_source=habrahabr&amp;utm_medium=rss#habracut">Читать далее</a>]]></description>
+      
+      <pubDate>Fri, 13 Nov 2026 13:15:42 GMT</pubDate>
+      <dc:creator><![CDATA[runity (Рунити)]]></dc:creator>
+      
+      <category><![CDATA[MCP]]></category><category><![CDATA[Model Context Protocol]]></category><category><![CDATA[API]]></category><category><![CDATA[ИИ-агенты]]></category><category><![CDATA[LLM]]></category><category><![CDATA[Python]]></category><category><![CDATA[function calling]]></category><category><![CDATA[MCP-сервер]]></category><category><![CDATA[интеграция API]]></category><category><![CDATA[архитектура ПО]]></category>
+    </item>
+  
+
+  
+
+  
+
+	
+  
+
+  
+
+  
+
+    
+  </channel>
+</rss>
