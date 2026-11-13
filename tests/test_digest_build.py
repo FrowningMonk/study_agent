@@ -18,6 +18,7 @@ import digest
 import feed
 import habr_api
 import habr_store
+from conftest import kek_article_id, rss_body
 
 UTC = timezone.utc
 NOW = datetime(2026, 11, 4, 15, 0, tzinfo=UTC)     # 18:00 MSK on Nov 4
@@ -550,13 +551,15 @@ class _Resp:
 
 @pytest.fixture
 def fake_list_router(monkeypatch, fixture_text):
-    """Installs a fake requests.get serving one list page built from the trimmed real fixture."""
+    """Installs a fake requests.get serving the Habr RSS feeds and kek article pages built
+    from the trimmed real fixture."""
     page = json.loads(fixture_text('habr_list_page.json'))
     template = page['publicationRefs'][page['publicationIds'][0]]
     state = {'log': []}
 
-    def install(day_count=12, hubs_=('python',), status=200, extra=()):
-        """extra: (habr_id, aware datetime) items added at their place in the newest-first order."""
+    def install(day_count=12, hubs_=('python',), status=200, extra=(), rss_dates=None):
+        """extra: (habr_id, aware datetime) items added at their place in the newest-first order;
+        rss_dates: habr_id -> RSS pubDate differing from the kek timePublished."""
         refs = []
         for n in range(day_count):
             ref = copy.deepcopy(template)
@@ -579,12 +582,19 @@ def fake_list_router(monkeypatch, fixture_text):
         old['id'] = '700000'
         old['timePublished'] = '2026-11-02T10:00:00+00:00'
         refs.append(old)
-        body = {'pagesCount': 1, 'publicationIds': [r['id'] for r in refs],
-                'publicationRefs': {r['id']: r for r in refs}}
+        by_id = {int(r['id']): r for r in refs}
+        rss = rss_body([(int(r['id']), (rss_dates or {}).get(int(r['id']),
+                                                           datetime.fromisoformat(r['timePublished'])))
+                        for r in refs])
 
         def fake_get(url, params=None, **kw):
             state['log'].append((url, dict(params or {})))
-            return _Resp(status, body if status == 200 else {'error': 'x'})
+            if status != 200:
+                return _Resp(status, {'error': 'x'})
+            if url.startswith(habr_api.RSS_BASE):
+                return _Resp(200, rss.encode('utf-8'))
+            ref = by_id.get(kek_article_id(url))
+            return _Resp(200, ref) if ref is not None else _Resp(404, {'errorCode': 'NOT_FOUND'})
 
         monkeypatch.setattr(habr_api.requests, 'get', fake_get)
         return state['log']
@@ -684,7 +694,7 @@ def test_dry_run_prints_parts_without_llm_or_delivery_rows(tmp_db, monkeypatch, 
     assert 'Лучшее на Хабре' in out and 'Твои хабы' in out
     assert '6. Статья дня' in out                  # first paging page of the site list
     assert FOOTER in out
-    assert log and all(u.startswith(habr_api.API_BASE + 'articles/') for u, _ in log)
+    assert log and all(u.startswith((habr_api.RSS_BASE, habr_api.API_BASE + 'articles/')) for u, _ in log)
     assert _count('digest_runs') == 0 and _count('digest_deliveries') == 0
     assert len(result['parts']) == 2
 
@@ -727,4 +737,69 @@ def test_fetch_day_articles_filters_window_and_upserts(tmp_db, fake_list_router)
     items = digest.fetch_day_articles(DAY)
     assert sorted(i['habr_id'] for i in items) == [800000, 800001, 800002]
     assert set(habr_store.get_habr_articles([800000, 800001, 800002, 700000])) == {800000, 800001, 800002}
-    assert log[0][1]['page'] == 1
+    assert log[0][0].startswith(habr_api.RSS_BASE) and log[0][1]['limit'] == habr_api.RSS_LIMIT
+
+
+def test_fetch_day_articles_rechecks_window_on_kek_dates(tmp_db, fake_list_router):
+    """In the day by its RSS pubDate, outside it by the kek timePublished: dropped, not stored."""
+    end = datetime(2026, 11, 3, 21, 0, tzinfo=UTC)            # 2026-11-04 00:00 MSK
+    fake_list_router(day_count=1, extra=[(900010, end)], rss_dates={900010: end - timedelta(hours=1)})
+    items = digest.fetch_day_articles(DAY)
+    assert [i['habr_id'] for i in items] == [800000]
+    assert set(habr_store.get_habr_articles([800000, 900010])) == {800000}
+
+
+def _route_feeds(monkeypatch, fixture_text, feeds: dict):
+    """requests.get fake: RSS path -> [(habr_id, published)]; kek by id from the fixture."""
+    page = json.loads(fixture_text('habr_list_page.json'))
+    template = page['publicationRefs'][page['publicationIds'][0]]
+    published = {habr_id: when for entries in feeds.values() for habr_id, when in entries}
+    requested, kek_ids = [], []
+
+    def fake_get(url, params=None, **kw):
+        if url.startswith(habr_api.RSS_BASE):
+            path = url[len(habr_api.RSS_BASE):]
+            requested.append(path)
+            if path not in feeds:
+                pytest.fail(f'unexpected feed requested: {path}')
+            return _Resp(200, rss_body(feeds[path]).encode('utf-8'))
+        habr_id = kek_article_id(url)
+        kek_ids.append(habr_id)
+        ref = copy.deepcopy(template)
+        ref['id'], ref['timePublished'] = str(habr_id), published[habr_id].isoformat()
+        return _Resp(200, ref)
+
+    monkeypatch.setattr(habr_api.requests, 'get', fake_get)
+    return requested, kek_ids
+
+
+def test_fetch_day_articles_reads_every_subscribed_hub_feed(tmp_db, monkeypatch, fixture_text):
+    habr_store.add_subscription(USER, 'python')
+    habr_store.add_subscription(OTHER, 'go')
+    habr_store.add_subscription(OTHER, 'python')
+    requested, _ = _route_feeds(monkeypatch, fixture_text, {
+        'articles/top/daily/': [], 'articles/top/weekly/': [],
+        'hubs/go/articles/': [(800002, IN_DAY)],
+        'hubs/python/articles/': [(800001, IN_DAY + timedelta(minutes=1))],
+    })
+    items = digest.fetch_day_articles(DAY)
+    assert [i['habr_id'] for i in items] == [800001, 800002]
+    assert sorted(requested) == ['articles/top/daily/', 'articles/top/weekly/',
+                                 'hubs/go/articles/', 'hubs/python/articles/']   # each hub once
+
+
+def test_fetch_day_articles_without_subscriptions_reads_top_only(tmp_db, monkeypatch, fixture_text):
+    requested, _ = _route_feeds(monkeypatch, fixture_text, {
+        'articles/top/daily/': [(800001, IN_DAY)], 'articles/top/weekly/': []})
+    assert [i['habr_id'] for i in digest.fetch_day_articles(DAY)] == [800001]
+    assert requested == ['articles/top/daily/', 'articles/top/weekly/']
+
+
+def test_fetch_day_articles_skips_kek_fetch_outside_the_day(tmp_db, monkeypatch, fixture_text):
+    """RSS candidates after the day end (the digest runs at 18:00 of D+1) cost no kek request."""
+    end = datetime(2026, 11, 3, 21, 0, tzinfo=UTC)
+    _, kek_ids = _route_feeds(monkeypatch, fixture_text, {
+        'articles/top/daily/': [(800009, end + timedelta(hours=1)), (800001, IN_DAY)],
+        'articles/top/weekly/': [(800008, end - timedelta(days=3))]})
+    assert [i['habr_id'] for i in digest.fetch_day_articles(DAY)] == [800001]
+    assert kek_ids == [800001]

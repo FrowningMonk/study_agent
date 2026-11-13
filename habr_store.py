@@ -317,6 +317,27 @@ def upsert_habr_article(item: dict) -> None:
     upsert_habr_articles([item])
 
 
+def insert_missing_habr_articles(items: Iterable[dict]) -> None:
+    """
+    Stores light RSS items (habr_api.fetch_rss_since) only for habr_ids that have no
+    row yet (INSERT ... DO NOTHING), so full metadata from a kek fetch is never
+    overwritten. A new row keeps only title, url and published_at; score, comments,
+    lead_text, hubs and tags stay empty (RSS has no score/hub types, and its description
+    and categories do not match kek leadData/tags). `fetched_at` stays NULL: needs_metadata_fetch /
+    backfill still see the row as lacking metadata, so the full kek fetch happens later.
+    """
+    conn = database._get_connection()
+    try:
+        with conn:
+            conn.executemany(
+                'INSERT INTO habr_articles (habr_id, title, url, published_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(habr_id) DO NOTHING',
+                [(i['habr_id'], i.get('title'), i.get('url'), _to_text(i.get('published_at'))) for i in items],
+            )
+    finally:
+        conn.close()
+
+
 def get_habr_articles(habr_ids: Iterable[int]) -> dict[int, dict]:
     """Metadata by habr_id with `hubs` ([{alias, hub_type}]) and `tags` ([str]); unknown ids omitted."""
     ids = list(dict.fromkeys(habr_ids))
@@ -530,6 +551,19 @@ def list_subscriptions(user_id: int) -> list[str]:
     try:
         rows = conn.execute(
             'SELECT hub_alias FROM hub_subscriptions WHERE user_id = ? ORDER BY hub_alias', (user_id,),
+        )
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def list_all_subscribed_hubs() -> list[str]:
+    """Hub aliases subscribed by any user, distinct case-insensitively, sorted."""
+    conn = database._get_connection()
+    try:
+        # One alias per case-insensitive name (Habr hub URLs are case-insensitive)
+        rows = conn.execute(
+            'SELECT MIN(hub_alias) FROM hub_subscriptions GROUP BY LOWER(hub_alias) ORDER BY LOWER(hub_alias)',
         )
         return [r[0] for r in rows]
     finally:

@@ -1,8 +1,11 @@
 import itertools
 import json
 import os
+import re
 import sys
 import threading
+from datetime import timezone
+from email.utils import format_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -75,6 +78,34 @@ class SignallingLock:
 
     def __exit__(self, *exc):
         self.release()
+
+
+def rss_body(entries) -> str:
+    """A Habr RSS channel (same markup as the live feed) for (habr_id, aware published) entries.
+
+    An entry may also be (habr_id, published, title)."""
+    items = []
+    for entry in entries:
+        habr_id, published = entry[0], entry[1]
+        title = entry[2] if len(entry) > 2 else f'Статья {habr_id}'
+        items.append(
+            '<item>\n'
+            f'<title><![CDATA[{title}]]></title>\n'
+            f'<guid isPermaLink="true">https://habr.com/ru/articles/{habr_id}/</guid>\n'
+            f'<link>https://habr.com/ru/articles/{habr_id}/?utm_campaign={habr_id}&amp;utm_source=habrahabr</link>\n'
+            '<description><![CDATA[<p>Анонс.</p>]]></description>\n'
+            f'<pubDate>{format_datetime(published.astimezone(timezone.utc), usegmt=True)}</pubDate>\n'
+            '<category><![CDATA[python]]></category>\n'
+            '</item>'
+        )
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0">\n<channel>\n'
+            '<title><![CDATA[Хабр]]></title>\n' + '\n'.join(items) + '\n</channel>\n</rss>\n')
+
+
+def kek_article_id(url: str) -> int | None:
+    """habr_id of a kek `articles/{id}/` URL, else None."""
+    match = re.fullmatch(r'https://habr\.com/kek/v2/articles/(\d+)/', url)
+    return int(match.group(1)) if match else None
 
 
 @pytest.fixture

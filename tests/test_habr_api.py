@@ -16,7 +16,7 @@ import requests
 
 import habr_api
 import scraper
-from conftest import IN_DRAFTS_ENVELOPE, SignallingLock
+from conftest import IN_DRAFTS_ENVELOPE, SignallingLock, rss_body
 
 UTC = timezone.utc
 
@@ -111,30 +111,6 @@ def hubs_fixture(fixture_text):
     return json.loads(fixture_text('habr_hubs_page.json'))
 
 
-@pytest.fixture
-def make_item(list_fixture):
-    template = list_fixture['publicationRefs'][list_fixture['publicationIds'][0]]
-
-    def _make(habr_id: int, published: datetime) -> dict:
-        item = copy.deepcopy(template)
-        item['id'] = str(habr_id)
-        item['timePublished'] = published.isoformat()
-        return item
-    return _make
-
-
-def make_page(items: list[dict], pages_count: int) -> dict:
-    return {
-        'pagesCount': pages_count,
-        'publicationIds': [item['id'] for item in items],
-        'publicationRefs': {item['id']: item for item in items},
-    }
-
-
-def descending(make_item, start_id: int, newest: datetime, count: int, step=timedelta(minutes=1)) -> list[dict]:
-    return [make_item(start_id + i, newest - step * i) for i in range(count)]
-
-
 SINCE = datetime(2026, 11, 2, 21, 0, 0, tzinfo=UTC)  # 00:00 MSK of 2026-11-03
 
 
@@ -222,16 +198,12 @@ def test_canonical_url_built_from_integer():
 # =============================================================================
 
 
-def test_list_page_normalization(fake_habr, list_fixture, make_item):
-    # Fixture page (real items) followed by a page whose last item crosses the boundary
-    fixture_items = [list_fixture['publicationRefs'][i] for i in list_fixture['publicationIds']]
-    since = datetime(2026, 11, 1, tzinfo=UTC)
-    filler = descending(make_item, 1, datetime(2026, 11, 3, 8, 0, tzinfo=UTC), 100 - len(fixture_items))
-    page1 = make_page(fixture_items + filler, 10)
-    page2 = make_page(descending(make_item, 500, datetime(2026, 10, 31, tzinfo=UTC), 100), 10)
-    fake_habr(by_page({1: page1, 2: page2}))
+def test_kek_item_normalization(fake_habr, list_fixture):
+    # Real kek items of every shape (regular, corporate, megaproject), fetched by id
+    refs = list_fixture['publicationRefs']
+    fake_habr(lambda url, params: FakeResponse(200, refs[url.rstrip('/').rsplit('/', 1)[1]]))
 
-    items = {item['habr_id']: item for item in habr_api.fetch_articles_since(since)}
+    items = {int(i): habr_api.fetch_article(int(i)) for i in list_fixture['publicationIds']}
 
     regular = items[1073184]
     assert regular['url'] == 'https://habr.com/ru/articles/1073184/'
@@ -290,7 +262,7 @@ def _drop(path):
 @pytest.mark.parametrize('mutate,value', [
     (_set(['id']), 1102920),
     (_set(['id']), 'abc'),
-    (_set(['id']), '1102921'),            # differs from the publicationIds key
+    (_set(['id']), '1102921'),            # differs from the requested id
     (_set(['titleHtml']), None),
     (_drop(['titleHtml']), None),
     (_set(['timePublished']), 'yesterday'),
@@ -311,174 +283,348 @@ def _drop(path):
     (_set(['leadData']), None),
     (_drop(['leadData', 'textHtml']), None),
 ], ids=lambda v: repr(v)[:40] if not callable(v) else '')
-def test_item_with_bad_field_type_rejected(fake_habr, list_fixture, make_item, mutate, value):
-    def page_with(item):
-        # The checked item is the page's last one and crosses the boundary, so a
-        # valid item makes the attempt succeed: only the bad field can fail it
-        page = make_page(descending(make_item, 1, datetime(2026, 11, 3, 12, tzinfo=UTC), 99), 1)
-        page['publicationIds'].append('1102920')
-        page['publicationRefs']['1102920'] = item
-        return page
-
+def test_item_with_bad_field_type_rejected(fake_habr, list_fixture, mutate, value):
     item = copy.deepcopy(list_fixture['publicationRefs']['1102920'])
-    item['timePublished'] = (SINCE - timedelta(hours=1)).isoformat()
-    fake_habr(by_page({1: page_with(copy.deepcopy(item))}))
-    assert len(habr_api.fetch_articles_since(SINCE)) == 99  # control: unmutated item passes
     fake_habr(FakeResponse(200, copy.deepcopy(item)))
-    assert habr_api.fetch_article(1102920)['habr_id'] == 1102920
+    assert habr_api.fetch_article(1102920)['habr_id'] == 1102920   # control: unmutated item passes
 
     mutate(item, value)
-    fake_habr(by_page({1: page_with(item)}))
-    with pytest.raises(habr_api.HabrUnavailable):
-        habr_api.fetch_articles_since(SINCE)
-
     fake_habr(FakeResponse(200, item))
     with pytest.raises(habr_api.HabrUnavailable):
         habr_api.fetch_article(1102920)
 
 
 # =============================================================================
-# fetch_articles_since: pagination
+# RSS lists: fetch_rss / fetch_rss_since / fetch_articles_since
 # =============================================================================
-
-
-def test_fetch_articles_since_stops_at_boundary(fake_habr, make_item):
-    page1 = make_page(descending(make_item, 1000, datetime(2026, 11, 4, 12, tzinfo=UTC), 100), 10)
-    # Page 2: 98 newer items, then the MSK day edge: 21:00:00Z included, 20:59:59Z excluded
-    page2_items = descending(make_item, 2000, datetime(2026, 11, 3, 12, tzinfo=UTC), 98)
-    page2_items.append(make_item(2098, SINCE))
-    page2_items.append(make_item(2099, SINCE - timedelta(seconds=1)))
-    page2 = make_page(page2_items, 10)
-    page3 = make_page(descending(make_item, 3000, datetime(2026, 11, 2, tzinfo=UTC), 100), 10)
-    fake = fake_habr(by_page({1: page1, 2: page2, 3: page3}))
-
-    items = habr_api.fetch_articles_since(SINCE)
-
-    assert fake.pages == [1, 2]
-    ids = [item['habr_id'] for item in items]
-    assert 2098 in ids and 2099 not in ids
-    assert len(ids) == 199
-    assert all(item['published_at'] >= SINCE for item in items)
-    assert [item['published_at'] for item in items] == sorted((i['published_at'] for i in items), reverse=True)
-    params = fake.log[0]['params']
-    assert params == {'sort': 'rating', 'fl': 'ru', 'hl': 'ru', 'perPage': 100, 'page': 1}
-    assert fake.log[0]['url'] == 'https://habr.com/kek/v2/articles/'
-
-
-def test_fetch_articles_since_rejects_naive_boundary(fake_habr):
-    fake = fake_habr(lambda url, params: pytest.fail('no request expected'))
-    with pytest.raises(ValueError):
-        habr_api.fetch_articles_since(datetime(2026, 11, 3))
-    assert fake.log == []
-
-
-def test_fetch_articles_since_dedups_across_pages(fake_habr, make_item):
-    page1_items = descending(make_item, 1000, datetime(2026, 11, 4, 12, tzinfo=UTC), 100)
-    # An insert at the top shifted the last item of page 1 onto page 2
-    shifted = copy.deepcopy(page1_items[-1])
-    page2_items = [shifted] + descending(make_item, 2000, datetime(2026, 11, 3, 10, tzinfo=UTC), 99)
-    page2_items[-1]['timePublished'] = (SINCE - timedelta(hours=1)).isoformat()
-    fake_habr(by_page({1: make_page(page1_items, 10), 2: make_page(page2_items, 10)}))
-
-    items = habr_api.fetch_articles_since(SINCE)
-
-    ids = [item['habr_id'] for item in items]
-    assert ids.count(int(shifted['id'])) == 1
-    assert len(ids) == len(set(ids)) == 100 + 98
 
 
 def _error_envelope(code: int, error_code: str) -> dict:
     return {'httpCode': code, 'message': 'x', 'data': {}, 'errorCode': error_code}
 
 
-def _partial_cases():
-    """Each case: name -> builder(make_item) returning the pages dict."""
-    newest = datetime(2026, 11, 4, 12, tzinfo=UTC)
-
-    def full(make_item, start, count=100, pages_count=10, crossed=False):
-        items = descending(make_item, start, newest, count)
-        if crossed:
-            items[-1]['timePublished'] = (SINCE - timedelta(hours=1)).isoformat()
-        return make_page(items, pages_count)
-
-    def missing(key):
-        def build(make_item):
-            page = full(make_item, 1000, crossed=True)
-            del page[key]
-            return {1: page}
-        return build
-
-    def id_absent(make_item):
-        page = full(make_item, 1000, crossed=True)
-        del page['publicationRefs'][page['publicationIds'][3]]
-        return {1: page}
-
-    def bad_item_on_page2(make_item):
-        page2 = full(make_item, 2000, crossed=True)
-        page2['publicationRefs'][page2['publicationIds'][5]]['statistics']['score'] = None
-        return {1: full(make_item, 1000), 2: page2}
-
-    def non_digit_id_key(make_item):
-        page = full(make_item, 1000, crossed=True)
-        key = page['publicationIds'][3]
-        page['publicationIds'][3] = 'abc'
-        page['publicationRefs']['abc'] = page['publicationRefs'].pop(key)
-        return {1: page}
-
-    def wrong_envelope_types(make_item):
-        page = full(make_item, 1000, crossed=True)
-        page['pagesCount'] = '10'
-        return {1: page}
-
-    def refs_not_dict(make_item):
-        page = full(make_item, 1000, crossed=True)
-        page['publicationRefs'] = list(page['publicationRefs'].values())
-        return {1: page}
-
-    def all_newer_pages(make_item, pages_count):
-        return {n: full(make_item, n * 1000, pages_count=pages_count) for n in range(1, 21)}
-
-    return {
-        'http_503': lambda mi: {1: FakeResponse(503, 'Service Unavailable')},
-        'http_503_on_page2': lambda mi: {1: full(mi, 1000), 2: FakeResponse(503, '')},
-        'error_envelope_400': lambda mi: {1: full(mi, 1000), 2: FakeResponse(400, _error_envelope(400, 'PAGINATOR_LIMIT'))},
-        'error_envelope_with_200': lambda mi: {1: FakeResponse(200, _error_envelope(400, 'PAGINATOR_LIMIT'))},
-        'non_json': lambda mi: {1: FakeResponse(200, '<html>maintenance</html>')},
-        'deeply_nested_json': lambda mi: {1: FakeResponse(200, '[' * 100_000 + ']' * 100_000)},
-        'json_not_object': lambda mi: {1: FakeResponse(200, [1, 2, 3])},
-        'missing_publicationIds': missing('publicationIds'),
-        'missing_publicationRefs': missing('publicationRefs'),
-        'missing_pagesCount': missing('pagesCount'),
-        'wrong_envelope_types': wrong_envelope_types,
-        'refs_not_dict': refs_not_dict,
-        'id_absent_from_refs': id_absent,
-        'non_digit_id_key': non_digit_id_key,
-        'bad_item_on_page2': bad_item_on_page2,
-        'short_page_before_last': lambda mi: {1: full(mi, 1000, count=50, crossed=True)},
-        'empty_page_before_last': lambda mi: {1: make_page([], 10)},
-        'boundary_not_crossed_before_pagesCount': lambda mi: all_newer_pages(mi, 2),
-        'boundary_not_crossed_single_short_last_page': lambda mi: {1: full(mi, 1000, count=30, pages_count=1)},
-        'item_cap_1000': lambda mi: all_newer_pages(mi, 20),
-        'timeout': lambda mi: {1: requests.exceptions.Timeout('slow')},
-        'connection_error': lambda mi: {1: full(mi, 1000), 2: requests.exceptions.ConnectionError('reset')},
-        'redirect': lambda mi: {1: FakeResponse(302, '', {'Location': 'https://habr.com/ru/'})},
-    }
+def _hours_before(hours: float) -> datetime:
+    return datetime(2026, 11, 4, 12, tzinfo=UTC) - timedelta(hours=hours)
 
 
-PARTIAL_CASES = _partial_cases()
+def test_fetch_rss_parses_live_fixture(fake_habr, fixture_text):
+    fake = fake_habr(FakeResponse(200, fixture_text('habr_rss_hub.xml')))
+
+    items = habr_api.fetch_rss('hubs/python/articles/')
+
+    assert [i['habr_id'] for i in items] == [1107610, 1101894, 1107568]
+    first = items[0]
+    assert set(first) == {'habr_id', 'title', 'url', 'published_at', 'lead_text', 'tags'}
+    assert first['url'] == 'https://habr.com/ru/articles/1107610/'
+    assert first['published_at'] == datetime(2026, 11, 13, 14, 13, 59, tzinfo=UTC)
+    assert first['title'].startswith('Сметчик завода считал КП')
+    assert 'python' in first['tags'] and 'llm' in first['tags']
+    assert first['lead_text'].startswith('<img src=')
+    # a company blog article is mapped to the canonical URL by id
+    assert items[1]['url'] == 'https://habr.com/ru/articles/1101894/'
+    assert fake.log[0]['url'] == 'https://habr.com/ru/rss/hubs/python/articles/'
+    assert fake.log[0]['params'] == {'fl': 'ru', 'limit': 100}
 
 
-@pytest.mark.parametrize('case', list(PARTIAL_CASES))
-def test_partial_response_conditions_raise_unavailable(fake_habr, make_item, case):
-    fake = fake_habr(by_page(PARTIAL_CASES[case](make_item)))
-    result = 'not set'
+def test_fetch_rss_skips_non_article_entries(fake_habr):
+    body = rss_body([(5, _hours_before(1)), (6, _hours_before(2))]).replace(
+        'https://habr.com/ru/articles/6/', 'https://habr.com/ru/sandbox/6/')
+    fake_habr(FakeResponse(200, body))
+    assert [i['habr_id'] for i in habr_api.fetch_rss('articles/top/daily/')] == [5]
 
+
+def test_fetch_rss_unescapes_plain_text_fields(fake_habr):
+    body = rss_body([(5, _hours_before(1))]).replace('<title><![CDATA[Статья 5]]></title>',
+                                                     '<title>A &amp; B</title>')
+    fake_habr(FakeResponse(200, body))
+    assert habr_api.fetch_rss('articles/top/daily/')[0]['title'] == 'A & B'
+
+
+@pytest.mark.parametrize('broken', [
+    lambda b: b.replace('<pubDate>', '<pubDate>not a date', 1),          # unparseable
+    lambda b: b.replace(' GMT</pubDate>', '</pubDate>', 1),              # naive
+    lambda b: b.replace('<pubDate>', '<!--', 1).replace('</pubDate>', '-->', 1),   # missing
+], ids=['unparseable', 'naive', 'missing'])
+def test_fetch_rss_skips_item_with_bad_date(fake_habr, caplog, broken):
+    body = broken(rss_body([(5, _hours_before(1)), (6, _hours_before(2))]))
+    fake_habr(FakeResponse(200, body))
+    with caplog.at_level(logging.WARNING, logger='habr_api'):
+        assert [i['habr_id'] for i in habr_api.fetch_rss('articles/top/daily/')] == [6]
+    assert any('skipped 1 items' in r.getMessage() for r in caplog.records)
+
+
+def test_fetch_rss_id_falls_back_to_link(fake_habr):
+    body = rss_body([(5, _hours_before(1))]).replace(
+        '<guid isPermaLink="true">https://habr.com/ru/articles/5/</guid>', '<guid isPermaLink="false">abc-5</guid>')
+    fake_habr(FakeResponse(200, body))
+    assert [i['habr_id'] for i in habr_api.fetch_rss('articles/top/daily/')] == [5]
+
+
+def test_fetch_rss_text_unescaped_exactly_once(fake_habr):
+    body = rss_body([(5, _hours_before(1))]).replace(
+        '<category><![CDATA[python]]></category>',
+        '<category>a &amp; b</category><category>x &amp;lt; y</category><category><![CDATA[c &amp; d]]></category>')
+    body = body.replace('<title><![CDATA[Статья 5]]></title>', '<title>T &amp;amp; U</title>')
+    fake_habr(FakeResponse(200, body))
+    item = habr_api.fetch_rss('articles/top/daily/')[0]
+    assert item['tags'] == ['a & b', 'x &lt; y', 'c & d']
+    assert item['title'] == 'T &amp; U'
+
+
+def test_fetch_rss_cdata_may_contain_closing_tag(fake_habr):
+    body = rss_body([(5, _hours_before(1), 'a </title> b')])
+    fake_habr(FakeResponse(200, body))
+    assert habr_api.fetch_rss('articles/top/daily/')[0]['title'] == 'a </title> b'
+
+
+def test_fetch_rss_markup_inside_cdata_cannot_forge_items_or_fields(fake_habr):
+    forged = ('</item><item><title>Fake</title><guid>https://habr.com/ru/articles/999999/</guid>'
+              '<pubDate>Mon, 01 Jan 2035 00:00:00 GMT</pubDate></item><item>'
+              '<pubDate>Mon, 01 Jan 2035 00:00:00 GMT</pubDate><category>forged</category>')
+    body = rss_body([(5, _hours_before(1))]).replace('<p>Анонс.</p>', forged)
+    fake_habr(FakeResponse(200, body))
+    items = habr_api.fetch_rss('articles/top/daily/')
+    assert [i['habr_id'] for i in items] == [5]
+    assert items[0]['published_at'] == _hours_before(1)
+    assert items[0]['tags'] == ['python'] and forged in items[0]['lead_text']
+
+
+def test_fetch_rss_item_count_capped(fake_habr):
+    entries = [(n, _hours_before(n / 100)) for n in range(1, habr_api.RSS_MAX_ITEMS + 50)]
+    fake_habr(FakeResponse(200, rss_body(entries)))
+    assert len(habr_api.fetch_rss('articles/top/daily/')) == habr_api.RSS_MAX_ITEMS
+
+
+def test_fetch_rss_never_expands_entities(fake_habr):
+    body = rss_body([(5, _hours_before(1))]).replace(
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY x "EXPANDED">]>').replace(
+        '<title><![CDATA[Статья 5]]></title>', '<title>&x;</title>')
+    fake_habr(FakeResponse(200, body))
+    assert habr_api.fetch_rss('articles/top/daily/')[0]['title'] == '&x;'
+
+
+# Every payload sits inside one closed <item> with a valid id, so the parser really runs on it
+@pytest.mark.parametrize('body', [
+    '<rss><channel><item><guid>https://habr.com/ru/articles/5/</guid>' + '<title>' + ' ' * 2_000_000 + '</item>',
+    '<rss><channel><item><guid>https://habr.com/ru/articles/5/</guid>' + '<title><![CDATA[' * 150_000 + ']]></title></item>',
+    '<rss><channel><item><guid>https://habr.com/ru/articles/5/</guid>' + '<category>' * 300_000 + '</item>',
+    '<rss><channel><item><guid>https://habr.com/ru/articles/5/</guid>' + '<title>' * 300_000 + '</item>',
+    '<rss><channel>' + '<item>' * 300_000 + '</item>',
+], ids=['spaces', 'cdata', 'categories', 'titles', 'items'])
+def test_fetch_rss_parsing_is_linear_on_adversarial_body(fake_habr, monkeypatch, body):
+    monkeypatch.setattr(habr_api, 'MAX_RESPONSE_BYTES', 4 * 1024 * 1024)
+    fake_habr(FakeResponse(200, body, chunk=1024 * 1024))
+    calls = []
+    real = habr_api._rss_elements
+    monkeypatch.setattr(habr_api, '_rss_elements', lambda *a: calls.append(a[1]) or real(*a))
+    started = time.monotonic()
+    assert habr_api.fetch_rss('articles/top/daily/') == []            # no pubDate: item skipped
+    assert time.monotonic() - started < 2
+    assert calls                                                       # the parser did run
+
+
+def test_fetch_rss_many_categories_parsed_linearly(fake_habr, monkeypatch):
+    monkeypatch.setattr(habr_api, 'MAX_RESPONSE_BYTES', 8 * 1024 * 1024)
+    body = rss_body([(5, _hours_before(1))]).replace(
+        '<category><![CDATA[python]]></category>', '<category>x</category>' * 200_000)
+    fake_habr(FakeResponse(200, body, chunk=1024 * 1024))
+    started = time.monotonic()
+    assert len(habr_api.fetch_rss('articles/top/daily/')[0]['tags']) == 200_000
+    assert time.monotonic() - started < 3
+
+
+@pytest.mark.parametrize('response', [
+    FakeResponse(503, 'Service Unavailable'),
+    FakeResponse(404, '<html>Not Found</html>'),
+    FakeResponse(200, '<html>maintenance</html>'),
+    FakeResponse(302, '', {'Location': 'https://habr.com/ru/'}),
+    requests.exceptions.Timeout('slow'),
+    requests.exceptions.ConnectionError('reset'),
+], ids=['503', '404', 'not_rss', 'redirect', 'timeout', 'connection'])
+def test_fetch_rss_failures_raise_unavailable(fake_habr, response):
+    fake_habr(response)
     with pytest.raises(habr_api.HabrUnavailable):
-        result = habr_api.fetch_articles_since(SINCE)
+        habr_api.fetch_rss('articles/top/daily/')
 
-    assert result == 'not set'  # no partial list leaks out
-    if case == 'item_cap_1000':
-        assert max(fake.pages) == 10  # never asks past the paginator cap
+
+def _feeds_handler(feeds: dict, articles: dict | None = None):
+    """RSS path -> entries; kek article id -> FakeResponse/item/exception."""
+    def handler(url, params):
+        if url.startswith(habr_api.RSS_BASE):
+            path = url[len(habr_api.RSS_BASE):]
+            if path not in feeds:
+                pytest.fail(f'unexpected feed requested: {path}')
+            return FakeResponse(200, rss_body(feeds[path]))
+        habr_id = int(url.rstrip('/').rsplit('/', 1)[1])
+        result = (articles or {}).get(habr_id)
+        if result is None:
+            pytest.fail(f'unexpected article requested: {habr_id}')
+        return result if isinstance(result, (FakeResponse, BaseException)) else FakeResponse(200, result)
+    return handler
+
+
+def test_fetch_rss_since_window_dedup_and_hubs(fake_habr):
+    until = _hours_before(0)
+    since = until - timedelta(days=1)
+    feeds = {
+        'hubs/python/articles/': [(1, until), (2, _hours_before(1)), (3, since), (4, since - timedelta(seconds=1))],
+        'hubs/devops/articles/': [(2, _hours_before(1)), (5, _hours_before(2))],
+        'articles/top/daily/': [(6, _hours_before(3)), (5, _hours_before(2))],
+        'articles/top/weekly/': [(7, since - timedelta(days=2))],
+    }
+    fake = fake_habr(_feeds_handler(feeds))
+
+    items = habr_api.fetch_rss_since(since, until=until, hubs=['python', 'devops', 'python'], top=True)
+
+    assert [i['habr_id'] for i in items] == [2, 5, 6, 3]          # newest first, window [since, until)
+    by_id = {i['habr_id']: i for i in items}
+    assert by_id[2]['hubs'] == [('python', 'collective'), ('devops', 'collective')]
+    assert by_id[5]['hubs'] == [('devops', 'collective')]
+    assert by_id[6]['hubs'] == []                                    # top feed only
+    assert [e['url'][len(habr_api.RSS_BASE):] for e in fake.log] == list(feeds)
+
+
+def test_fetch_rss_since_without_top_reads_only_hub_feeds(fake_habr):
+    fake = fake_habr(_feeds_handler({'hubs/python/articles/': [(1, _hours_before(1))]}))
+    assert [i['habr_id'] for i in habr_api.fetch_rss_since(_hours_before(24), hubs=['python'])] == [1]
+    assert len(fake.log) == 1
+
+
+def test_fetch_rss_since_validates_input_before_any_request(fake_habr):
+    fake = fake_habr(lambda url, params: pytest.fail('no request expected'))
+    with pytest.raises(ValueError):
+        habr_api.fetch_rss_since(datetime(2026, 11, 3), hubs=['python'])
+    assert fake.log == []
+
+
+def test_fetch_rss_since_skips_unsafe_alias_and_dedups_case_insensitively(fake_habr, caplog):
+    fake = fake_habr(_feeds_handler({'hubs/Python/articles/': [(1, _hours_before(1))]}))
+    with caplog.at_level(logging.WARNING, logger='habr_api'):
+        items = habr_api.fetch_rss_since(_hours_before(24), hubs=['../../kek', 'Python', 'python', None])
+    assert [i['habr_id'] for i in items] == [1]
+    assert [e['url'] for e in fake.log] == ['https://habr.com/ru/rss/hubs/Python/articles/']
+    assert sum('unsafe alias' in r.getMessage() for r in caplog.records) == 2
+
+
+@pytest.mark.parametrize('status', [404, 410])
+def test_fetch_rss_since_skips_gone_hub_feed(fake_habr, caplog, status):
+    def handler(url, params):
+        if 'renamed' in url:
+            return FakeResponse(status, '<html>Not Found</html>')
+        return FakeResponse(200, rss_body([(1, _hours_before(1))]))
+    fake_habr(handler)
+    with caplog.at_level(logging.WARNING, logger='habr_api'):
+        items = habr_api.fetch_rss_since(_hours_before(24), hubs=['renamed', 'python'], top=True)
+    assert [i['habr_id'] for i in items] == [1]
+    assert any('hub=renamed' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize('failing, status', [('top/daily', 404), ('python', 503), ('python', 403)])
+def test_fetch_rss_since_other_feed_errors_fail(fake_habr, failing, status):
+    def handler(url, params):
+        if failing in url:
+            return FakeResponse(status, '')
+        return FakeResponse(200, rss_body([(1, _hours_before(1))]))
+    fake_habr(handler)
+    with pytest.raises(habr_api.HabrUnavailable):
+        habr_api.fetch_rss_since(_hours_before(24), hubs=['python'], top=True)
+
+
+def test_fetch_rss_since_one_failed_feed_fails_the_call(fake_habr):
+    def handler(url, params):
+        if 'devops' in url:
+            return FakeResponse(503, '')
+        return FakeResponse(200, rss_body([(1, _hours_before(1))]))
+    fake_habr(handler)
+    with pytest.raises(habr_api.HabrUnavailable):
+        habr_api.fetch_rss_since(_hours_before(24), hubs=['python', 'devops'])
+
+
+def test_fetch_rss_since_logs_uncovered_hub_window(fake_habr, caplog):
+    since = _hours_before(24)
+    entries = [(n, _hours_before(n / 10)) for n in range(1, habr_api.RSS_LIMIT + 1)]
+    fake_habr(_feeds_handler({'hubs/python/articles/': entries}))
+    with caplog.at_level(logging.WARNING, logger='habr_api'):
+        assert len(habr_api.fetch_rss_since(since, hubs=['python'])) == habr_api.RSS_LIMIT
+    assert any('does not cover' in r.getMessage() for r in caplog.records)
+
+
+def test_fetch_rss_since_covered_or_top_feed_does_not_warn(fake_habr, caplog):
+    since = _hours_before(24)
+    full_new = [(n, _hours_before(n / 10)) for n in range(1, habr_api.RSS_LIMIT + 1)]
+    reaching_back = full_new[:-1] + [(999, since - timedelta(hours=1))]
+    fake_habr(_feeds_handler({'hubs/python/articles/': reaching_back,
+                              'articles/top/daily/': full_new, 'articles/top/weekly/': []}))
+    with caplog.at_level(logging.WARNING, logger='habr_api'):
+        habr_api.fetch_rss_since(since, hubs=['python'], top=True)
+    assert not any('does not cover' in r.getMessage() for r in caplog.records)
+
+
+def _kek(article_fixture, habr_id: int, published: datetime) -> dict:
+    item = copy.deepcopy(article_fixture)
+    item['id'] = str(habr_id)
+    item['timePublished'] = published.isoformat()
+    return item
+
+
+def test_fetch_articles_since_enriches_candidates(fake_habr, article_fixture):
+    since = _hours_before(24)
+    feeds = {'hubs/python/articles/': [(1, _hours_before(1)), (2, _hours_before(2)), (3, _hours_before(3))],
+             'articles/top/daily/': [], 'articles/top/weekly/': []}
+    gone = FakeResponse(404, _error_envelope(404, 'NOT_FOUND'))
+    articles = {1: _kek(article_fixture, 1, _hours_before(1)), 2: gone, 3: _kek(article_fixture, 3, _hours_before(3))}
+    fake_habr(_feeds_handler(feeds, articles))
+
+    items = habr_api.fetch_articles_since(since, hubs=['python'], top=True)
+
+    assert [i['habr_id'] for i in items] == [1, 3]
+    assert items[0]['score'] == article_fixture['statistics']['score']
+    assert ('transport', 'collective') in items[0]['hubs']        # kek hubs, not the RSS feed hub
+
+
+def test_fetch_articles_since_failure_share(fake_habr, article_fixture):
+    count = 50                                   # allowed = max(3, 10 % of 50) = 5
+    feeds = {'hubs/python/articles/': [(n, _hours_before(n / 10)) for n in range(1, count + 1)]}
+    articles = {n: _kek(article_fixture, n, _hours_before(n / 10)) for n in range(1, count + 1)}
+    for n in range(1, 6):
+        articles[n] = FakeResponse(503, '')
+    fake_habr(_feeds_handler(feeds, articles))
+    items = habr_api.fetch_articles_since(_hours_before(24), hubs=['python'])
+    assert [i['habr_id'] for i in items] == list(range(6, count + 1))   # newest first, failed dropped
+
+    articles[6] = FakeResponse(503, '')
+    fake_habr(_feeds_handler(feeds, articles))
+    with pytest.raises(habr_api.HabrUnavailable) as info:
+        habr_api.fetch_articles_since(_hours_before(24), hubs=['python'])
+    assert info.value.kind == 'partial'
+
+
+def test_fetch_articles_since_tolerates_few_article_failures(fake_habr, article_fixture):
+    count = 12
+    feeds = {'hubs/python/articles/': [(n, _hours_before(n)) for n in range(1, count + 1)]}
+    articles = {n: _kek(article_fixture, n, _hours_before(n)) for n in range(1, count + 1)}
+    for n in range(1, habr_api.ARTICLE_FAILURES_MIN + 1):
+        articles[n] = FakeResponse(503, '')
+    fake_habr(_feeds_handler(feeds, articles))
+    items = habr_api.fetch_articles_since(_hours_before(24), hubs=['python'], top=False)
+    assert len(items) == count - habr_api.ARTICLE_FAILURES_MIN
+
+    articles[habr_api.ARTICLE_FAILURES_MIN + 1] = requests.exceptions.ConnectionError('reset')
+    fake_habr(_feeds_handler(feeds, articles))
+    with pytest.raises(habr_api.HabrUnavailable) as info:
+        habr_api.fetch_articles_since(_hours_before(24), hubs=['python'], top=False)
+    assert info.value.kind == 'partial'
+
+
+def test_fetch_articles_since_busy_propagates(fake_habr, monkeypatch):
+    fake_habr(_feeds_handler({'hubs/python/articles/': [(1, _hours_before(1))]}))
+
+    def busy(habr_id, **kw):
+        raise habr_api.HabrBusy('busy')
+    monkeypatch.setattr(habr_api, 'fetch_article', busy)
+    with pytest.raises(habr_api.HabrBusy):
+        habr_api.fetch_articles_since(_hours_before(24), hubs=['python'], top=False)
 
 
 # =============================================================================
@@ -503,6 +649,9 @@ def test_partial_response_conditions_raise_unavailable(fake_habr, make_item, cas
     (FakeResponse(503, 'Service Unavailable'), habr_api.HabrUnavailable),
     (FakeResponse(200, 'not json'), habr_api.HabrUnavailable),
     (FakeResponse(200, '"a string"'), habr_api.HabrUnavailable),
+    (FakeResponse(200, '[' * 100_000 + ']' * 100_000), habr_api.HabrUnavailable),    # RecursionError
+    (FakeResponse(200, _error_envelope(400, 'PAGINATOR_LIMIT')), habr_api.HabrUnavailable),
+    (FakeResponse(200, [1, 2, 3]), habr_api.HabrUnavailable),
     (requests.exceptions.Timeout('slow'), habr_api.HabrUnavailable),
     (requests.exceptions.ConnectionError('down'), habr_api.HabrUnavailable),
 ])
@@ -635,20 +784,18 @@ def test_body_at_cap_is_accepted(fake_habr, article_fixture):
     assert habr_api.fetch_article(1102920)['habr_id'] == 1102920
 
 
-def test_request_uses_timeout_and_user_agent(fake_habr, article_fixture, hubs_fixture, make_item):
-    page = make_page(descending(make_item, 1, datetime(2026, 11, 4, tzinfo=UTC), 100), 10)
-    page['publicationRefs'][page['publicationIds'][-1]]['timePublished'] = (SINCE - timedelta(1)).isoformat()
+def test_request_uses_timeout_and_user_agent(fake_habr, article_fixture, hubs_fixture):
     hubs_fixture['pagesCount'] = 1
 
     def handler(url, params):
-        if url.endswith('/articles/'):
-            return FakeResponse(200, page)
+        if url.startswith(habr_api.RSS_BASE):
+            return FakeResponse(200, rss_body([(1, SINCE)]))
         if url.endswith('/hubs/'):
             return FakeResponse(200, hubs_fixture)
         return FakeResponse(200, article_fixture)
     fake = fake_habr(handler)
 
-    habr_api.fetch_articles_since(SINCE)
+    habr_api.fetch_rss('articles/top/daily/')
     habr_api.fetch_article(1102920)
     habr_api.fetch_hub_catalog()
 
@@ -658,7 +805,7 @@ def test_request_uses_timeout_and_user_agent(fake_habr, article_fixture, hubs_fi
         assert entry['headers']['User-Agent'] == scraper.USER_AGENT
         assert entry['allow_redirects'] is False
         assert entry['stream'] is True
-        assert entry['url'].startswith('https://habr.com/kek/v2/')
+        assert entry['url'].startswith(('https://habr.com/kek/v2/', 'https://habr.com/ru/rss/'))
 
 
 # =============================================================================
@@ -852,7 +999,7 @@ def test_wait_timeout_raises_habr_busy(fake_habr, monkeypatch, article_fixture):
             habr_api.fetch_article(1102920, wait_timeout=0.1)
         assert not isinstance(excinfo.value, habr_api.HabrUnavailable)
         assert 0.1 <= time.monotonic() - started < 2
-        for call in (lambda: habr_api.fetch_articles_since(SINCE, wait_timeout=0.05),
+        for call in (lambda: habr_api.fetch_rss_since(SINCE, hubs=['python'], wait_timeout=0.05),
                      lambda: habr_api.fetch_hub_catalog(wait_timeout=0.05)):
             with pytest.raises(habr_api.HabrBusy):
                 call()
@@ -1128,21 +1275,19 @@ def test_multi_page_catalog_bounded_by_one_deadline(fake_habr, monkeypatch, hubs
     assert not habr_api._lock.locked()
 
 
-def test_multi_page_list_bounded_by_one_deadline(fake_habr, monkeypatch, make_item):
+def test_multi_feed_list_bounded_by_one_deadline(fake_habr, monkeypatch):
     monkeypatch.setattr(habr_api, 'MIN_REQUEST_INTERVAL', 0)
     newest = datetime(2026, 11, 4, 12, tzinfo=UTC)
 
     def slow(url, params):
         time.sleep(0.15)
-        page = int(params['page'])
-        refs = {str(page * 1000 + i): make_item(page * 1000 + i, newest - timedelta(minutes=page))
-                for i in range(100)}
-        return FakeResponse(200, {'pagesCount': 10, 'publicationIds': list(refs), 'publicationRefs': refs})
+        return FakeResponse(200, rss_body([(1, newest)]))
 
     fake = fake_habr(slow)
+    hubs = [f'hub{n}' for n in range(10)]
     started = time.monotonic()
     with pytest.raises(habr_api.HabrBusy):
-        habr_api.fetch_articles_since(newest - timedelta(days=1), wait_timeout=30, deadline=started + 0.4)
+        habr_api.fetch_rss_since(newest - timedelta(days=1), hubs=hubs, wait_timeout=30, deadline=started + 0.4)
     assert time.monotonic() - started < 1.5
     assert 1 <= len(fake.log) < 10
 
